@@ -1,143 +1,141 @@
 # Minecraft Server Scanner
 
-A desktop GUI for discovering and testing Minecraft servers. It searches Shodan, imports/exports server lists, pings servers concurrently to fetch live status, and can export results directly into your Minecraft `servers.dat`.
+![Screenshot](https://i.imgur.com/NCpx7u0.png)
 
-![UI](https://i.imgur.com/ftBcq2W.png)
-![Monitor](https://i.imgur.com/NIkwWCl.png)
+Minecraft Server Scanner is a Windows desktop application that discovers, checks, organizes, and exports Minecraft servers through a Tkinter GUI.
 
----
+## Features
 
-## What it does
+### Server discovery and scanning
 
-- **Shodan search:** Enter a query (the app prepends `minecraft` for you) and browse results in a sortable table: **ICON**, **IP**, **MOTD**, **Players**, **Version**.
-- **Status scan:** Ping selected or all servers in any tab. Scans run concurrently and stream results back into a results table.
-- **JSON search:** Load a local Shodan dump (`.json`/`.jsonl`) and run boolean searches (AND/OR/NOT with parentheses). View and scan matches.
-- **Import/export lists:**  
-  - Load `.txt` lists into the GUI.  
-  - Export search/scan results as `.txt` in a consistent, human-readable format.
-- **Ignore / Saved lists:** Add servers to `ignore.txt` or `saved.txt` (with optional reasons) from any table; ignored servers are filtered everywhere.
-- **Minecraft integration:** Export any `.txt` list into `%APPDATA%\.minecraft\servers.dat` (creates a one-time `.bak` backup if none exists).
-- **Player filter:** Only show severs that have currently active players.
-- **Shows Players:** You can see and search who's currently playing on the detected servers.
-- **Logs Players:** Keeps a list of all discovered players and the last server they were in.
-- **Cracked:** Shows which servers are cracked (via UUID detection) when running normal scans. More robust faux login attempt scan (more accurate on servers with no players) available via toggle.
-- **Server Monitor**: Monitors selected servers every minute and logs all players.
+- Searches Shodan for Minecraft servers with a Shodan API key.
+- Loads local Shodan JSON and JSONL files.
+- Searches JSON data with boolean expressions using AND, OR, NOT, and parentheses.
+- Loads server lists from text files.
+- Scans individual servers or complete result sets concurrently.
+- Shows server icons, MOTD, online players, maximum players, version, and sampled player names.
+- Filters scan results by player count.
+- Filters versions with an editable substring search, such as 26.3.
+- Sorts result tables by IP, players, version, MOTD, whitelist status, and other displayed fields.
+- Exports server results in a consistent text format.
 
----
+### Network Scan
 
-## Tabs & workflows
+The Network Scan tab accepts individual IPv4 addresses, CIDR ranges, explicit IPv4 ranges such as 192.0.2.1-192.0.2.20, and ASNs such as AS13335 or 13335.
 
-### Servers
-- Load a `.txt` list into a sortable table.
-- Scan **Selected** or **All**; live results appear below in another table.
-- Actions on either table: **Copy IP(s)**, **Add to Ignore**, **Add to Saved**, **Export Scan…**.
-- Optional filter: “Only players > 0” for scan output.
-- Optional filter: "Only cracked servers" - Will scan all servers normally then rescan respondant servers to check if theyre cracked via faux login method.
+ASN scanning resolves announced IPv4 prefixes through BGPView, expands the prefixes within the configured host limit, and scans the configured ports. The scan supports multiple ports and protects the application with a maximum-host limit.
 
-### Shodan
-- Type a query **without** the word `minecraft` (the app prepends it).
-- Results table is sortable with actions identical to the Servers tab.
-- Scan **Selected/All** from the results; export results or scan output.
-- Optional filter: “Only players > 0” for scan output.
-- Optional filter: "Only cracked servers" - Will scan all servers normally then rescan respondant servers to check if theyre cracked via faux login method.
+### Whitelist verification
 
-### JSON Search
-- Point at a local `minecraft_servers.json`/`.jsonl` or any JSON Lines file with Shodan entries.
-- Enter a boolean query (see below) and browse sortable matches.
-- Scan **Selected/All**; export search results or scan output.
-- Optional filter: “Only players > 0” for scan output.
-- Optional filter: "Only cracked servers" - Will scan all servers normally then rescan respondant servers to check if theyre cracked via faux login method.
+- Checks whitelist access with an authenticated Minecraft account.
+- Uses the server’s detected protocol for each whitelist login probe.
+- Provides a Check Whitelist action below result tables for selected rows.
+- Supports whitelist checks during normal scans.
+- Scans the entire Ignore list for whitelist status.
+- Records whitelist probes in whitelist_scan.log.
+- Displays whitelist, not-whitelisted, unknown, authentication, timeout, and protocol-mismatch results.
 
-### Export to MC
-- Choose a `.txt` and export it directly into `%APPDATA%\.minecraft\servers.dat`.
-- On first export (and if no backup exists), a `%APPDATA%\.minecraft\servers.dat.bak` is created.
-- Includes a **Restore Backup** button.
+### Minecraft accounts and tokens
 
-### Saved List
-- Reads your saved.txt and allows editing and copying
+- Imports Prism Launcher accounts.
+- Imports Minecraft access tokens and Microsoft refresh tokens.
+- Accepts USERNAME:TOKEN lines.
+- Accepts username-prefixed MSA refresh-token lines and standalone MSA refresh-token lines.
+- Accepts JWT-style Minecraft access tokens when the token contains a Minecraft profile.
+- Tests selected accounts or all stored accounts.
+- Resolves account names and UUIDs from valid access tokens.
+- Refreshes Microsoft accounts when refresh-token data is available.
+- Sets an active account for manual whitelist checks.
+- Removes failed accounts.
 
-### Ignore List
-- Reads your ignore.txt and allows editing and copying
+### Proxy management
 
-### IP Log
-- Reads your ips.txt and allows editing and copying
+- Imports HTTP and authenticated SOCKS5 proxies from text or files.
+- Tests all proxies or only selected proxies.
+- Saves proxy state in proxies.json.
+- Routes whitelist probes through working proxies when proxy mode is enabled.
+- Rotates accounts and proxies during bulk whitelist scans.
+- Configures worker counts for bulk scans.
+- Performs an optional initial status scan through the local connection or one selected proxy.
 
-### Player Log
-- Keeps a log of all players discovered and stores it in ``user_log.json``
-- Allows you to see their last known server location
-- Can export the data or copy specific IP addresses or usernames
+### Server classification
+
+- Detects likely cracked or offline-mode servers through status data and optional login probing.
+- Caches cracked-server results in known_cracked_servers.json.
+- Supports cracked-server filtering in applicable result workflows.
+
+### Lists and logs
+
+- Maintains Saved and Ignore lists with optional reasons.
+- Filters ignored servers from scan workflows.
+- Maintains a global IP Log in the IP Log tab.
+- Maintains a player log with each player’s latest known server.
+- Copies selected IPs and exports selected result sets.
+
+Network Scan results remain in the scan result table unless they are explicitly added to another list. A network scan does not automatically write every result to ips.txt.
 
 ### Server Monitor
-- Add servers to a list to be monitored
-- Set a time to ping and grab server info (default 1 minute)
-- Players for each server will be saved and new players will be added to the list
 
----
+- Monitors selected servers on a recurring interval.
+- Records online status, MOTD, version, player counts, and player names.
+- Stores monitor state in server_monitor_log.json.
 
-## Boolean search (JSON tab)
+### Minecraft server-list export
 
-The JSON search matches across common Shodan fields (`ip_str`, `port`, `data`, `minecraft`, `location`, `version`, `hostnames`).
+- Imports a text server list into %APPDATA%\.minecraft\servers.dat.
+- Creates %APPDATA%\.minecraft\servers.dat.bak before the first export when a backup does not already exist.
+- Restores the backup through the Export to MC tab.
 
-Supported:
-- `AND`, `OR`, `NOT` (case-insensitive)
-- Parentheses for grouping
+## Tabs
 
-Examples:
-```
-java AND (version.1.21 OR version.1.20) AND (survival OR anarchy)
-```
+- Accounts: imports, tests, activates, and removes Minecraft accounts and tokens.
+- Network Scan: scans IPs, ranges, CIDRs, and ASNs across selected ports.
+- Proxies: manages proxies and runs bulk whitelist scans.
+- Servers: loads, scans, filters, checks, and exports text server lists.
+- Shodan: searches Shodan and scans search results.
+- JSON Search: searches local Shodan JSON or JSONL data and scans matches.
+- Server Monitor: monitors saved servers and records player activity.
+- Export to MC: writes text lists to Minecraft’s servers.dat.
+- Saved: manages saved servers.
+- Ignore: manages ignored servers and scans the complete list for whitelist status.
+- IP Log: manages the global ips.txt server log.
+- Player Log: searches and exports discovered player records.
 
----
+## Requirements
 
-## Files the app reads/writes
+- Windows.
+- Python 3.10 or newer.
+- A valid Shodan API key for Shodan searches.
+- The cryptography package for authenticated whitelist probes.
+- Network access for Shodan, Minecraft status probes, account services, and ASN prefix lookup.
 
-All paths are relative to the app’s working directory unless stated otherwise.
+## Running the application
 
-- `shodan_key.txt` — your Shodan API key (first line). Managed by the app.
-- `ignore.txt` — entries you choose to ignore. Lines look like:
-  ```
-  1.2.3.4:25565 | Reason: <your note or "No reason">
-  ```
-- `saved.txt` — entries you’ve saved for later consideration, same format as above.
-- `ips.txt` — a global log of known servers. Updated by scans to keep latest MOTD/players/version.
-- `%APPDATA%\.minecraft\servers.dat` — target file for **Export**.
-- `%APPDATA%\.minecraft\servers.dat.bak` — one-time backup created by the app if none exists.
+Run:
 
----
+    python MC_Scanner.py
 
-## Scanning behavior
+The application stores its working files in the current working directory unless a path uses %APPDATA% explicitly.
 
-- **Concurrent workers:** `MAX_WORKERS = 100`  
-- **Socket timeout:** `TIMEOUT = 3` seconds  
-- **Protocol version:** `PROTOCOL_VERSION = 772` (adjust in code if needed)  
-- Results stream into the UI as they arrive; an optional “Only players > 0” filter is available on output tables.
+## Text format
 
----
+The standard exported server line is:
 
-## Export formats
+    IP:PORT | MOTD: text | Players: online/maximum | Version: version
 
-All export actions produce plain `.txt` where every line is in the canonical format:
+The importer accepts this format and common IP:PORT lines.
 
-```
-<IP:PORT> | MOTD: <text> | Players: <online>/<max> | Version: <version>
-```
+## JSON search
 
-This is the same format the importer accepts, which makes round-tripping easy.
+JSON Search matches common Shodan fields including IP, port, data, Minecraft metadata, location, hostnames, and version values.
 
----
+Example:
 
-## Notes & limits
+    java AND (version.1.21 OR version.1.20) AND (survival OR anarchy)
 
-- Shodan access requires a valid API key and is subject to Shodan’s rate limits and terms.
-- Some servers may not respond to status pings, return partial data, or throttle connections.
-- The app filters out anything listed in `ignore.txt` across all tabs and workflows.
+## Notes
 
----
-
-## Purpose
-
-This project streamlines the full loop of **discover → triage → verify → keep/ignore → export** for Minecraft servers. It replaces manual shell scripts and ad-hoc text parsing with a single, fast GUI that stays consistent across Shodan searches, local JSON dumps, and your own text lists—right up to expprting into Minecraft’s `servers.dat`.
-
-I created this to replace my [Web UI version](https://github.com/cev-api/minecraft-server-scanner-web-ui) of the same app, which in turn was a replacement for a CLI version of the same app. I like this one the most! Enjoy!
-
-
+- Shodan searches follow Shodan API limits and terms.
+- Minecraft servers can reject status or login probes, throttle connections, require a different protocol, or return incomplete metadata.
+- ASN expansion depends on the external BGPView API and the configured host limit.
+- Whitelist probing uses authenticated accounts and can rotate accounts and proxies when those options are enabled.
