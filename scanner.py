@@ -9,6 +9,7 @@ import os
 import random
 import time
 import shutil
+import subprocess
 import ipaddress
 import urllib.request
 import urllib.error
@@ -77,6 +78,12 @@ MOJANG_JOIN_RETRIES = 2
 NETWORK_SCAN_WORKERS = 500
 NETWORK_SCAN_DEFAULT_PORTS = "25565"
 NETWORK_SCAN_MAX_HOSTS = 4096
+# --- masscan backend (fast SYN port discovery before Minecraft handshake) ---
+MASSCAN_BIN = shutil.which("masscan") or "masscan"
+MASSCAN_DEFAULT_RATE = 10000
+MASSCAN_DEFAULT_WAIT = 2
+MASSCAN_MAX_HOSTS = 1000000
+MASSCAN_OUTPUT_TIMEOUT_MARGIN = 30
 
 # Never trust a server-provided length.  Apart from protecting against broken
 # servers, this prevents a single scan target from reserving gigabytes of RAM.
@@ -2241,6 +2248,684 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
     return [target for target in dict.fromkeys(targets) if not is_ignored(target)]
 
 
+# ==================== MASSCAN BACKEND ====================
+# Two-phase scan for speed:
+#   Phase 1 (masscan): fast SYN scan finds open TCP ports across huge ranges.
+#   Phase 2 (Python): Minecraft status handshake (ping_server) only on open ports.
+# This avoids a full TCP+handshake per host and is orders of magnitude faster
+# than the pure-Python ThreadPool scan for CIDR/ASN sweeps.
+
+def is_masscan_available():
+    """True when a masscan binary can be executed."""
+    exe = shutil.which("masscan")
+    if not exe:
+        if MASSCAN_BIN and os.path.isabs(MASSCAN_BIN) and os.path.exists(MASSCAN_BIN):
+            exe = MASSCAN_BIN
+        else:
+            return False
+    try:
+        proc = subprocess.run(
+            [exe, "-V"],
+            capture_output=True, text=True, timeout=8
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return "masscan" in out.lower() or proc.returncode == 0
+    except Exception:
+        return False
+
+
+def masscan_status_line():
+    exe = shutil.which("masscan")
+    if not exe:
+        return "masscan: not found (Python fallback)"
+    try:
+        proc = subprocess.run([exe, "-V"], capture_output=True, text=True, timeout=8)
+        out = ((proc.stdout or "") + " " + (proc.stderr or "")).strip().splitlines()
+        ver = out[0].strip() if out else "found"
+        return f"masscan: {exe} ({ver[:60]})"
+    except Exception as exc:
+        return f"masscan: {exe} (check failed: {exc})"
+
+
+def _masscan_count_hosts(spec, cap=MASSCAN_MAX_HOSTS):
+    """Estimate host count for a masscan target spec without enumerating."""
+    try:
+        if "/" in spec:
+            net = ipaddress.ip_network(spec, strict=False)
+            if net.version != 4:
+                return 0
+            n = net.num_addresses - 2 if net.num_addresses > 2 else net.num_addresses
+            return max(0, min(n, cap + 1))
+        if "-" in spec:
+            left, right = spec.split("-", 1)
+            start = int(ipaddress.ip_address(left.strip()))
+            end = int(ipaddress.ip_address(right.strip()))
+            if end < start:
+                return 0
+            return min(end - start + 1, cap + 1)
+        ipaddress.ip_address(spec)
+        return 1
+    except Exception:
+        return 0
+
+
+def build_masscan_inputs(target_text, ports, max_hosts=MASSCAN_MAX_HOSTS):
+    """Convert GUI target text into masscan ranges + direct ip:port targets.
+
+    Returns (masscan_targets, direct_targets):
+      masscan_targets: list of 'IP', 'CIDR' or 'start-end' strings for masscan.
+      direct_targets: list of 'ip:port' strings to ping directly (explicit ports
+        outside the scan port list, or entries masscan cannot express).
+    Hostnames are resolved to IPs for masscan; unresolvable names are skipped.
+    """
+    ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
+    port_set = set(ports)
+    masscan_targets = []
+    direct_targets = []
+    seen_range = set()
+    total_hosts = 0
+
+    def add_range(spec):
+        nonlocal total_hosts
+        spec = spec.strip()
+        if not spec or spec in seen_range:
+            return
+        # masscan handles huge ranges natively, so max_hosts is a soft stop:
+        # stop adding *new* specs once the budget is spent, but never silently
+        # drop a user-requested range just because it alone exceeds the budget.
+        if total_hosts >= max_hosts:
+            return
+        count = _masscan_count_hosts(spec)
+        if count <= 0:
+            return
+        seen_range.add(spec)
+        masscan_targets.append(spec)
+        total_hosts += count
+
+    def add_direct(ip_port):
+        if ip_port not in direct_targets and not is_ignored(ip_port):
+            direct_targets.append(ip_port)
+
+    tokens = []
+    for line in (target_text or "").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        tokens.extend([p.strip() for p in re.split(r"[,;\s]+", line) if p.strip()])
+
+    for token in tokens:
+        if total_hosts >= max_hosts:
+            break
+        try:
+            if re.match(r"^AS?\d+$", token, re.I):
+                try:
+                    prefixes = fetch_asn_prefixes(token)
+                except Exception:
+                    continue
+                for prefix in prefixes:
+                    if total_hosts >= max_hosts:
+                        break
+                    try:
+                        net = ipaddress.ip_network(prefix, strict=False)
+                    except ValueError:
+                        continue
+                    if net.version != 4:
+                        continue
+                    add_range(str(net))
+                continue
+            if "/" in token:
+                host_part = token.split("/")[0]
+                if ":" in host_part and not host_part.replace(".", "").replace(":", "").strip().isdigit():
+                    pass
+                try:
+                    net = ipaddress.ip_network(token, strict=False)
+                except ValueError:
+                    continue
+                if net.version != 4:
+                    continue
+                add_range(str(net))
+                continue
+            if "-" in token and "/" not in token and ":" not in token:
+                left, right = token.split("-", 1)
+                try:
+                    start = ipaddress.ip_address(left.strip())
+                    end = ipaddress.ip_address(right.strip())
+                except ValueError:
+                    continue
+                if start.version != 4 or end.version != 4 or int(end) < int(start):
+                    continue
+                add_range(f"{start}-{end}")
+                continue
+            if ":" in token:
+                host, port_txt = token.rsplit(":", 1)
+                host = host.strip()
+                try:
+                    explicit_port = int(port_txt.strip())
+                except ValueError:
+                    continue
+                if not (1 <= explicit_port <= 65535):
+                    continue
+                try:
+                    ipaddress.ip_address(host)
+                    ip_str = host
+                except ValueError:
+                    try:
+                        ip_str = socket.gethostbyname(host)
+                    except Exception:
+                        continue
+                if explicit_port in port_set:
+                    add_range(ip_str)
+                else:
+                    add_direct(f"{ip_str}:{explicit_port}")
+                continue
+            try:
+                ipaddress.ip_address(token)
+                add_range(token)
+                continue
+            except ValueError:
+                pass
+            try:
+                ip_str = socket.gethostbyname(token)
+            except Exception:
+                continue
+            add_range(ip_str)
+        except Exception:
+            continue
+
+    return masscan_targets, [t for t in dict.fromkeys(direct_targets) if not is_ignored(t)]
+
+
+def parse_masscan_json_file(path):
+    """Parse masscan -oJ output file into ['ip:port', ...]."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return []
+    return parse_masscan_json_text(raw)
+
+
+def parse_masscan_json_text(raw):
+    """Parse masscan -oJ output text into ['ip:port', ...]."""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    found = []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = None
+    if isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            ip = entry.get("ip")
+            for p in entry.get("ports") or []:
+                try:
+                    port = int((p or {}).get("port", 0))
+                    status = str((p or {}).get("status", "open")).lower()
+                except Exception:
+                    continue
+                if ip and 1 <= port <= 65535 and status == "open":
+                    found.append(f"{ip}:{port}")
+    elif isinstance(data, dict):
+        ip = data.get("ip")
+        for p in data.get("ports") or []:
+            try:
+                port = int((p or {}).get("port", 0))
+            except Exception:
+                continue
+            if ip and 1 <= port <= 65535:
+                found.append(f"{ip}:{port}")
+    else:
+        for line in raw.splitlines():
+            line = line.strip().rstrip(",")
+            if not line or line in ("[", "]"):
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            ip = entry.get("ip")
+            for p in entry.get("ports") or []:
+                try:
+                    port = int((p or {}).get("port", 0))
+                except Exception:
+                    continue
+                if ip and 1 <= port <= 65535:
+                    found.append(f"{ip}:{port}")
+    return [t for t in dict.fromkeys(found) if not is_ignored(t)]
+
+
+_MASSCAN_DISCOVERED_RE = re.compile(r"^Discovered\s+open\s+port\s+(\d{1,5})/(\w+)\s+on\s+(\S+)")
+
+def parse_masscan_discovered_line(line):
+    """Parse 'Discovered open port 25565/tcp on 1.2.3.4' (masscan --interactive)."""
+    m = _MASSCAN_DISCOVERED_RE.match((line or "").strip())
+    if not m:
+        return None
+    try:
+        port = int(m.group(1))
+    except ValueError:
+        return None
+    host = m.group(3)
+    if not host or not (1 <= port <= 65535):
+        return None
+    return f"{host}:{port}"
+
+
+def _masscan_failure_markers(output):
+    low = (output or "").lower()
+    return ("sorry, try again" in low or "incorrect password" in low
+            or "no tty present" in low or "sudo: " in low
+            or "could not open file" in low
+            or "permission denied" in low or "need to sudo" in low
+            or "run as root" in low or "fail: " in low)
+
+
+def _raise_masscan_error(returncode, output):
+    """Raise the most helpful exception for a failed masscan run."""
+    output = (output or "").strip()
+    low = output.lower()
+    if ("sorry, try again" in low or "incorrect password" in low
+            or "no tty present" in low or "sudo: " in low):
+        raise PermissionError(
+            "sudo authentication failed (wrong password or not allowed "
+            "to run masscan with sudo). " + output[:300]
+        )
+    if "could not open file" in low:
+        raise RuntimeError(
+            "masscan could not open its output destination. " + output[:300]
+        )
+    if "permission denied" in low or "need to sudo" in low or "run as root" in low:
+        raise PermissionError(
+            "masscan needs raw-socket privileges. Run as root/Administrator "
+            "(Linux: sudo, Windows: admin + Npcap) or use Python backend. "
+            + output[:300]
+        )
+    raise RuntimeError(f"masscan failed (exit {returncode}): {output[:500]}")
+
+
+def _masscan_popen(cmd, sudo_password):
+    """Start masscan; feed a sudo password via stdin when given, then close it
+    at once so sudo can never block on a tty prompt."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if sudo_password is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    if sudo_password is not None:
+        try:
+            proc.stdin.write(sudo_password + "\n")
+        except Exception:
+            pass
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+    return proc
+
+
+def _masscan_proc_error_info(proc, output):
+    """(returncode, failed_bool) for a finished masscan process."""
+    try:
+        returncode = proc.returncode
+    except Exception:
+        returncode = -1
+    failed = (returncode not in (0, None)) or _masscan_failure_markers(output)
+    return returncode, failed
+
+
+def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
+                           wait=MASSCAN_DEFAULT_WAIT, timeout=None, exe=None,
+                           use_sudo=False, sudo_password=None):
+    """Run masscan SYN discovery. Returns (open_targets, stderr_note).
+
+    open_targets is a list of 'ip:port' strings with TCP open.
+    Raises FileNotFoundError when masscan is missing, PermissionError when raw
+    sockets are denied (needs root/admin), TimeoutError on timeout.
+    Results stream through stdout (`-oJ -`); no temp files are used.
+    """
+    exe = exe or shutil.which("masscan")
+    if not exe:
+        if MASSCAN_BIN and os.path.isabs(MASSCAN_BIN) and os.path.exists(MASSCAN_BIN):
+            exe = MASSCAN_BIN
+        else:
+            raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
+    ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
+    try:
+        rate = max(100, min(int(rate), 1000000))
+    except Exception:
+        rate = MASSCAN_DEFAULT_RATE
+    try:
+        wait = max(0, min(int(wait), 60))
+    except Exception:
+        wait = MASSCAN_DEFAULT_WAIT
+    if not masscan_targets:
+        return [], "no targets"
+
+    port_spec = ",".join(str(p) for p in ports)
+    base_cmd = [exe]
+    if use_sudo:
+        if not sudo_available():
+            raise PermissionError(
+                "sudo is not available on this system. Run as Administrator/root "
+                "or use the Python backend."
+            )
+        # -S reads the password from stdin, -p "" suppresses sudo's own prompt.
+        base_cmd = ["sudo", "-S", "-p", "", exe]
+    cmd = base_cmd + list(masscan_targets) + [
+        "-p", port_spec,
+        "--open",
+        "--rate", str(rate),
+        "--wait", str(wait),
+        "-oJ", "-",
+    ]
+    if timeout is None:
+        timeout = 300 + MASSCAN_OUTPUT_TIMEOUT_MARGIN
+    try:
+        proc = _masscan_popen(cmd, sudo_password if use_sudo else None)
+    except FileNotFoundError:
+        raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except Exception:
+                stdout, stderr = "", ""
+            raise TimeoutError(f"masscan timed out after {timeout}s")
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"masscan failed to run: {exc}")
+    output = (stderr or "").strip()
+    opened = parse_masscan_json_text(stdout or "")
+    returncode, failed = _masscan_proc_error_info(proc, output)
+    if failed:
+        if opened:
+            return opened, output[:500]
+        _raise_masscan_error(returncode, output)
+    return opened, (output[:500] if output else "")
+
+
+_MASSCAN_LIST_LINE_RE = re.compile(r"^open\s+tcp\s+(\d{1,5})\s+(\S+)")
+
+def parse_masscan_list_line(line):
+    """Parse one masscan -oL line ('open tcp 25565 1.2.3.4 ...') into 'ip:port'."""
+    m = _MASSCAN_LIST_LINE_RE.match((line or "").strip())
+    if not m:
+        return None
+    try:
+        port = int(m.group(1))
+    except ValueError:
+        return None
+    host = m.group(2)
+    if not host or not (1 <= port <= 65535):
+        return None
+    return f"{host}:{port}"
+
+
+def sudo_available():
+    """True when a sudo binary exists (Linux/macOS privilege escalation path)."""
+    return os.name != "nt" and shutil.which("sudo") is not None
+
+
+def sudo_noninteractive_ok(timeout=10):
+    """True when sudo works without a password (root, passwordless sudo, cached creds)."""
+    if not sudo_available():
+        return False
+    try:
+        proc = subprocess.run(["sudo", "-n", "true"],
+                              capture_output=True, text=True, timeout=timeout)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
+                          wait=MASSCAN_DEFAULT_WAIT, on_open=None, timeout=None,
+                          exe=None, use_sudo=False, sudo_password=None):
+    """Run masscan and call on_open(ip_port) live as open ports are found.
+
+    masscan runs with `--interactive` (which flushes a `Discovered open
+    port ...` line to stdout per hit) plus `-oL -` as a backup stream, so
+    callers can handshake/display each host immediately instead of waiting
+    for the whole sweep. Everything flows through pipes; no temp files are
+    used, so there is nothing a privileged/unprivileged user mismatch can
+    fail to open. Returns (found_list, note). Raises FileNotFoundError when
+    masscan is missing, PermissionError when raw sockets are denied, and
+    TimeoutError on timeout.
+
+    When use_sudo is True, masscan runs under `sudo -S` (password fed via
+    stdin when sudo_password is given, otherwise relies on cached/passwordless
+    sudo so it can never hang on a tty prompt).
+    """
+    exe = exe or shutil.which("masscan")
+    if not exe:
+        if MASSCAN_BIN and os.path.isabs(MASSCAN_BIN) and os.path.exists(MASSCAN_BIN):
+            exe = MASSCAN_BIN
+        else:
+            raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
+    ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
+    try:
+        rate = max(100, min(int(rate), 1000000))
+    except Exception:
+        rate = MASSCAN_DEFAULT_RATE
+    try:
+        wait = max(0, min(int(wait), 60))
+    except Exception:
+        wait = MASSCAN_DEFAULT_WAIT
+    if not masscan_targets:
+        return [], "no targets"
+
+    port_spec = ",".join(str(p) for p in ports)
+    base_cmd = [exe]
+    if use_sudo:
+        if not sudo_available():
+            raise PermissionError(
+                "sudo is not available on this system. Run as Administrator/root "
+                "or use the Python backend."
+            )
+        # -S reads the password from stdin, -p "" suppresses sudo's own prompt.
+        base_cmd = ["sudo", "-S", "-p", "", exe]
+    # --interactive prints (and flushes) one 'Discovered open port ...' line
+    # per hit; -oL - mirrors the same hits as list lines on the same pipe.
+    cmd = base_cmd + list(masscan_targets) + [
+        "-p", port_spec,
+        "--open",
+        "--rate", str(rate),
+        "--wait", str(wait),
+        "--interactive",
+        "-oL", "-",
+    ]
+    if timeout is None:
+        timeout = 300 + MASSCAN_OUTPUT_TIMEOUT_MARGIN
+    found = []
+    seen = set()
+
+    def emit(ip_port):
+        if not ip_port or ip_port in seen or is_ignored(ip_port):
+            return
+        seen.add(ip_port)
+        found.append(ip_port)
+        if on_open:
+            try:
+                on_open(ip_port)
+            except Exception:
+                pass
+
+    try:
+        proc = _masscan_popen(cmd, sudo_password if use_sudo else None)
+    except FileNotFoundError:
+        raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
+    timed_out = {"hit": False}
+
+    def _kill():
+        try:
+            if proc.poll() is None:
+                timed_out["hit"] = True
+                proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout, _kill)
+    watchdog.daemon = True
+    stderr = ""
+    try:
+        watchdog.start()
+        try:
+            for line in proc.stdout:
+                ip_port = parse_masscan_discovered_line(line)
+                if ip_port is None:
+                    ip_port = parse_masscan_list_line(line)
+                if ip_port:
+                    emit(ip_port)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        try:
+            stderr = proc.stderr.read() or ""
+        except Exception:
+            stderr = ""
+    finally:
+        try:
+            watchdog.cancel()
+        except Exception:
+            pass
+        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+    stderr = (stderr or "").strip()
+    if timed_out["hit"]:
+        if found:
+            note = (stderr[:400] + " " if stderr else "") + f"[partial: timed out after {timeout}s]"
+            return found, note.strip()
+        raise TimeoutError(f"masscan timed out after {timeout}s")
+    returncode, failed = _masscan_proc_error_info(proc, stderr)
+    if failed:
+        # An old masscan may not know --interactive; retry plainly (batched).
+        if "interactive" in (stderr or "") and "unknown" in (stderr or "").lower():
+            return _run_masscan_streaming_plain(
+                base_cmd, masscan_targets, port_spec, rate, wait,
+                timeout, found, seen, emit, sudo_password if use_sudo else None)
+        if found:
+            return found, stderr[:500]
+        _raise_masscan_error(returncode, stderr)
+    return found, (stderr[:500] if stderr else "")
+
+
+def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wait,
+                                 timeout, found, seen, emit, sudo_password):
+    """Fallback for masscan builds without --interactive: same stdout stream
+    with only -oL - list lines (still live in chunks, no temp files)."""
+    cmd = base_cmd + list(masscan_targets) + [
+        "-p", port_spec,
+        "--open",
+        "--rate", str(rate),
+        "--wait", str(wait),
+        "-oL", "-",
+    ]
+    try:
+        proc = _masscan_popen(cmd, sudo_password)
+    except FileNotFoundError:
+        raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
+    timed_out = {"hit": False}
+
+    def _kill():
+        try:
+            if proc.poll() is None:
+                timed_out["hit"] = True
+                proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout, _kill)
+    watchdog.daemon = True
+    stderr = ""
+    try:
+        watchdog.start()
+        try:
+            for line in proc.stdout:
+                ip_port = parse_masscan_list_line(line)
+                if ip_port:
+                    emit(ip_port)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        try:
+            stderr = proc.stderr.read() or ""
+        except Exception:
+            stderr = ""
+    finally:
+        try:
+            watchdog.cancel()
+        except Exception:
+            pass
+        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+    stderr = (stderr or "").strip()
+    if timed_out["hit"]:
+        if found:
+            note = (stderr[:400] + " " if stderr else "") + f"[partial: timed out after {timeout}s]"
+            return found, note.strip()
+        raise TimeoutError(f"masscan timed out after {timeout}s")
+    returncode, failed = _masscan_proc_error_info(proc, stderr)
+    if failed:
+        if found:
+            return found, stderr[:500]
+        _raise_masscan_error(returncode, stderr)
+    return found, (stderr[:500] if stderr else "")
+
+
+def merge_global_ip_log(updated_ips):
+    """Merge {ip_port: line} results into the global ips.txt log."""
+    existing = {}
+    if os.path.exists(GLOBAL_IP_LOG):
+        try:
+            with open(GLOBAL_IP_LOG, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        ip = line.strip().split(' |')[0]
+                        existing[ip] = line.strip()
+        except Exception:
+            pass
+    existing.update({k: v for k, v in (updated_ips or {}).items() if not is_ignored(k)})
+    try:
+        with open(GLOBAL_IP_LOG, 'w', encoding='utf-8') as f:
+            for line in sorted(existing.values()):
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
 class UserLogManager:
     """
     Thread-safe store that tracks the last seen server for each player name.
@@ -3458,6 +4143,28 @@ class NetworkScanTab(ttk.Frame):
         self.max_hosts_var = tk.StringVar(value=str(NETWORK_SCAN_MAX_HOSTS))
         ttk.Entry(top, textvariable=self.max_hosts_var, width=18).grid(row=3, column=1, sticky="ew")
 
+        backend_bar = ttk.Frame(content)
+        backend_bar.pack(fill="x", padx=8, pady=(0,8))
+        ttk.Label(backend_bar, text="Backend:").pack(side="left")
+        self.backend_var = tk.StringVar(value="Auto (masscan → Python)")
+        self.backend_combo = ttk.Combobox(
+            backend_bar,
+            textvariable=self.backend_var,
+            values=["Auto (masscan → Python)", "masscan (fast SYN + handshake)", "Python (handshake only)"],
+            state="readonly",
+            width=30,
+        )
+        self.backend_combo.pack(side="left", padx=4)
+        ttk.Label(backend_bar, text="Rate (pps):").pack(side="left", padx=(12, 2))
+        self.masscan_rate_var = tk.StringVar(value=str(MASSCAN_DEFAULT_RATE))
+        ttk.Entry(backend_bar, textvariable=self.masscan_rate_var, width=8).pack(side="left")
+        ttk.Label(backend_bar, text="Wait (s):").pack(side="left", padx=(12, 2))
+        self.masscan_wait_var = tk.StringVar(value=str(MASSCAN_DEFAULT_WAIT))
+        ttk.Entry(backend_bar, textvariable=self.masscan_wait_var, width=5).pack(side="left")
+        self.masscan_status_var = tk.StringVar(value=masscan_status_line())
+        ttk.Label(backend_bar, textvariable=self.masscan_status_var).pack(side="left", padx=(12, 2))
+        ttk.Button(backend_bar, text="Recheck", command=lambda: self.masscan_status_var.set(masscan_status_line())).pack(side="left", padx=4)
+
         controls = ttk.Frame(content)
         controls.pack(fill="x", padx=8, pady=(0,8))
         ttk.Button(controls, text="Scan Targets", command=self.scan_targets).pack(side="left", padx=4)
@@ -3557,26 +4264,77 @@ class NetworkScanTab(ttk.Frame):
                 self.scan_rows[idx] = tuple(row)
                 break
 
+    def _prompt_sudo_password(self):
+        """Ask for the sudo password on the main thread. Called from a worker
+        thread; blocks it until the user answers. Returns the password or None
+        when canceled/timed out. The password is kept in memory for this scan
+        only and never stored."""
+        holder = {}
+        done = threading.Event()
+
+        def ask():
+            try:
+                pw = simpledialog.askstring(
+                    "masscan needs root",
+                    "masscan needs raw-socket privileges.\n"
+                    "Enter your sudo password to rerun discovery with sudo\n"
+                    "(used once for this scan, never stored):",
+                    parent=self, show="*")
+            except Exception:
+                pw = None
+            holder["pw"] = pw
+            done.set()
+
+        try:
+            self.after(0, ask)
+        except Exception:
+            return None
+        if not done.wait(timeout=300):
+            return None
+        return holder.get("pw")
+
     def scan_targets(self):
         try:
-            max_hosts = int(self.max_hosts_var.get().strip() or NETWORK_SCAN_MAX_HOSTS)
+            max_hosts_raw = int(self.max_hosts_var.get().strip() or NETWORK_SCAN_MAX_HOSTS)
         except ValueError:
-            max_hosts = NETWORK_SCAN_MAX_HOSTS
-        max_hosts = max(1, min(max_hosts, 65536))
+            max_hosts_raw = NETWORK_SCAN_MAX_HOSTS
+        backend = ""
+        try:
+            backend = self.backend_var.get()
+        except Exception:
+            backend = "Auto (masscan → Python)"
+        use_masscan = backend != "Python (handshake only)"
+        if use_masscan:
+            max_hosts = max(1, min(max_hosts_raw, MASSCAN_MAX_HOSTS))
+        else:
+            max_hosts = max(1, min(max_hosts_raw, 65536))
         ports = parse_ports(self.ports_var.get())
+        try:
+            masscan_rate = int((self.masscan_rate_var.get() or "").strip() or MASSCAN_DEFAULT_RATE)
+        except ValueError:
+            masscan_rate = MASSCAN_DEFAULT_RATE
+        try:
+            masscan_wait = int((self.masscan_wait_var.get() or "").strip() or MASSCAN_DEFAULT_WAIT)
+        except ValueError:
+            masscan_wait = MASSCAN_DEFAULT_WAIT
         targets_raw = self.targets_text.get("1.0", "end")
+        # Snapshot Tk vars here (main thread); work() runs in the background.
+        only_players = self.only_players_var.get()
+        pre_version = self.pre_version_var.get().strip()
+        check_whitelist_flag = self.check_whitelist_var.get()
         self.set_status("Expanding targets...")
 
         def work():
             try:
-                targets = expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
-                if not targets:
-                    self.after(0, lambda: self.set_status("No valid targets to scan."))
+                if use_masscan and backend.startswith("masscan") and not is_masscan_available():
+                    self.after(0, lambda: self.set_status("masscan not found; install masscan or use Auto/Python backend."))
                     return
+                # Shared setup runs first so streamed masscan hits appear in
+                # the table the moment their handshake completes.
                 self.scan_rows = []
                 self._scan_row_map = {}
                 self.after(0, lambda: self.scan_tree.delete(*self.scan_tree.get_children()))
-                check_whitelist = self.check_whitelist_var.get()
+                check_whitelist = check_whitelist_flag
                 account = get_active_mc_account() if check_whitelist else None
                 if check_whitelist and not account:
                     self.after(0, lambda: self.set_status("Whitelist check canceled: no account selected."))
@@ -3587,7 +4345,8 @@ class NetworkScanTab(ttk.Frame):
                 whitelist_entries = []
                 whitelist_seen = set()
                 lock = threading.Lock()
-                pre_version = self.pre_version_var.get().strip()
+                results = []
+                stream_updated = {}
 
                 def on_start(ip):
                     self._current_scan_ip = ip
@@ -3595,7 +4354,7 @@ class NetworkScanTab(ttk.Frame):
                 def on_result(r, line):
                     if not r:
                         return
-                    if self.only_players_var.get() and r.get("players", 0) <= 0:
+                    if only_players and r.get("players", 0) <= 0:
                         return
                     if pre_version and not version_filter_allows(r.get("version", ""), pre_version):
                         return
@@ -3620,18 +4379,154 @@ class NetworkScanTab(ttk.Frame):
                                 whitelist_seen.add(r["ip"])
                                 whitelist_entries.append(r)
 
-                def on_progress(done, total):
-                    self.after(0, lambda d=done, t=total:
-                               self.set_status(f"Network scan: {d}/{t}"))
+                targets = None
+                skip_python = False
+                if use_masscan and is_masscan_available():
+                    # ---- streaming masscan path: each open port is handed to
+                    # the handshake pool (and the GUI) as soon as masscan
+                    # reports it, instead of waiting for the whole sweep. ----
+                    try:
+                        ranges, direct = build_masscan_inputs(targets_raw, ports, max_hosts=max_hosts)
+                    except Exception as exc:
+                        ranges, direct = [], []
+                        if backend.startswith("masscan"):
+                            message = str(exc)
+                            self.after(0, lambda m=message: self.set_status(f"masscan target error: {m}"))
+                            return
+                    if not ranges and not direct:
+                        targets = []
+                    if targets is None:
+                        submitted = set()
+                        opened_n = {"n": 0}
+                        probed_n = {"n": 0}
+                        hs_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-                results, _ = scan_servers_gui(
-                    targets,
-                    on_start=on_start,
-                    on_result=on_result,
-                    on_progress=on_progress
-                )
+                        def update_stream_status():
+                            self.after(0, lambda o=opened_n["n"], p=probed_n["n"], f=len(results):
+                                self.set_status(f"masscan: {o} open | handshake: {p} | Minecraft: {f}"))
+
+                        def handle_ping_done(server, fut):
+                            try:
+                                r = fut.result()
+                            except Exception:
+                                r = None
+                            with lock:
+                                probed_n["n"] += 1
+                            if r:
+                                line = (f"{r['ip']} | MOTD: {r['motd']} | Players: "
+                                        f"{r['players']}/{r['max_players']} | Version: {r['version']}")
+                                with lock:
+                                    results.append(r)
+                                    stream_updated[r["ip"]] = line
+                                try:
+                                    USER_LOG_MANAGER.update_from_result(r)
+                                except Exception:
+                                    pass
+                                try:
+                                    on_result(r, line)
+                                except Exception:
+                                    pass
+                            update_stream_status()
+
+                        def handle_open(ip_port):
+                            with lock:
+                                if ip_port in submitted:
+                                    return
+                                submitted.add(ip_port)
+                                opened_n["n"] += 1
+                            on_start(ip_port)
+                            try:
+                                fut = hs_executor.submit(ping_server, ip_port)
+                            except Exception:
+                                return
+                            fut.add_done_callback(lambda f, s=ip_port: handle_ping_done(s, f))
+                            update_stream_status()
+
+                        def finish_stream_error(msg):
+                            """Common failure exit. Returns 'fallback' or 'abort'."""
+                            try:
+                                hs_executor.shutdown(wait=True)
+                            except Exception:
+                                pass
+                            if backend.startswith("masscan"):
+                                merge_global_ip_log(stream_updated)
+                                self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
+                                self.after(0, lambda m=msg: self.set_status(m))
+                                return "abort"
+                            self.after(0, lambda m=msg: self.set_status(m + " Falling back to Python scan..."))
+                            return "fallback"
+
+                        for d in direct:
+                            handle_open(d)
+                        self.after(0, lambda: self.set_status("masscan: discovering open ports (live)..."))
+                        outcome = "ok"
+                        try:
+                            run_masscan_streaming(ranges, ports, rate=masscan_rate,
+                                                  wait=masscan_wait, on_open=handle_open)
+                        except PermissionError:
+                            if sudo_available() and ranges:
+                                self.after(0, lambda: self.set_status("masscan needs root; trying sudo..."))
+                                passwordless = sudo_noninteractive_ok()
+                                sudo_pw = None
+                                if passwordless:
+                                    self.after(0, lambda: self.set_status("masscan: retrying with sudo..."))
+                                else:
+                                    sudo_pw = self._prompt_sudo_password()
+                                if passwordless or sudo_pw:
+                                    try:
+                                        self.after(0, lambda: self.set_status(
+                                            "masscan: discovering open ports with sudo (live)..."))
+                                        run_masscan_streaming(ranges, ports, rate=masscan_rate,
+                                                              wait=masscan_wait, on_open=handle_open,
+                                                              use_sudo=True, sudo_password=sudo_pw)
+                                        sudo_pw = None
+                                    except PermissionError as exc2:
+                                        outcome = finish_stream_error(f"sudo failed: {exc2}")
+                                    except Exception as exc2:
+                                        outcome = finish_stream_error(f"masscan with sudo failed: {exc2}")
+                                else:
+                                    outcome = finish_stream_error("sudo canceled")
+                            else:
+                                outcome = finish_stream_error("masscan needs privileges")
+                        except Exception as exc:
+                            outcome = finish_stream_error(f"masscan failed: {exc}")
+                        if outcome == "abort":
+                            return
+                        if outcome == "fallback":
+                            try:
+                                hs_executor.shutdown(wait=True)
+                            except Exception:
+                                pass
+                            targets = [t for t in expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
+                                       if t not in submitted]
+                        else:
+                            try:
+                                hs_executor.shutdown(wait=True)
+                            except Exception:
+                                pass
+                            skip_python = True
+                if not skip_python:
+                    if targets is None:
+                        targets = expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
+                    if not targets and not results:
+                        self.after(0, lambda: self.set_status("No valid targets to scan."))
+                        merge_global_ip_log(stream_updated)
+                        return
+                    if targets:
+                        def on_progress(done, total):
+                            self.after(0, lambda d=done, t=total:
+                                       self.set_status(f"Network scan: {d}/{t}"))
+
+                        more, _ = scan_servers_gui(
+                            targets,
+                            on_start=on_start,
+                            on_result=on_result,
+                            on_progress=on_progress
+                        )
+                        results.extend(more)
+                merge_global_ip_log(stream_updated)
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
-                self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}."))
+                self.after(0, lambda n=len(results): self.set_status(f"Scan complete. Minecraft servers: {n}."))
 
                 if check_whitelist:
                     with lock:

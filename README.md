@@ -25,6 +25,18 @@ The Network Scan tab accepts individual IPv4 addresses, CIDR ranges, explicit IP
 
 ASN scanning resolves announced IPv4 prefixes through BGPView, expands the prefixes within the configured host limit, and scans the configured ports. The scan supports multiple ports and protects the application with a maximum-host limit.
 
+#### masscan backend (fast)
+
+The Backend selector controls port discovery:
+
+- `Auto (masscan → Python)` (default): uses masscan SYN discovery when the binary is available, then runs the Minecraft handshake only on open ports. Falls back to pure Python when masscan is missing or lacks privileges.
+- `masscan (fast SYN + handshake)`: requires masscan and fails clearly when it is missing or unprivileged instead of falling back.
+- `Python (handshake only)`: original ThreadPool handshake scan, no masscan.
+
+Phase 1 (masscan) passes CIDR/range/ASN prefixes directly to masscan (`-p <ports> --open --rate <pps> --wait <s> --interactive -oL -`), so large ranges do not need per-host Python expansion. `--interactive` makes masscan print and flush one `Discovered open port ...` line per hit, which the scanner reads live from masscan's stdout pipe — each open port is handed to the Minecraft handshake pool immediately and rows appear in the table as hosts are discovered and verified, not batched at the end. (masscan's `-oL` file output is libc-buffered and only lands in chunks, which is why file-tailing can't stream; the interactive stream is flushed per result. `-oL -` list lines on the same pipe act as backup, and very old masscan builds without `--interactive` fall back to parsing those.) Everything flows through pipes — no temp files — so privileged and unprivileged runs can't disagree over output files. Tune packets-per-second with Rate and post-scan wait with Wait. masscan needs raw-socket privileges: run as root/Administrator (Linux: `sudo`, Windows: admin + Npcap). Without privileges the Auto backend falls back to Python automatically.
+
+When masscan reports insufficient privileges and `sudo` is available (Linux/macOS), the scanner first tries passwordless sudo (`sudo -n true`, which also succeeds when credentials are cached) and otherwise prompts for the sudo password in a popup, then reruns discovery as `sudo -S masscan ...`. The password is fed once through a pipe, kept only in memory for that scan, and never written to disk. Canceling the prompt aborts the masscan backend (strict mode) or falls back to Python (Auto mode).
+
 ### Whitelist verification
 
 - Checks whitelist access with an authenticated Minecraft account.
@@ -108,6 +120,7 @@ Network Scan results remain in the scan result table unless they are explicitly 
 - A valid Shodan API key for Shodan searches.
 - The cryptography package for authenticated whitelist probes.
 - Network access for Shodan, Minecraft status probes, account services, and ASN prefix lookup.
+- Optional: masscan for fast Network Scan discovery (requires root/Administrator + Npcap on Windows). Without it, the scanner falls back to the Python backend.
 
 ## Running the application
 
