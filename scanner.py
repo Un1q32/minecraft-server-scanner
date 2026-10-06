@@ -1,6 +1,7 @@
 # === Minecraft Scanner by Cev-API ===
 
 import shodan
+import codecs
 import socket
 import struct
 import json
@@ -2497,11 +2498,11 @@ def parse_masscan_json_text(raw):
     return [t for t in dict.fromkeys(found) if not is_ignored(t)]
 
 
-_MASSCAN_DISCOVERED_RE = re.compile(r"^Discovered\s+open\s+port\s+(\d{1,5})/(\w+)\s+on\s+(\S+)")
+_MASSCAN_DISCOVERED_RE = re.compile(r"Discovered\s+open\s+port\s+(\d{1,5})/(\w+)\s+on\s+(\S+)")
 
 def parse_masscan_discovered_line(line):
     """Parse 'Discovered open port 25565/tcp on 1.2.3.4' (masscan --interactive)."""
-    m = _MASSCAN_DISCOVERED_RE.match((line or "").strip())
+    m = _MASSCAN_DISCOVERED_RE.search(line or "")
     if not m:
         return None
     try:
@@ -2546,18 +2547,24 @@ def _raise_masscan_error(returncode, output):
     raise RuntimeError(f"masscan failed (exit {returncode}): {output[:500]}")
 
 
-def _masscan_popen(cmd, sudo_password):
+def _masscan_popen(cmd, sudo_password, merge_stderr=False, binary_stream=False):
     """Start masscan; feed a sudo password via stdin when given, then close it
-    at once so sudo can never block on a tty prompt."""
+    at once so sudo can never block on a tty prompt. With merge_stderr=True,
+    stderr is folded into stdout (one pipe to drain, no deadlock possible).
+    With binary_stream=True the stdout pipe is binary (for manual chunk reads)."""
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE if sudo_password is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        text=not binary_stream, bufsize=1 if not binary_stream else -1,
     )
     if sudo_password is not None:
         try:
-            proc.stdin.write(sudo_password + "\n")
+            if binary_stream:
+                proc.stdin.write((sudo_password + "\n").encode("utf-8", "replace"))
+            else:
+                proc.stdin.write(sudo_password + "\n")
         except Exception:
             pass
         try:
@@ -2565,6 +2572,125 @@ def _masscan_popen(cmd, sudo_password):
         except Exception:
             pass
     return proc
+
+
+_MASSCAN_PROGRESS_RE = re.compile(r"rate:\s*([\d.]+)-kpps,\s*([\d.]+)%\s*done")
+
+def parse_masscan_progress(fragment):
+    """Parse masscan's status line ('rate: 9.83-kpps, 12.34% done, ...').
+    Returns (percent_float, rate_kpps_str) or None."""
+    m = _MASSCAN_PROGRESS_RE.search(fragment or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(2)), m.group(1)
+    except ValueError:
+        return None
+
+
+def format_stream_status(opened, probed, found, pct=None, rate=None):
+    """Status-bar text for a live masscan sweep."""
+    if pct is None:
+        return f"masscan: {opened} open | handshake: {probed} | Minecraft: {found}"
+    if rate:
+        return (f"masscan: {pct:.0f}% @ {rate}kpps | {opened} open | "
+                f"handshake: {probed} | Minecraft: {found}")
+    return f"masscan: {pct:.0f}% | {opened} open | handshake: {probed} | Minecraft: {found}"
+
+
+def _drain_masscan_stdout(proc, timeout, frag_cb, progress_cb=None, note_cap=4096):
+    """Feed \\r/\\n-separated stdout fragments to callbacks until EOF.
+
+    masscan's progress line uses bare \\r (no newline), so the pipe is read
+    in chunks and split on both characters; result lines use \\n. Progress
+    fragments go to progress_cb(pct, rate); other fragments go to
+    frag_cb(frag), which returns True when it consumed a result line.
+    Unmatched text (capped) is returned for error notes.
+    Returns (timed_out, other_text). Kills proc after timeout.
+    """
+    timed_out = {"hit": False}
+
+    def _kill():
+        try:
+            if proc.poll() is None:
+                timed_out["hit"] = True
+                proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout, _kill)
+    watchdog.daemon = True
+    other_parts = []
+    other_len = 0
+
+    def handle_fragment(frag):
+        nonlocal other_len
+        frag = (frag or "").strip()
+        if not frag:
+            return
+        # NOTE: no early return after progress — masscan glues the \r status
+        # text directly onto the next result line, so one fragment can hold
+        # both ("...found=1Discovered open port ...").
+        prog_matched = parse_masscan_progress(frag) is not None
+        if prog_matched and progress_cb is not None:
+            try:
+                progress_cb(*parse_masscan_progress(frag))
+            except Exception:
+                pass
+        try:
+            matched = frag_cb(frag)
+        except Exception:
+            matched = False
+        if not matched and not prog_matched and other_len < note_cap:
+            other_parts.append(frag[:500])
+            other_len += len(frag[:500])
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buf = ""
+    try:
+        watchdog.start()
+        while True:
+            try:
+                chunk = proc.stdout.read1(65536)
+            except Exception:
+                break
+            if not chunk:
+                break
+            try:
+                buf += decoder.decode(chunk)
+            except Exception:
+                continue
+            if "\r" in buf or "\n" in buf:
+                parts = re.split(r"[\r\n]+", buf)
+                buf = parts.pop()
+                for frag in parts:
+                    handle_fragment(frag)
+        try:
+            buf += decoder.decode(b"", final=True)
+        except Exception:
+            pass
+        if buf.strip():
+            handle_fragment(buf)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+    finally:
+        try:
+            watchdog.cancel()
+        except Exception:
+            pass
+        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+    return timed_out["hit"], "\n".join(other_parts).strip()[:note_cap]
 
 
 def _masscan_proc_error_info(proc, output):
@@ -2655,11 +2781,11 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     return opened, (output[:500] if output else "")
 
 
-_MASSCAN_LIST_LINE_RE = re.compile(r"^open\s+tcp\s+(\d{1,5})\s+(\S+)")
+_MASSCAN_LIST_LINE_RE = re.compile(r"open\s+tcp\s+(\d{1,5})\s+(\S+)")
 
 def parse_masscan_list_line(line):
     """Parse one masscan -oL line ('open tcp 25565 1.2.3.4 ...') into 'ip:port'."""
-    m = _MASSCAN_LIST_LINE_RE.match((line or "").strip())
+    m = _MASSCAN_LIST_LINE_RE.search(line or "")
     if not m:
         return None
     try:
@@ -2690,8 +2816,8 @@ def sudo_noninteractive_ok(timeout=10):
 
 
 def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
-                          wait=MASSCAN_DEFAULT_WAIT, on_open=None, timeout=None,
-                          exe=None, use_sudo=False, sudo_password=None):
+                          wait=MASSCAN_DEFAULT_WAIT, on_open=None, on_scan_progress=None,
+                          timeout=None, exe=None, use_sudo=False, sudo_password=None):
     """Run masscan and call on_open(ip_port) live as open ports are found.
 
     masscan runs with `--interactive` (which flushes a `Discovered open
@@ -2761,59 +2887,26 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             except Exception:
                 pass
 
+    def handle_result(frag):
+        ip_port = parse_masscan_discovered_line(frag)
+        if ip_port is None:
+            ip_port = parse_masscan_list_line(frag)
+        if ip_port:
+            emit(ip_port)
+            return True
+        return False
+
     try:
-        proc = _masscan_popen(cmd, sudo_password if use_sudo else None)
+        proc = _masscan_popen(cmd, sudo_password if use_sudo else None,
+                              merge_stderr=True, binary_stream=True)
     except FileNotFoundError:
         raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
-    timed_out = {"hit": False}
-
-    def _kill():
-        try:
-            if proc.poll() is None:
-                timed_out["hit"] = True
-                proc.kill()
-        except Exception:
-            pass
-
-    watchdog = threading.Timer(timeout, _kill)
-    watchdog.daemon = True
-    stderr = ""
-    try:
-        watchdog.start()
-        try:
-            for line in proc.stdout:
-                ip_port = parse_masscan_discovered_line(line)
-                if ip_port is None:
-                    ip_port = parse_masscan_list_line(line)
-                if ip_port:
-                    emit(ip_port)
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _kill()
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                pass
-        try:
-            stderr = proc.stderr.read() or ""
-        except Exception:
-            stderr = ""
-    finally:
-        try:
-            watchdog.cancel()
-        except Exception:
-            pass
-        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
-            try:
-                if stream:
-                    stream.close()
-            except Exception:
-                pass
-    stderr = (stderr or "").strip()
-    if timed_out["hit"]:
+    # One merged pipe: masscan's \r progress, flushed Discovered lines and
+    # buffered -oL lines all arrive here; nothing can deadlock or stay hidden.
+    timed_out, other = _drain_masscan_stdout(proc, timeout, handle_result,
+                                             progress_cb=on_scan_progress)
+    stderr = other
+    if timed_out:
         if found:
             note = (stderr[:400] + " " if stderr else "") + f"[partial: timed out after {timeout}s]"
             return found, note.strip()
@@ -2824,7 +2917,8 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
         if "interactive" in (stderr or "") and "unknown" in (stderr or "").lower():
             return _run_masscan_streaming_plain(
                 base_cmd, masscan_targets, port_spec, rate, wait,
-                timeout, found, seen, emit, sudo_password if use_sudo else None)
+                timeout, found, seen, emit, sudo_password if use_sudo else None,
+                on_scan_progress=on_scan_progress)
         if found:
             return found, stderr[:500]
         _raise_masscan_error(returncode, stderr)
@@ -2832,8 +2926,9 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
 
 
 def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wait,
-                                 timeout, found, seen, emit, sudo_password):
-    """Fallback for masscan builds without --interactive: same stdout stream
+                                 timeout, found, seen, emit, sudo_password,
+                                 on_scan_progress=None):
+    """Fallback for masscan builds without --interactive: same merged stream
     with only -oL - list lines (still live in chunks, no temp files)."""
     cmd = base_cmd + list(masscan_targets) + [
         "-p", port_spec,
@@ -2843,56 +2938,22 @@ def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wai
         "-oL", "-",
     ]
     try:
-        proc = _masscan_popen(cmd, sudo_password)
+        proc = _masscan_popen(cmd, sudo_password,
+                              merge_stderr=True, binary_stream=True)
     except FileNotFoundError:
         raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
-    timed_out = {"hit": False}
 
-    def _kill():
-        try:
-            if proc.poll() is None:
-                timed_out["hit"] = True
-                proc.kill()
-        except Exception:
-            pass
+    def handle_result(frag):
+        ip_port = parse_masscan_list_line(frag)
+        if ip_port:
+            emit(ip_port)
+            return True
+        return False
 
-    watchdog = threading.Timer(timeout, _kill)
-    watchdog.daemon = True
-    stderr = ""
-    try:
-        watchdog.start()
-        try:
-            for line in proc.stdout:
-                ip_port = parse_masscan_list_line(line)
-                if ip_port:
-                    emit(ip_port)
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _kill()
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                pass
-        try:
-            stderr = proc.stderr.read() or ""
-        except Exception:
-            stderr = ""
-    finally:
-        try:
-            watchdog.cancel()
-        except Exception:
-            pass
-        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
-            try:
-                if stream:
-                    stream.close()
-            except Exception:
-                pass
-    stderr = (stderr or "").strip()
-    if timed_out["hit"]:
+    timed_out, other = _drain_masscan_stdout(proc, timeout, handle_result,
+                                             progress_cb=on_scan_progress)
+    stderr = other
+    if timed_out:
         if found:
             note = (stderr[:400] + " " if stderr else "") + f"[partial: timed out after {timeout}s]"
             return found, note.strip()
@@ -4399,11 +4460,18 @@ class NetworkScanTab(ttk.Frame):
                         submitted = set()
                         opened_n = {"n": 0}
                         probed_n = {"n": 0}
+                        scan_prog = {"pct": None, "rate": None}
                         hs_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
                         def update_stream_status():
-                            self.after(0, lambda o=opened_n["n"], p=probed_n["n"], f=len(results):
-                                self.set_status(f"masscan: {o} open | handshake: {p} | Minecraft: {f}"))
+                            self.after(0, lambda o=opened_n["n"], p=probed_n["n"], f=len(results),
+                                       pct=scan_prog["pct"], rate=scan_prog["rate"]:
+                                self.set_status(format_stream_status(o, p, f, pct, rate)))
+
+                        def handle_scan_progress(pct, rate):
+                            scan_prog["pct"] = pct
+                            scan_prog["rate"] = rate
+                            update_stream_status()
 
                         def handle_ping_done(server, fut):
                             try:
@@ -4462,7 +4530,8 @@ class NetworkScanTab(ttk.Frame):
                         outcome = "ok"
                         try:
                             run_masscan_streaming(ranges, ports, rate=masscan_rate,
-                                                  wait=masscan_wait, on_open=handle_open)
+                                                  wait=masscan_wait, on_open=handle_open,
+                                                  on_scan_progress=handle_scan_progress)
                         except PermissionError:
                             if sudo_available() and ranges:
                                 self.after(0, lambda: self.set_status("masscan needs root; trying sudo..."))
@@ -4478,6 +4547,7 @@ class NetworkScanTab(ttk.Frame):
                                             "masscan: discovering open ports with sudo (live)..."))
                                         run_masscan_streaming(ranges, ports, rate=masscan_rate,
                                                               wait=masscan_wait, on_open=handle_open,
+                                                              on_scan_progress=handle_scan_progress,
                                                               use_sudo=True, sudo_password=sudo_pw)
                                         sudo_pw = None
                                     except PermissionError as exc2:
