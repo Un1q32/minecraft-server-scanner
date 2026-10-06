@@ -4170,6 +4170,109 @@ class AccountTab(ttk.Frame):
         self.status.set(f"Removed {len(removed)} failed account(s).")
 
 
+class _SudoPasswordDialog:
+    """Hand-built sudo password prompt.
+
+    Plain simpledialog prompts fail silently on some macOS Tk builds
+    (grab/focus errors → instant cancel with no window ever shown), so this
+    builds the Toplevel step by step, forces it frontmost, and records the
+    exact failing step instead of swallowing it.
+    """
+
+    def __init__(self, parent):
+        self.password = None
+        self.error = None
+        try:
+            top = tk.Toplevel(parent)
+        except Exception as exc:
+            self.error = f"open dialog window: {exc}"
+            return
+        self.top = top
+        self.entry = None
+        try:
+            top.title("masscan needs root")
+            try:
+                top.resizable(False, False)
+            except Exception:
+                pass
+            try:
+                top.attributes("-topmost", True)
+            except Exception:
+                pass
+            try:
+                top.lift()
+            except Exception:
+                pass
+            ttk.Label(
+                top,
+                text=("masscan needs raw-socket privileges.\n"
+                      "Enter your sudo password to rerun discovery with sudo\n"
+                      "(used once for this scan, never stored):"),
+                wraplength=360, justify="left").pack(padx=14, pady=(12, 8))
+            self.entry = ttk.Entry(top, show="*", width=32)
+            self.entry.pack(padx=14, pady=(0, 6))
+            btns = ttk.Frame(top)
+            btns.pack(padx=14, pady=(0, 14))
+            ttk.Button(btns, text="OK", command=self._on_ok).pack(side="left", padx=(0, 8))
+            ttk.Button(btns, text="Cancel", command=self._on_cancel).pack(side="left")
+            top.protocol("WM_DELETE_WINDOW", self._on_cancel)
+            top.bind("<Return>", lambda _e: self._on_ok())
+            top.bind("<Escape>", lambda _e: self._on_cancel())
+            try:
+                top.update_idletasks()
+                px, py = parent.winfo_rootx(), parent.winfo_rooty()
+                pw, ph = parent.winfo_width(), parent.winfo_height()
+                dw, dh = top.winfo_reqwidth(), top.winfo_reqheight()
+                if pw > 1 and ph > 1:
+                    top.geometry(f"+{max(0, px + (pw - dw) // 2)}+{max(0, py + (ph - dh) // 2)}")
+            except Exception:
+                pass
+            try:
+                self.entry.focus_force()
+            except Exception:
+                pass
+            try:
+                top.after(150, self._force_front)
+            except Exception:
+                pass
+            top.wait_window(top)
+        except Exception as exc:
+            if self.error is None:
+                self.error = f"{exc}"
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+    def _force_front(self):
+        try:
+            self.top.lift()
+        except Exception:
+            pass
+        try:
+            if self.entry is not None:
+                self.entry.focus_force()
+        except Exception:
+            pass
+
+    def _on_ok(self):
+        try:
+            self.password = self.entry.get() if self.entry is not None else None
+        except Exception as exc:
+            self.error = f"read password field: {exc}"
+            self.password = None
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+    def _on_cancel(self):
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+
 class NetworkScanTab(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -4327,32 +4430,36 @@ class NetworkScanTab(ttk.Frame):
 
     def _prompt_sudo_password(self):
         """Ask for the sudo password on the main thread. Called from a worker
-        thread; blocks it until the user answers. Returns the password or None
-        when canceled/timed out. The password is kept in memory for this scan
-        only and never stored."""
+        thread; blocks it until the user answers. Returns
+        (password_or_None, error_or_None): error is set when the prompt
+        itself broke (vs the user pressing Cancel / closing the window).
+        The password is kept in memory for this scan only and never stored."""
         holder = {}
         done = threading.Event()
 
         def ask():
             try:
-                pw = simpledialog.askstring(
-                    "masscan needs root",
-                    "masscan needs raw-socket privileges.\n"
-                    "Enter your sudo password to rerun discovery with sudo\n"
-                    "(used once for this scan, never stored):",
-                    parent=self, show="*")
-            except Exception:
-                pw = None
-            holder["pw"] = pw
-            done.set()
+                top = self.winfo_toplevel()
+                try:
+                    top.lift()
+                except Exception:
+                    pass
+                dlg = _SudoPasswordDialog(top)
+                holder["pw"] = dlg.password
+                holder["err"] = dlg.error
+            except Exception as exc:
+                holder["pw"] = None
+                holder["err"] = f"prompt crashed: {exc}"
+            finally:
+                done.set()
 
         try:
             self.after(0, ask)
-        except Exception:
-            return None
+        except Exception as exc:
+            return None, f"cannot schedule prompt: {exc}"
         if not done.wait(timeout=300):
-            return None
-        return holder.get("pw")
+            return None, "prompt timed out after 5 minutes (no answer)"
+        return holder.get("pw"), holder.get("err")
 
     def scan_targets(self):
         try:
@@ -4537,10 +4644,13 @@ class NetworkScanTab(ttk.Frame):
                                 self.after(0, lambda: self.set_status("masscan needs root; trying sudo..."))
                                 passwordless = sudo_noninteractive_ok()
                                 sudo_pw = None
+                                sudo_err = None
                                 if passwordless:
                                     self.after(0, lambda: self.set_status("masscan: retrying with sudo..."))
                                 else:
-                                    sudo_pw = self._prompt_sudo_password()
+                                    self.after(0, lambda: self.set_status(
+                                        "sudo password required — waiting for the popup..."))
+                                    sudo_pw, sudo_err = self._prompt_sudo_password()
                                 if passwordless or sudo_pw:
                                     try:
                                         self.after(0, lambda: self.set_status(
@@ -4555,7 +4665,12 @@ class NetworkScanTab(ttk.Frame):
                                     except Exception as exc2:
                                         outcome = finish_stream_error(f"masscan with sudo failed: {exc2}")
                                 else:
-                                    outcome = finish_stream_error("sudo canceled")
+                                    if sudo_err:
+                                        outcome = finish_stream_error(
+                                            f"sudo prompt failed ({sudo_err}). "
+                                            "Tip: run 'sudo -v' in Terminal, then scan again")
+                                    else:
+                                        outcome = finish_stream_error("sudo canceled")
                             else:
                                 outcome = finish_stream_error("masscan needs privileges")
                         except Exception as exc:
