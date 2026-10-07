@@ -4398,7 +4398,6 @@ class NetworkScanTab(ttk.Frame):
         ttk.Label(top, text="Targets (IPs/CIDRs/ranges/ASNs — comma, space or newline separated):").grid(row=0, column=0, sticky="w")
         self.targets_text = tk.Text(top, height=4, width=70)
         self.targets_text.grid(row=1, column=0, rowspan=4, sticky="ew", padx=(0, 8))
-        self.targets_text.insert("1.0", "127.0.0.1/32, 192.168.1.0/30")
         top.grid_columnconfigure(0, weight=1)
 
         ttk.Label(top, text="Ports:").grid(row=0, column=1, sticky="w")
