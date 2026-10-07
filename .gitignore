@@ -1,0 +1,34 @@
+# --- Minecraft Server Scanner runtime files (per-machine data, never commit) ---
+shodan_key.txt
+ips.txt
+ignore.txt
+saved.txt
+minecraft_servers.json
+user_log.json
+server_monitor_log.json
+known_cracked_servers.json
+cracked_scan.log
+whitelist_scan.log
+mc_accounts.json
+proxies.json
+
+# generic byproducts
+*.log
+*.bak
+*.tmp
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
