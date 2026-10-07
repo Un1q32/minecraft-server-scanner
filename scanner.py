@@ -2235,12 +2235,7 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
             seen.add(host)
             hosts.append(host)
 
-    tokens = []
-    for line in target_text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        tokens.extend([part.strip() for part in re.split(r"[,;\s]+", line) if part.strip()])
+    tokens = _split_target_tokens(target_text)
 
     for token in tokens:
         if len(hosts) >= max_hosts:
@@ -2329,74 +2324,142 @@ def masscan_status_line():
 
 
 def _masscan_count_hosts(spec, cap=MASSCAN_MAX_HOSTS):
-    """Estimate host count for a masscan target spec without enumerating."""
+    """Estimate host count for a masscan target spec without enumerating.
+    cap=None disables the cap."""
     try:
         if "/" in spec:
             net = ipaddress.ip_network(spec, strict=False)
             if net.version != 4:
                 return 0
             n = net.num_addresses - 2 if net.num_addresses > 2 else net.num_addresses
-            return max(0, min(n, cap + 1))
+            n = max(0, n)
+            return n if cap is None else min(n, cap + 1)
         if "-" in spec:
             left, right = spec.split("-", 1)
             start = int(ipaddress.ip_address(left.strip()))
             end = int(ipaddress.ip_address(right.strip()))
             if end < start:
                 return 0
-            return min(end - start + 1, cap + 1)
+            n = end - start + 1
+            return n if cap is None else min(n, cap + 1)
         ipaddress.ip_address(spec)
         return 1
     except Exception:
         return 0
 
 
-def build_masscan_inputs(target_text, ports, max_hosts=MASSCAN_MAX_HOSTS):
+_IPV4_RANGE_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})\s*-\s*(\d{1,3}(?:\.\d{1,3}){3})")
+
+def _split_target_tokens(target_text):
+    """Split target text on commas, semicolons, spaces and newlines.
+
+    Spaced IPv4 ranges ('10.0.0.1 - 10.0.0.5') are rejoined first so they
+    survive as one token; '#' starts a comment.
+    """
+    text = _IPV4_RANGE_RE.sub(r"\1-\2", target_text or "")
+    tokens = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0]
+        tokens.extend([p for p in re.split(r"[,;\s]+", line.strip()) if p])
+    return tokens
+
+
+def _masscan_estimate_probes(masscan_targets, ports):
+    """Total SYN probes masscan will send (hosts x ports), arithmetic only."""
+    try:
+        nports = len(ports or [25565]) or 1
+    except Exception:
+        nports = 1
+    total = 0
+    for spec in masscan_targets or []:
+        total += _masscan_count_hosts(spec, cap=None)
+    return total * max(1, nports)
+
+
+def _masscan_estimate_seconds(masscan_targets, ports, rate, wait):
+    """Expected sweep duration in seconds (probes/rate + post-scan wait)."""
+    try:
+        rate = max(1, int(rate))
+    except Exception:
+        rate = MASSCAN_DEFAULT_RATE
+    try:
+        wait = max(0, int(wait))
+    except Exception:
+        wait = MASSCAN_DEFAULT_WAIT
+    return _masscan_estimate_probes(masscan_targets, ports) / rate + wait
+
+
+def _masscan_default_timeout(masscan_targets, ports, rate, wait):
+    """Watchdog timeout scaled to the sweep size: expected + wait + margin.
+
+    A fixed timeout killed big sweeps early: a /8 at 10kpps needs ~28min,
+    so the old fixed 330s always 'ended' the scan around 20%.
+    """
+    try:
+        expected = _masscan_estimate_seconds(masscan_targets, ports, rate, wait)
+    except Exception:
+        expected = 0
+    return max(120, int(expected + MASSCAN_OUTPUT_TIMEOUT_MARGIN + 60))
+
+
+def _format_masscan_eta(seconds):
+    try:
+        seconds = max(0, int(seconds))
+    except Exception:
+        return ""
+    if seconds < 10:
+        return ""
+    if seconds < 120:
+        return f" (~{seconds}s)"
+    mins = seconds / 60
+    if mins < 90:
+        return f" (~{mins:.0f} min)"
+    return f" (~{mins / 60:.1f} h)"
+
+
+def _masscan_note_is_partial(note):
+    low = (note or "").lower()
+    return "timed out" in low or "partial" in low
+
+
+def build_masscan_inputs(target_text, ports):
     """Convert GUI target text into masscan ranges + direct ip:port targets.
+
+    Accepts any mix of IPs, CIDRs, start-end ranges, ASNs and hostnames,
+    separated by commas, spaces, semicolons or newlines.
 
     Returns (masscan_targets, direct_targets):
       masscan_targets: list of 'IP', 'CIDR' or 'start-end' strings for masscan.
       direct_targets: list of 'ip:port' strings to ping directly (explicit ports
         outside the scan port list, or entries masscan cannot express).
     Hostnames are resolved to IPs for masscan; unresolvable names are skipped.
+
+    Every valid range is passed through: masscan sweeps huge/multi ranges
+    natively (timeout and progress scale with the size), so unlike the
+    Python path there is no host budget that could silently drop a range.
     """
     ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
     port_set = set(ports)
     masscan_targets = []
     direct_targets = []
     seen_range = set()
-    total_hosts = 0
 
     def add_range(spec):
-        nonlocal total_hosts
         spec = spec.strip()
         if not spec or spec in seen_range:
             return
-        # masscan handles huge ranges natively, so max_hosts is a soft stop:
-        # stop adding *new* specs once the budget is spent, but never silently
-        # drop a user-requested range just because it alone exceeds the budget.
-        if total_hosts >= max_hosts:
-            return
-        count = _masscan_count_hosts(spec)
-        if count <= 0:
+        if _masscan_count_hosts(spec, cap=None) <= 0:
             return
         seen_range.add(spec)
         masscan_targets.append(spec)
-        total_hosts += count
 
     def add_direct(ip_port):
         if ip_port not in direct_targets and not is_ignored(ip_port):
             direct_targets.append(ip_port)
 
-    tokens = []
-    for line in (target_text or "").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        tokens.extend([p.strip() for p in re.split(r"[,;\s]+", line) if p.strip()])
+    tokens = _split_target_tokens(target_text)
 
     for token in tokens:
-        if total_hosts >= max_hosts:
-            break
         try:
             if re.match(r"^AS?\d+$", token, re.I):
                 try:
@@ -2404,8 +2467,6 @@ def build_masscan_inputs(target_text, ports, max_hosts=MASSCAN_MAX_HOSTS):
                 except Exception:
                     continue
                 for prefix in prefixes:
-                    if total_hosts >= max_hosts:
-                        break
                     try:
                         net = ipaddress.ip_network(prefix, strict=False)
                     except ValueError:
@@ -2789,7 +2850,7 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
         "-oJ", "-",
     ]
     if timeout is None:
-        timeout = 300 + MASSCAN_OUTPUT_TIMEOUT_MARGIN
+        timeout = _masscan_default_timeout(masscan_targets, ports, rate, wait)
     try:
         proc = _masscan_popen(cmd, sudo_password if use_sudo else None)
     except FileNotFoundError:
@@ -2912,7 +2973,7 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
         "-oL", "-",
     ]
     if timeout is None:
-        timeout = 300 + MASSCAN_OUTPUT_TIMEOUT_MARGIN
+        timeout = _masscan_default_timeout(masscan_targets, ports, rate, wait)
     found = []
     seen = set()
 
@@ -4334,10 +4395,10 @@ class NetworkScanTab(ttk.Frame):
         top = ttk.Frame(content)
         top.pack(fill="x", padx=8, pady=8)
 
-        ttk.Label(top, text="Targets (IP/CIDR/range/ASN, e.g. AS13335):").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="Targets (IPs/CIDRs/ranges/ASNs — comma, space or newline separated):").grid(row=0, column=0, sticky="w")
         self.targets_text = tk.Text(top, height=4, width=70)
         self.targets_text.grid(row=1, column=0, rowspan=4, sticky="ew", padx=(0, 8))
-        self.targets_text.insert("1.0", "127.0.0.1/32")
+        self.targets_text.insert("1.0", "127.0.0.1/32, 192.168.1.0/30")
         top.grid_columnconfigure(0, weight=1)
 
         ttk.Label(top, text="Ports:").grid(row=0, column=1, sticky="w")
@@ -4636,12 +4697,13 @@ class NetworkScanTab(ttk.Frame):
 
                 targets = None
                 skip_python = False
+                masscan_note = ""
                 if use_masscan and is_masscan_available():
                     # ---- streaming masscan path: each open port is handed to
                     # the handshake pool (and the GUI) as soon as masscan
                     # reports it, instead of waiting for the whole sweep. ----
                     try:
-                        ranges, direct = build_masscan_inputs(targets_raw, ports, max_hosts=max_hosts)
+                        ranges, direct = build_masscan_inputs(targets_raw, ports)
                     except Exception as exc:
                         ranges, direct = [], []
                         if backend.startswith("masscan"):
@@ -4720,12 +4782,16 @@ class NetworkScanTab(ttk.Frame):
 
                         for d in direct:
                             handle_open(d)
-                        self.after(0, lambda: self.set_status("masscan: discovering open ports (live)..."))
+                        eta = _format_masscan_eta(_masscan_estimate_seconds(
+                            ranges, ports, masscan_rate, masscan_wait))
+                        self.after(0, lambda e=eta: self.set_status(
+                            f"masscan: discovering open ports (live){e}..."))
                         outcome = "ok"
                         try:
-                            run_masscan_streaming(ranges, ports, rate=masscan_rate,
-                                                  wait=masscan_wait, on_open=handle_open,
-                                                  on_scan_progress=handle_scan_progress)
+                            _, masscan_note = run_masscan_streaming(
+                                ranges, ports, rate=masscan_rate,
+                                wait=masscan_wait, on_open=handle_open,
+                                on_scan_progress=handle_scan_progress)
                         except PermissionError:
                             if sudo_available() and ranges:
                                 self.after(0, lambda: self.set_status("masscan needs root; trying sudo..."))
@@ -4740,12 +4806,13 @@ class NetworkScanTab(ttk.Frame):
                                     sudo_pw, sudo_err = self._prompt_sudo_password()
                                 if passwordless or sudo_pw:
                                     try:
-                                        self.after(0, lambda: self.set_status(
-                                            "masscan: discovering open ports with sudo (live)..."))
-                                        run_masscan_streaming(ranges, ports, rate=masscan_rate,
-                                                              wait=masscan_wait, on_open=handle_open,
-                                                              on_scan_progress=handle_scan_progress,
-                                                              use_sudo=True, sudo_password=sudo_pw)
+                                        self.after(0, lambda e=eta: self.set_status(
+                                            f"masscan: discovering open ports with sudo (live){e}..."))
+                                        _, masscan_note = run_masscan_streaming(
+                                            ranges, ports, rate=masscan_rate,
+                                            wait=masscan_wait, on_open=handle_open,
+                                            on_scan_progress=handle_scan_progress,
+                                            use_sudo=True, sudo_password=sudo_pw)
                                         sudo_pw = None
                                     except PermissionError as exc2:
                                         outcome = finish_stream_error(f"sudo failed: {exc2}")
@@ -4798,7 +4865,12 @@ class NetworkScanTab(ttk.Frame):
                         results.extend(more)
                 merge_global_ip_log(stream_updated)
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
-                self.after(0, lambda n=len(results): self.set_status(f"Scan complete. Minecraft servers: {n}."))
+                if _masscan_note_is_partial(masscan_note):
+                    self.after(0, lambda n=len(results): self.set_status(
+                        "Scan complete — masscan stopped early (timeout), results partial. "
+                        f"Minecraft servers: {n}."))
+                else:
+                    self.after(0, lambda n=len(results): self.set_status(f"Scan complete. Minecraft servers: {n}."))
 
                 if check_cracked:
                     with lock:
