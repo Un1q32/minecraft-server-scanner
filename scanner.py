@@ -1955,6 +1955,46 @@ def check_selected_whitelist(parent, tree):
         parent.after(0, lambda: setattr(parent, "_whitelist_manual_status", f"Whitelist check: {done}/{total}"))
     run_whitelist_verifier_async(entries, account, on_update, progress_cb=progress)
 
+def check_selected_cracked(parent, tree):
+    """Manually probe the currently selected result rows for offline-mode."""
+    selected = tree.selection()
+    if not selected:
+        messagebox.showinfo("Check Cracked", "Select one or more server rows first.", parent=parent)
+        return
+    columns = list(tree["columns"])
+    if "cracked" not in columns:
+        messagebox.showinfo("Check Cracked", "This result view has no cracked column.", parent=parent)
+        return
+    entries = []
+    for iid in selected:
+        values = tree.item(iid, "values")
+        row = dict(zip(columns, values))
+        if row.get("ip"):
+            entries.append({"ip": row["ip"]})
+            tree.set(iid, "cracked", "Queued")
+    if not entries:
+        return
+    def on_update(entry, result, message, was_cached):
+        if was_cached or result is True:
+            label = "Yes (cached)" if was_cached else "Yes"
+        elif result is False:
+            label = "No"
+        else:
+            label = "Unknown"
+        ip = entry.get("ip")
+        for iid in tree.get_children(""):
+            vals = tree.item(iid, "values")
+            if vals and vals[columns.index("ip")] == ip:
+                parent.after(0, lambda i=iid, v=label: tree.set(i, "cracked", v))
+                break
+    def progress(done, total):
+        try:
+            if hasattr(parent, "set_status"):
+                parent.after(0, lambda d=done, t=total: parent.set_status(f"Cracked check: {d}/{t}"))
+        except Exception:
+            pass
+    run_cracked_verifier_async(entries, on_update, progress_cb=progress)
+
 def run_whitelist_verifier_async(entries, account, callback, progress_cb=None):
     # Proxy mode: route through working proxies and rotate accounts in parallel.
     if _WHITELIST_USE_PROXIES:
@@ -4279,6 +4319,7 @@ class NetworkScanTab(ttk.Frame):
         self.scan_rows = []
         self._scan_row_map = {}
         self._current_scan_ip = None
+        self._cracked_job_id = 0
         self._whitelist_job_id = 0
         self.version_filter_var = tk.StringVar(value="All versions")
         self.pre_version_var = tk.StringVar(value="")
@@ -4350,12 +4391,14 @@ class NetworkScanTab(ttk.Frame):
         self.version_filter_combo.bind("<KeyRelease>", lambda _e: self.refresh_scan_tree())
         self.only_players_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(controls, text="Only players > 0", variable=self.only_players_var).pack(side="left", padx=(14, 4))
+        self.check_cracked_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="Check cracked", variable=self.check_cracked_var).pack(side="left", padx=4)
         self.check_whitelist_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(controls, text="Check whitelist", variable=self.check_whitelist_var).pack(side="left", padx=4)
 
         frame = ttk.Frame(content)
         frame.pack(fill="both", expand=True, padx=8, pady=(0,8))
-        cols = ("ip", "motd", "players", "version", "whitelist", "active_players")
+        cols = ("ip", "motd", "players", "version", "cracked", "whitelist", "active_players")
         self.scan_tree = ttk.Treeview(frame, columns=cols, show="headings", height=18, selectmode="extended")
         for col in cols:
             self.scan_tree.heading(col, text=col.upper())
@@ -4365,6 +4408,8 @@ class NetworkScanTab(ttk.Frame):
                 width = 220
             elif col in ("players", "version"):
                 width = 120
+            elif col == "cracked":
+                width = 90
             else:
                 width = 170
             self.scan_tree.column(col, width=width, anchor="w")
@@ -4372,12 +4417,16 @@ class NetworkScanTab(ttk.Frame):
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.scan_tree.yview)
         sb.pack(side="left", fill="y")
         self.scan_tree.config(yscrollcommand=sb.set)
-        ttk.Button(content, text="Check Whitelist", command=lambda: check_selected_whitelist(self, self.scan_tree)).pack(anchor="w", padx=8, pady=(0,8))
+        bottom = ttk.Frame(content)
+        bottom.pack(fill="x", padx=8, pady=(0,8))
+        ttk.Button(bottom, text="Check Cracked", command=lambda: check_selected_cracked(self, self.scan_tree)).pack(side="left", padx=(0,8))
+        ttk.Button(bottom, text="Check Whitelist", command=lambda: check_selected_whitelist(self, self.scan_tree)).pack(side="left")
         make_tree_sortable(self.scan_tree, {
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
             "players": _players_key,
             "version": _version_key,
+            "cracked": lambda v: (0 if str(v).lower() in ("false", "no", "0") else 1) if v is not None else -1,
             "whitelist": lambda v: str(v).lower(),
             "active_players": lambda v: str(v).lower()
         })
@@ -4413,7 +4462,7 @@ class NetworkScanTab(ttk.Frame):
                 iid = self.scan_tree.insert("", "end", values=row)
                 self._scan_row_map[row[0]] = iid
 
-    def _update_scan_row_whitelist(self, ip, text):
+    def _update_scan_row_cracked(self, ip, text):
         iid = self._scan_row_map.get(ip)
         if not iid:
             return
@@ -4425,6 +4474,21 @@ class NetworkScanTab(ttk.Frame):
             if row and row[0] == ip:
                 row = list(row)
                 row[4] = text
+                self.scan_rows[idx] = tuple(row)
+                break
+
+    def _update_scan_row_whitelist(self, ip, text):
+        iid = self._scan_row_map.get(ip)
+        if not iid:
+            return
+        vals = list(self.scan_tree.item(iid, "values"))
+        if len(vals) >= 6:
+            vals[5] = text
+            self.scan_tree.item(iid, values=vals)
+        for idx, row in enumerate(self.scan_rows):
+            if row and row[0] == ip:
+                row = list(row)
+                row[5] = text
                 self.scan_rows[idx] = tuple(row)
                 break
 
@@ -4489,6 +4553,7 @@ class NetworkScanTab(ttk.Frame):
         # Snapshot Tk vars here (main thread); work() runs in the background.
         only_players = self.only_players_var.get()
         pre_version = self.pre_version_var.get().strip()
+        check_cracked_flag = self.check_cracked_var.get()
         check_whitelist_flag = self.check_whitelist_var.get()
         self.set_status("Expanding targets...")
 
@@ -4503,10 +4568,16 @@ class NetworkScanTab(ttk.Frame):
                 self._scan_row_map = {}
                 self.after(0, lambda: self.scan_tree.delete(*self.scan_tree.get_children()))
                 check_whitelist = check_whitelist_flag
+                check_cracked = check_cracked_flag
                 account = get_active_mc_account() if check_whitelist else None
                 if check_whitelist and not account:
                     self.after(0, lambda: self.set_status("Whitelist check canceled: no account selected."))
                     return
+                if check_cracked:
+                    self._cracked_job_id += 1
+                cracked_job = self._cracked_job_id
+                cracked_entries = []
+                cracked_seen = set()
                 if check_whitelist:
                     self._whitelist_job_id += 1
                 whitelist_job = self._whitelist_job_id
@@ -4526,11 +4597,22 @@ class NetworkScanTab(ttk.Frame):
                         return
                     if pre_version and not version_filter_allows(r.get("version", ""), pre_version):
                         return
+                    if check_cracked:
+                        cached = get_cached_cracked_entry(r["ip"])
+                        if cached:
+                            cracked_text = "Yes (cached)"
+                        elif r.get("cracked"):
+                            cracked_text = "Yes?"
+                        else:
+                            cracked_text = "Queued"
+                    else:
+                        cracked_text = "Yes" if r.get("cracked") else "No"
                     row = (
                         r["ip"],
                         r["motd"],
                         f"{r['players']}/{r['max_players']}",
                         r["version"],
+                        cracked_text,
                         "Queued" if check_whitelist else "-",
                         format_player_list(r.get("players_sample"))
                     )
@@ -4541,6 +4623,11 @@ class NetworkScanTab(ttk.Frame):
                         iid = self.scan_tree.insert("", "end", values=row)
                         self._scan_row_map[row[0]] = iid
                     self.after(0, add_row)
+                    if check_cracked and cracked_text == "Queued":
+                        with lock:
+                            if r["ip"] not in cracked_seen:
+                                cracked_seen.add(r["ip"])
+                                cracked_entries.append(r)
                     if check_whitelist:
                         with lock:
                             if r["ip"] not in whitelist_seen:
@@ -4712,6 +4799,27 @@ class NetworkScanTab(ttk.Frame):
                 merge_global_ip_log(stream_updated)
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
                 self.after(0, lambda n=len(results): self.set_status(f"Scan complete. Minecraft servers: {n}."))
+
+                if check_cracked:
+                    with lock:
+                        entries = list(cracked_entries)
+                    def handle_cracked_update(entry, result, message, was_cached):
+                        if cracked_job != self._cracked_job_id:
+                            return
+                        if was_cached or result is True:
+                            label = "Yes (cached)" if was_cached else "Yes"
+                        elif result is False:
+                            label = "No"
+                        else:
+                            label = "Unknown"
+                        self.after(0, lambda ip=entry.get("ip"), label=label:
+                                   self._update_scan_row_cracked(ip, label))
+                    def handle_cracked_progress(done, total):
+                        if cracked_job != self._cracked_job_id:
+                            return
+                        self.after(0, lambda d=done, t=total:
+                                   self.set_status(f"Checking cracked: {d}/{t}"))
+                    run_cracked_verifier_async(entries, handle_cracked_update, progress_cb=handle_cracked_progress)
 
                 if check_whitelist:
                     with lock:

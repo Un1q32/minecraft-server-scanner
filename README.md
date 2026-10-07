@@ -37,6 +37,10 @@ Phase 1 (masscan) passes CIDR/range/ASN prefixes directly to masscan (`-p <ports
 
 When masscan reports insufficient privileges and `sudo` is available (Linux/macOS), the scanner first tries passwordless sudo (`sudo -n true`, which also succeeds when credentials are cached) and otherwise prompts for the sudo password in a popup, then reruns discovery as `sudo -S masscan ...`. The password is fed once through a pipe, kept only in memory for that scan, and never written to disk. Canceling the prompt aborts the masscan backend (strict mode) or falls back to Python (Auto mode).
 
+#### Cracked column
+
+The result table has a CRACKED column. Every handshake already detects likely offline-mode servers (a sampled player's UUID matching the offline-mode UUID for its name), so rows show `Yes`/`No` immediately. Tick `Check cracked` before scanning to login-probe each found server for confirmation (`Yes`, `No`, `Unknown`; previously seen servers show `Yes (cached)` from `known_cracked_servers.json`). The `Check Cracked` button probes only the selected rows. The column is sortable.
+
 ### Whitelist verification
 
 - Checks whitelist access with an authenticated Minecraft account.
