@@ -66,13 +66,16 @@ DEFAULT_MONITOR_INTERVAL = 60
 CRACKED_CACHE_FILE = "known_cracked_servers.json"
 CRACKED_LOG_FILE = "cracked_scan.log"
 WHITELIST_LOG_FILE = "whitelist_scan.log"
-CRACKED_VERIFY_WORKERS = 10
+CRACKED_VERIFY_WORKERS = 50
 MC_ACCOUNTS_FILE = "mc_accounts.json"
 PRISM_ACCOUNTS_PATH = os.path.expandvars(r"%APPDATA%\PrismLauncher\accounts.json")
 PROXIES_FILE = "proxies.json"
 PROXY_TEST_HOST = "api.minecraftservices.com"
 PROXY_TEST_PORT = 443
-WHITELIST_VERIFY_WORKERS = 1
+# Cracked (offline-mode) whitelist probes run in parallel with no throttle and
+# never touch Mojang auth. Online-mode probes still pace themselves with
+# WHITELIST_PROBE_DELAY and Mojang backoff, just as before.
+WHITELIST_VERIFY_WORKERS = 20
 WHITELIST_PROBE_DELAY = 2.5
 MOJANG_RATE_LIMIT_COOLDOWN = 45
 MOJANG_JOIN_RETRIES = 2
@@ -94,6 +97,12 @@ MAX_ICON_CACHE_ENTRIES = 512
 
 _CRACKED_CACHE_LOCK = threading.Lock()
 _WHITELIST_LOG_LOCK = threading.Lock()
+# Throttle for online-mode (Mojang-authenticated) whitelist probes only.
+# Cracked/offline probes never touch this. The lock spaces the *start* of
+# each online probe by WHITELIST_PROBE_DELAY, matching the old serial pacing
+# even though probes now run in a thread pool.
+_WHITELIST_ONLINE_THROTTLE_LOCK = threading.Lock()
+_WHITELIST_LAST_ONLINE_PROBE = [0.0]
 # When True, every whitelist verification (in all scan tabs) routes through
 # proxies and rotates across all accounts to avoid rate limiting.
 _WHITELIST_USE_PROXIES = False
@@ -347,8 +356,6 @@ def verify_minecraft_join(account, server_hash):
                 raise
         except Exception:
             return False
-        if attempt < 2:
-            time.sleep(0.25)
     return False
 
 def minecraft_join_server(account, server_hash, verify=False):
@@ -1535,7 +1542,99 @@ def offline_uuid_nodash(name):
     data[8] = (data[8] & 0x3F) | 0x80
     return uuid.UUID(bytes=bytes(data)).hex
 
-def get_server_status_info(host, port=25565, proxy=None):
+# --- Modloader (Forge / NeoForge) detection ---------------------------------
+# NeoForge/Forge servers advertise themselves in the status ping
+# ("modinfo"/"forgeData"/"isModded" keys, or "neoforge"/"forge" in the
+# version string) and later via login plugin channels ("neoforge:", "forge:",
+# "fml:"). We surface a warning so modded hits are not mistaken for vanilla.
+
+def detect_modloader_from_status(data, version_hint=""):
+    """Return (loader, detail) e.g. ("NeoForge", "...") or (None, "")."""
+    try:
+        blob = json.dumps(data or {}).lower()
+    except Exception:
+        blob = ""
+    version_name = ""
+    try:
+        version_name = str(((data or {}).get("version") or {}).get("name") or "")
+    except Exception:
+        version_name = ""
+    if not version_name and version_hint:
+        version_name = str(version_hint or "")
+    low_version = (version_name or "").lower()
+
+    has_neoforge_marker = (
+        "neoforge" in blob or "neoforge" in low_version
+    )
+    if has_neoforge_marker:
+        detail = version_name or "status lists NeoForge markers"
+        return "NeoForge", detail
+
+    modinfo = (data or {}).get("modinfo") if isinstance(data, dict) else None
+    forge_data = (data or {}).get("forgeData") if isinstance(data, dict) else None
+    is_modded = (data or {}).get("isModded") if isinstance(data, dict) else None
+    if isinstance(modinfo, dict):
+        mod_type = str(modinfo.get("type") or "")
+        mods = modinfo.get("modList") or modinfo.get("mods") or []
+        try:
+            n = len(mods)
+        except Exception:
+            n = 0
+        return "Forge", f"{mod_type or 'modinfo'} ({n} mods) {version_name}".strip()
+    if forge_data is not None:
+        return "Forge", f"forgeData present {version_name}".strip()
+    if is_modded is True:
+        return "Modded", f"isModded {version_name}".strip()
+
+    for marker, loader in (
+        ("forge", "Forge"),
+        ("fml", "Forge"),
+        ("fabric", "Fabric"),
+        ("quilt", "Quilt"),
+        ("paper", "Paper"),
+        ("spigot", "Spigot"),
+        ("bungeecord", "BungeeCord"),
+        ("velocity", "Velocity"),
+    ):
+        if marker in low_version or (blob and f'"{marker}"' in blob):
+            return loader, version_name or f"status mentions {marker}"
+    if version_hint and "neoforge" in str(version_hint).lower():
+        return "NeoForge", str(version_hint)
+    return None, ""
+
+
+def detect_modloader_from_channel(channel):
+    low = (channel or "").lower()
+    if "neoforge" in low:
+        return "NeoForge", channel
+    if "forge" in low or low.startswith("fml:") or low == "fml":
+        return "Forge", channel
+    return None, ""
+
+
+def mod_warning_text(loader, detail=""):
+    detail = (detail or "").strip()
+    base = f"{loader} modded server"
+    if detail and detail.lower() != loader.lower():
+        short = detail if len(detail) <= 80 else detail[:77] + "..."
+        return f"WARNING: {base} ({short}) - client mods required"
+    return f"WARNING: {base} - client mods required"
+
+
+def append_mod_warning(message, mod_warning):
+    if not mod_warning:
+        return message or ""
+    if mod_warning.lower() in (message or "").lower():
+        return message or ""
+    return f"{message} [{mod_warning}]" if message else f"[{mod_warning}]"
+
+
+def get_server_status_full(host, port=25565, proxy=None):
+    """Status ping returning (protocol, sample_names, sample_hint, status_data).
+
+    status_data is the raw status JSON dict (or {} on failure). This never
+    touches Mojang auth; it is safe for cracked servers.
+    """
     sock = None
     try:
         sock = open_connection(host, port, proxy=proxy, timeout=4)
@@ -1554,6 +1653,8 @@ def get_server_status_info(host, port=25565, proxy=None):
         json_length = recv_varint(sock)
         status_json = recv_bounded(sock, json_length, MAX_STATUS_RESPONSE_BYTES).decode("utf-8", errors="ignore")
         data = json.loads(status_json)
+        if not isinstance(data, dict):
+            data = {}
 
         proto = data.get("version", {}).get("protocol", DEFAULT_STATUS_PROTOCOL)
 
@@ -1580,15 +1681,20 @@ def get_server_status_info(host, port=25565, proxy=None):
         else:
             sample_hint = None
 
-        return proto, sample_names, sample_hint
+        return proto, sample_names, sample_hint, data
     except Exception:
-        return DEFAULT_STATUS_PROTOCOL, [], None
+        return DEFAULT_STATUS_PROTOCOL, [], None, {}
     finally:
         if sock:
             try:
                 sock.close()
             except Exception:
                 pass
+
+
+def get_server_status_info(host, port=25565, proxy=None):
+    proto, sample_names, sample_hint, _data = get_server_status_full(host, port, proxy=proxy)
+    return proto, sample_names, sample_hint
 
 def get_server_protocol(host, port=25565):
     proto, _, _ = get_server_status_info(host, port)
@@ -1731,9 +1837,175 @@ def parse_disconnect_reason(buf, pos):
     except Exception:
         return ""
 
-def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=None):
+def read_login_plugin_channel(buf, pos):
+    """Extract the channel string from a Login Plugin Request (0x04) packet."""
+    try:
+        _msg_id, pos = read_varint_from_bytes(buf, pos)
+        channel, _ = read_mc_string_from_bytes(buf, pos)
+        return channel or ""
+    except Exception:
+        return ""
+
+
+def _throttle_online_whitelist_probe():
+    """Space out online-mode (Mojang) probes by WHITELIST_PROBE_DELAY.
+
+    Cracked/offline probes never call this. The timestamp marks the start of
+    each online probe so parallel workers keep the same pacing as the old
+    serial loop.
+    """
+    if WHITELIST_PROBE_DELAY <= 0:
+        return
+    with _WHITELIST_ONLINE_THROTTLE_LOCK:
+        now = time.monotonic()
+        wait = WHITELIST_PROBE_DELAY - (now - _WHITELIST_LAST_ONLINE_PROBE[0])
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _WHITELIST_LAST_ONLINE_PROBE[0] = now
+
+
+def offline_whitelist_probe(host, port=25565, protocol=None, proxy=None, timeout=6):
+    """Whitelist check for offline-mode (cracked) servers without Mojang auth.
+
+    Sends an unauthenticated Login Start and interprets the reply:
+      - Login Success (0x02)            -> (False, open cracked server)
+      - Disconnect mentioning whitelist -> (True, whitelisted cracked server)
+      - Encryption Request (0x01)       -> (None, online-mode marker, needs_auth=True)
+    Returns (result, message, needs_auth, plugin_mod_warning).
+    Never contacts Mojang session servers.
+    """
+    if protocol is None:
+        try:
+            protocol = get_server_protocol(host, port)
+        except Exception:
+            protocol = DEFAULT_STATUS_PROTOCOL
+    username = "Player" + str(random.randint(1000, 9999))
+    sock = None
+    compression_threshold = -1
+    plugin_mod_warning = ""
+    try:
+        sock = open_connection(host, port, proxy=proxy, timeout=timeout)
+        sock.settimeout(2.5)
+        handshake = (
+            varint_encode(0) +
+            varint_encode(protocol) +
+            write_string(host) +
+            struct.pack(">H", port) +
+            varint_encode(2)
+        )
+        send_mc_packet(sock, handshake)
+        send_mc_packet(sock, build_login_start(username, protocol))
+        while True:
+            packet_length = recv_varint(sock)
+            if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
+                raise ValueError("Packet too large")
+            packet_data = recv_exact(sock, packet_length)
+            buf = unpack_login_packet(packet_data, compression_threshold)
+            packet_id, pos = read_varint_from_bytes(buf, 0)
+            if packet_id == 0x03:
+                compression_threshold, _ = read_varint_from_bytes(buf, pos)
+                continue
+            if packet_id == 0x01:
+                # Online-mode: server wants Mojang auth. Caller falls through
+                # to the authenticated path.
+                return None, "ONLINE-MODE (auth required)", True, plugin_mod_warning
+            if packet_id == 0x02:
+                msg = f"Not Whitelisted (offline login accepted as {username})"
+                if plugin_mod_warning:
+                    msg = append_mod_warning(msg, plugin_mod_warning)
+                return False, msg, False, plugin_mod_warning
+            if packet_id == 0x04:
+                channel = read_login_plugin_channel(buf, pos)
+                loader, _detail = detect_modloader_from_channel(channel)
+                if loader:
+                    plugin_mod_warning = mod_warning_text(loader, channel)
+                # Cracked server behind a login plugin / proxy: no whitelist
+                # kick yet, so treat as open (not whitelisted) rather than
+                # burning a Mojang token on it.
+                msg = f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)"
+                if plugin_mod_warning:
+                    msg = append_mod_warning(msg, plugin_mod_warning)
+                return False, msg, False, plugin_mod_warning
+            if packet_id == 0x00:
+                reason = parse_disconnect_reason(buf, pos)
+                low = reason.lower()
+                if "whitelist" in low or "white list" in low or "not whitelisted" in low:
+                    msg = f"WHITELISTED ({reason}) [offline-mode, no Mojang auth used]"
+                    if plugin_mod_warning:
+                        msg = append_mod_warning(msg, plugin_mod_warning)
+                    return True, msg, False, plugin_mod_warning
+                if "outdated client" in low or "outdated server" in low:
+                    return None, f"Version mismatch ({reason})", False, plugin_mod_warning
+                # Any other disconnect on an offline-mode server still proves
+                # no Mojang auth was needed to get an answer.
+                msg = f"Not Whitelisted ({reason}) [offline-mode, no Mojang auth used]"
+                if plugin_mod_warning:
+                    msg = append_mod_warning(msg, plugin_mod_warning)
+                return False, msg, False, plugin_mod_warning
+            if packet_id == 0x05:
+                msg = "Not Whitelisted (entered configuration; no immediate whitelist kick) [offline-mode, no Mojang auth used]"
+                if plugin_mod_warning:
+                    msg = append_mod_warning(msg, plugin_mod_warning)
+                return False, msg, False, plugin_mod_warning
+    except socket.timeout:
+        return None, "Timed out during offline whitelist probe", False, plugin_mod_warning
+    except Exception as exc:
+        return None, f"Offline whitelist probe error: {str(exc)[:80]}", False, plugin_mod_warning
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=None, version_hint=""):
+    # 1) Status ping: protocol + NeoForge/Forge detection. No Mojang involved.
+    mod_warning = ""
+    status_data = {}
+    if protocol is None:
+        try:
+            protocol, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
+        except Exception:
+            protocol = DEFAULT_STATUS_PROTOCOL
+            status_data = {}
+    else:
+        try:
+            _proto, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
+        except Exception:
+            status_data = {}
+    try:
+        loader, detail = detect_modloader_from_status(status_data, version_hint)
+        if loader:
+            mod_warning = mod_warning_text(loader, detail)
+    except Exception:
+        pass
+    if not mod_warning and version_hint and "neoforge" in str(version_hint).lower():
+        mod_warning = mod_warning_text("NeoForge", str(version_hint))
+
+    # 2) Offline-first probe: cracked servers never touch Mojang auth.
+    try:
+        off_result, off_message, needs_auth, plugin_warning = offline_whitelist_probe(
+            host, port, protocol=protocol, proxy=proxy
+        )
+    except Exception as exc:
+        off_result, off_message, needs_auth, plugin_warning = None, f"Offline probe failed: {exc}", False, ""
+    combined_warning = mod_warning or plugin_warning
+    if plugin_warning and mod_warning and plugin_warning not in mod_warning:
+        combined_warning = f"{mod_warning} + {plugin_warning}"
+    if not needs_auth:
+        # Definitive offline answer (or offline timeout/error): return as-is,
+        # Mojang sessionserver never contacted.
+        return off_result, append_mod_warning(off_message, combined_warning)
+
+    # 3) Online-mode path: Mojang auth is unavoidable from here on.
+    # Same pacing as before: space out online probes, plus Mojang 429 backoff
+    # inside ensure_minecraft_session_join. Offline probes above never wait.
     if not account:
-        return None, "No Minecraft account selected"
+        msg = "No Minecraft account selected (online-mode server needs Mojang auth)"
+        return None, append_mod_warning(msg, combined_warning)
+    _throttle_online_whitelist_probe()
     # USERNAME:TOKEN imports may not include a profile UUID. Resolve the
     # profile before constructing Login Start; an empty selectedProfile is
     # rejected by the session server as HTTP 400.
@@ -1744,13 +2016,11 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
             account.update(resolved)
             upsert_mc_accounts([account], active_uuid=account.get("uuid"))
         else:
-            return None, f"Token profile lookup failed: {detail}"
+            return None, append_mod_warning(f"Token profile lookup failed: {detail}", combined_warning)
     if not account.get("uuid"):
-        return None, "Minecraft profile UUID is missing; test the token first"
+        return None, append_mod_warning("Minecraft profile UUID is missing; test the token first", combined_warning)
     if not _CRYPTO_AVAILABLE:
-        return None, "cryptography package is not available"
-    if protocol is None:
-        protocol, _, _ = get_server_status_info(host, port, proxy=proxy)
+        return None, append_mod_warning("cryptography package is not available", combined_warning)
     sock = None
     compression_threshold = -1
     encrypted = False
@@ -1814,9 +2084,9 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                 reason = parse_disconnect_reason(buf, pos)
                 low = reason.lower()
                 if "whitelist" in low or "white list" in low or "not whitelisted" in low:
-                    return True, f"WHITELISTED ({reason})"
+                    return True, append_mod_warning(f"WHITELISTED ({reason})", combined_warning)
                 if "outdated client" in low or "outdated server" in low:
-                    return None, f"Version mismatch ({reason})"
+                    return None, append_mod_warning(f"Version mismatch ({reason})", combined_warning)
                 if (
                     "multiplayer is disabled" in low or
                     "authentication" in low or
@@ -1824,22 +2094,35 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                     "verify username" in low or
                     "unverified_username" in low
                 ):
-                    return None, f"Auth/session rejected ({reason})"
-                return False, f"Not Whitelisted ({reason})"
+                    return None, append_mod_warning(f"Auth/session rejected ({reason})", combined_warning)
+                # Modded servers often kick here with mod/channel mismatch text.
+                extra_warning = combined_warning
+                for marker in ("neoforge", "forge", "fml", "mod"):
+                    if marker in low and marker not in extra_warning.lower():
+                        extra_warning = append_mod_warning("", mod_warning_text("NeoForge" if marker == "neoforge" else "Forge", reason)) or extra_warning
+                        break
+                return False, append_mod_warning(f"Not Whitelisted ({reason})", extra_warning)
 
             if packet_id == 0x02:
-                return False, "Not Whitelisted (login accepted)"
+                return False, append_mod_warning("Not Whitelisted (login accepted)", combined_warning)
 
             if packet_id == 0x04:
-                return False, "Not Whitelisted (login plugin request; no immediate whitelist kick)"
+                channel = read_login_plugin_channel(buf, pos)
+                warn = combined_warning
+                loader, _d = detect_modloader_from_channel(channel)
+                if loader:
+                    warn = append_mod_warning(warn, mod_warning_text(loader, channel))
+                return False, append_mod_warning(
+                    f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)",
+                    warn)
 
             if packet_id == 0x05:
-                return False, "Not Whitelisted (entered configuration; no immediate whitelist kick)"
+                return False, append_mod_warning("Not Whitelisted (entered configuration; no immediate whitelist kick)", combined_warning)
 
     except socket.timeout:
-        return None, "Timed out during whitelist probe"
+        return None, append_mod_warning("Timed out during whitelist probe", combined_warning)
     except Exception as exc:
-        return None, f"Whitelist probe error: {str(exc)[:80]}"
+        return None, append_mod_warning(f"Whitelist probe error: {str(exc)[:80]}", combined_warning)
     finally:
         if sock:
             try:
@@ -1860,7 +2143,8 @@ def _probe_whitelist_entry(entry, account, proxy=None):
         protocol = int(protocol) if protocol is not None else None
     except Exception:
         protocol = None
-    return whitelist_login_probe(host, port, account=account, protocol=protocol, proxy=proxy)
+    version_hint = entry.get("version", "") or ""
+    return whitelist_login_probe(host, port, account=account, protocol=protocol, proxy=proxy, version_hint=version_hint)
 
 def whitelist_result_label(result, message):
     if result is True:
@@ -1872,6 +2156,13 @@ def whitelist_result_label(result, message):
     detail = sanitize_motd(message or "").strip()
     if not detail:
         return base
+    # Preserve modloader warnings (e.g. NeoForge) past the truncation limit.
+    warnings = []
+    for m in re.finditer(r"\[(?:WARNING:[^\]]*|NEOFORGE[^\]]*|FORGE[^\]]*|MODDED[^\]]*)\]", detail, re.IGNORECASE):
+        warnings.append(m.group(0))
+    for w in warnings:
+        detail = detail.replace(w, "").strip()
+    detail = re.sub(r"\s{2,}", " ", detail).strip()
     if base == "Not Whitelisted" and detail.lower().startswith("not whitelisted"):
         detail = detail[len("Not Whitelisted"):].strip()
         if detail.startswith(":"):
@@ -1880,7 +2171,12 @@ def whitelist_result_label(result, message):
             detail = detail[1:-1].strip()
     if len(detail) > 90:
         detail = detail[:87] + "..."
-    return f"{base}: {detail}"
+    label = f"{base}: {detail}" if detail else base
+    if warnings:
+        warn_suffix = " ".join(dict.fromkeys(warnings))
+        if warn_suffix.lower() not in label.lower():
+            label = f"{label} {warn_suffix}"
+    return label
 
 def log_whitelist_probe(entry, result, message, account=None):
     try:
@@ -1921,11 +2217,12 @@ def open_whitelist_log_file(parent=None):
             messagebox.showerror("Whitelist Log", f"Could not open log: {exc}", parent=parent)
 
 def check_selected_whitelist(parent, tree):
-    """Manually probe the currently selected result rows using the active token."""
+    """Manually probe the currently selected result rows.
+
+    Cracked (offline-mode) servers are checked without any Minecraft account;
+    only online-mode servers need the active token for Mojang auth.
+    """
     account = get_active_mc_account()
-    if not account:
-        messagebox.showinfo("Check Whitelist", "Select/probe an active Minecraft account first.", parent=parent)
-        return
     selected = tree.selection()
     if not selected:
         messagebox.showinfo("Check Whitelist", "Select one or more server rows first.", parent=parent)
@@ -1995,33 +2292,64 @@ def check_selected_cracked(parent, tree):
             pass
     run_cracked_verifier_async(entries, on_update, progress_cb=progress)
 
-def run_whitelist_verifier_async(entries, account, callback, progress_cb=None):
+def run_whitelist_verifier_async(entries, account, callback, progress_cb=None, workers=None):
+    """Whitelist probes: cracked answers fast, online-mode keeps its delay.
+
+    Cracked (offline-mode) servers are answered by the offline-first probe
+    without Mojang auth, so they run fully parallel with no throttle. Only
+    online-mode servers take the Mojang path, which is still spaced by
+    WHITELIST_PROBE_DELAY with the original sessionserver 429 backoff.
+    """
     # Proxy mode: route through working proxies and rotate accounts in parallel.
     if _WHITELIST_USE_PROXIES:
         proxies = get_working_proxies()
         accounts = get_all_mc_accounts() or [a for a in [account] if a]
-        if proxies and accounts:
+        if proxies and (accounts or True):
             def adapted(entry, result, message, acc=None, proxy=None):
                 callback(entry, result, message)
-            run_bulk_whitelist_verifier_async(entries, accounts, proxies, adapted, progress_cb=progress_cb)
+            run_bulk_whitelist_verifier_async(entries, accounts, proxies, adapted, progress_cb=progress_cb, workers=workers)
             return
-    def worker():
-        total = len(entries)
-        completed = 0
-        for entry in entries:
-            try:
-                result, message = _probe_whitelist_entry(entry, account)
-            except Exception as exc:
-                result, message = None, str(exc)
-            log_whitelist_probe(entry, result, message, account=account)
+    if not entries:
+        return
+    total = len(entries)
+    try:
+        max_workers = int(workers) if workers else 0
+    except Exception:
+        max_workers = 0
+    if max_workers < 1:
+        max_workers = max(1, min(WHITELIST_VERIFY_WORKERS, total))
+    lock = threading.Lock()
+    counter = {"done": 0}
+
+    def _one(entry):
+        try:
+            result, message = _probe_whitelist_entry(entry, account)
+        except Exception as exc:
+            result, message = None, str(exc)
+        log_whitelist_probe(entry, result, message, account=account)
+        try:
             callback(entry, result, message)
-            completed += 1
-            if progress_cb:
-                progress_cb(completed, total)
-            if completed < total and WHITELIST_PROBE_DELAY > 0:
-                time.sleep(WHITELIST_PROBE_DELAY)
-    if entries:
-        threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            pass
+        with lock:
+            counter["done"] += 1
+            done = counter["done"]
+        if progress_cb:
+            try:
+                progress_cb(done, total)
+            except Exception:
+                pass
+
+    def run():
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_one, entry) for entry in entries]
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+
+    threading.Thread(target=run, daemon=True).start()
 
 def _is_token_auth_failure(message):
     """True when a whitelist probe failed because the account token was rejected
@@ -2054,11 +2382,11 @@ def run_bulk_whitelist_verifier_async(entries, accounts, proxies, callback, prog
     accounts = [a for a in (accounts or []) if a and a.get("access_token")]
     if not accounts:
         accounts = [a for a in [get_active_mc_account()] if a]
-    if not accounts or not entries:
+    if not entries:
         return
     total = len(entries)
     if workers is None or workers < 1:
-        workers = max(1, len(working_proxies))
+        workers = max(1, len(working_proxies)) if working_proxies else WHITELIST_VERIFY_WORKERS
     lock = threading.Lock()
     counter = {"done": 0}
     excluded = set()            # account keys rejected by Mojang -> skip for rest of scan
@@ -2085,26 +2413,34 @@ def run_bulk_whitelist_verifier_async(entries, accounts, proxies, callback, prog
             account_used = None
             result, message = None, ""
             local_tried = set()
-            while True:
-                account = _next_account(local_tried)
-                if account is None:
-                    if result is None:
-                        result, message = None, "No usable tokens left (all excluded for auth failure)"
-                    break
-                key = _account_key(account)
-                local_tried.add(key)
-                account_used = account
+            if not accounts:
+                # No tokens at all: offline (cracked) servers still resolve
+                # without Mojang auth; online-mode hits report missing auth.
                 try:
-                    result, message = _probe_whitelist_entry(entry, account, proxy=proxy)
+                    result, message = _probe_whitelist_entry(entry, None, proxy=proxy)
                 except Exception as exc:
                     result, message = None, str(exc)
-                if _is_token_auth_failure(message):
-                    # token is bad for Mojang auth -> exclude it and retry this
-                    # same server with a different token.
-                    with account_lock:
-                        excluded.add(key)
-                    continue
-                break
+            else:
+                while True:
+                    account = _next_account(local_tried)
+                    if account is None:
+                        if result is None:
+                            result, message = None, "No usable tokens left (all excluded for auth failure)"
+                        break
+                    key = _account_key(account)
+                    local_tried.add(key)
+                    account_used = account
+                    try:
+                        result, message = _probe_whitelist_entry(entry, account, proxy=proxy)
+                    except Exception as exc:
+                        result, message = None, str(exc)
+                    if _is_token_auth_failure(message):
+                        # token is bad for Mojang auth -> exclude it and retry this
+                        # same server with a different token.
+                        with account_lock:
+                            excluded.add(key)
+                        continue
+                    break
             log_whitelist_probe(entry, result, message, account=account_used)
             try:
                 callback(entry, result, message, account_used, proxy)
@@ -4629,10 +4965,9 @@ class NetworkScanTab(ttk.Frame):
                 self.after(0, lambda: self.scan_tree.delete(*self.scan_tree.get_children()))
                 check_whitelist = check_whitelist_flag
                 check_cracked = check_cracked_flag
+                # Cracked servers need no account (offline probe, no Mojang auth);
+                # account may be None and only online-mode hits will report it.
                 account = get_active_mc_account() if check_whitelist else None
-                if check_whitelist and not account:
-                    self.after(0, lambda: self.set_status("Whitelist check canceled: no account selected."))
-                    return
                 if check_cracked:
                     self._cracked_job_id += 1
                 cracked_job = self._cracked_job_id
@@ -5211,12 +5546,8 @@ class ProxyTab(ttk.Frame):
             messagebox.showinfo("Bulk Whitelist", "No proxies loaded. Add some in the Proxies tab first.")
             return
         accounts = get_all_mc_accounts() if self.use_all_accounts_var.get() else [a for a in [get_active_mc_account()] if a]
-        if not accounts:
-            data = _load_mc_accounts()
-            has_refresh = any(a.get("refresh_token") for a in data.get("accounts", []))
-            hint = " Use 'Probe Accounts' in the Accounts tab first to fetch their tokens." if has_refresh else ""
-            messagebox.showinfo("Bulk Whitelist", "No accounts with usable tokens." + hint)
-            return
+        # Cracked servers need no account (offline probe, no Mojang auth), so
+        # allow the scan with zero accounts; online-mode hits will report it.
         try:
             workers = int(self.workers_var.get().strip() or "0")
         except ValueError:
@@ -5246,7 +5577,7 @@ class ProxyTab(ttk.Frame):
                 return
             if result:
                 with live_lock:
-                    live.append({"ip": result["ip"], "protocol": result.get("protocol")})
+                    live.append({"ip": result["ip"], "protocol": result.get("protocol"), "version": result.get("version", "")})
 
         def on_init_progress(done, total):
             if job != self._bulk_job:
@@ -5820,11 +6151,8 @@ class ServersTab(ttk.Frame):  #
         self.set_status("Preparing scan...")
         only_cracked = self.only_cracked_var.get()
         check_whitelist = self.check_whitelist_var.get()
+        # Cracked servers need no account (offline probe, no Mojang auth).
         account = get_active_mc_account() if check_whitelist else None
-        if check_whitelist and not account:
-            messagebox.showinfo("Accounts", "Import or add a Minecraft account first.")
-            self.set_status("Whitelist check canceled: no account selected.")
-            return
         if only_cracked or check_whitelist:
             self._reset_scan_row_map()
             self._cracked_job_id += 1
@@ -6816,11 +7144,8 @@ class ShodanTab(ttk.Frame):
         self.set_status("Preparing scan...")
         only_cracked = self.only_cracked_var.get()
         check_whitelist = self.check_whitelist_var.get()
+        # Cracked servers need no account (offline probe, no Mojang auth).
         account = get_active_mc_account() if check_whitelist else None
-        if check_whitelist and not account:
-            messagebox.showinfo("Accounts", "Import or add a Minecraft account first.")
-            self.set_status("Whitelist check canceled: no account selected.")
-            return
         self.scan_rows = []
         if only_cracked or check_whitelist:
             self._reset_scan_row_map()
@@ -7419,11 +7744,8 @@ class JSONTab(ttk.Frame):
         self.set_status("Preparing scan...")
         only_cracked = self.only_cracked_var.get()
         check_whitelist = self.check_whitelist_var.get()
+        # Cracked servers need no account (offline probe, no Mojang auth).
         account = get_active_mc_account() if check_whitelist else None
-        if check_whitelist and not account:
-            messagebox.showinfo("Accounts", "Import or add a Minecraft account first.")
-            self.set_status("Whitelist check canceled: no account selected.")
-            return
         self.scan_rows = []
         if only_cracked or check_whitelist:
             self._reset_scan_row_map()
@@ -7805,10 +8127,8 @@ class _ReasonFileTab(ttk.Frame):
         messagebox.showinfo(self.tab_name, "Saved.")
 
     def _scan_whitelist(self):
+        # Cracked servers need no account; online-mode hits report missing auth.
         account = get_active_mc_account()
-        if not account:
-            messagebox.showinfo("Ignore", "Select/probe an active Minecraft account first.", parent=self)
-            return
         entries = []
         for iid in self.tree.get_children(""):
             values = self.tree.item(iid, "values")
