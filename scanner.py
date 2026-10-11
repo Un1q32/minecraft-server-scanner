@@ -102,7 +102,31 @@ _WHITELIST_LOG_LOCK = threading.Lock()
 # each online probe by WHITELIST_PROBE_DELAY, matching the old serial pacing
 # even though probes now run in a thread pool.
 _WHITELIST_ONLINE_THROTTLE_LOCK = threading.Lock()
-_WHITELIST_LAST_ONLINE_PROBE = [0.0]
+_WHITELIST_LAST_ONLINE_PROBE = {}
+# Remembers each server's protocol number from earlier status pings so the
+# whitelist check can open its single login connection straight away instead
+# of doing a status ping first (Paper kicks rapid reconnects with
+# "Connection throttled").
+_PROTOCOL_CACHE = {}
+_PROTOCOL_CACHE_LOCK = threading.Lock()
+
+def _remember_protocol(ip_port, protocol):
+    try:
+        protocol = int(protocol)
+    except Exception:
+        return
+    try:
+        with _PROTOCOL_CACHE_LOCK:
+            _PROTOCOL_CACHE[ip_port] = protocol
+    except Exception:
+        pass
+
+def _cached_protocol(ip_port):
+    try:
+        with _PROTOCOL_CACHE_LOCK:
+            return _PROTOCOL_CACHE.get(ip_port)
+    except Exception:
+        return None
 # When True, every whitelist verification (in all scan tabs) routes through
 # proxies and rotates across all accounts to avoid rate limiting.
 _WHITELIST_USE_PROXIES = False
@@ -455,23 +479,30 @@ def refresh_minecraft_account(account):
     upsert_mc_accounts([refreshed], active_uuid=refreshed.get("uuid"))
     return refreshed
 
-def ensure_minecraft_session_join(account, server_hash):
-    last_rate_limit = False
-    for attempt in range(MOJANG_JOIN_RETRIES + 1):
+def ensure_minecraft_session_join(account, server_hash, cooldown=None, retries=None):
+    if cooldown is None:
+        cooldown = MOJANG_RATE_LIMIT_COOLDOWN
+    if retries is None:
+        retries = MOJANG_JOIN_RETRIES
+    rate_attempts = 0
+    refreshed_once = False
+    while True:
         try:
             minecraft_join_server(account, server_hash, verify=False)
             return account
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
-                last_rate_limit = True
-                if attempt < MOJANG_JOIN_RETRIES:
-                    time.sleep(MOJANG_RATE_LIMIT_COOLDOWN)
+                if rate_attempts < retries:
+                    rate_attempts += 1
+                    time.sleep(cooldown)
                     continue
                 raise MinecraftSessionError(
-                    f"Mojang sessionserver rate limited join after {MOJANG_JOIN_RETRIES + 1} attempt(s)"
+                    f"Mojang sessionserver rate limited join after {retries + 1} attempt(s)"
                 )
             if exc.code not in (401, 403):
                 raise
+            if refreshed_once:
+                raise MinecraftSessionError(f"Session token rejected by Mojang HTTP {exc.code}")
             try:
                 refreshed = refresh_minecraft_account(account)
             except Exception:
@@ -479,12 +510,10 @@ def ensure_minecraft_session_join(account, server_hash):
             if not refreshed:
                 raise MinecraftSessionError(f"Session token rejected by Mojang HTTP {exc.code}")
             account = refreshed
+            refreshed_once = True
             continue
         except MinecraftSessionError:
             raise
-    if last_rate_limit:
-        raise MinecraftSessionError("Mojang sessionserver rate limited join")
-    raise MinecraftSessionError("Session join failed")
 
 # ==================== PROXIES ====================
 
@@ -1408,7 +1437,7 @@ def ping_server(entry, proxy=None):
                 except Exception:
                     continue
 
-            return {
+            result = {
                 'ip': f"{host}:{port}",
                 'players': players,
                 'max_players': max_players,
@@ -1418,6 +1447,8 @@ def ping_server(entry, proxy=None):
                 'players_sample': players_sample,
                 'cracked': cracked
             }
+            _remember_protocol(result['ip'], result['protocol'])
+            return result
     except:
         return None
 
@@ -1847,288 +1878,284 @@ def read_login_plugin_channel(buf, pos):
         return ""
 
 
-def _throttle_online_whitelist_probe():
+def _throttle_online_whitelist_probe(account=None):
     """Space out online-mode (Mojang) probes by WHITELIST_PROBE_DELAY.
 
-    Cracked/offline probes never call this. The timestamp marks the start of
-    each online probe so parallel workers keep the same pacing as the old
-    serial loop.
+    Cracked/offline probes never call this. Spacing is per account, so bulk
+    scans rotating many tokens stay parallel while each individual account
+    keeps the same pacing as the old serial loop (which also protects that
+    account from Mojang sessionserver rate limits).
     """
     if WHITELIST_PROBE_DELAY <= 0:
         return
+    try:
+        key = _account_key(account) if account else ""
+    except Exception:
+        key = ""
+    if not key:
+        key = "shared"
     with _WHITELIST_ONLINE_THROTTLE_LOCK:
+        last = _WHITELIST_LAST_ONLINE_PROBE.get(key, 0.0)
         now = time.monotonic()
-        wait = WHITELIST_PROBE_DELAY - (now - _WHITELIST_LAST_ONLINE_PROBE[0])
+        wait = WHITELIST_PROBE_DELAY - (now - last)
         if wait > 0:
             time.sleep(wait)
             now = time.monotonic()
-        _WHITELIST_LAST_ONLINE_PROBE[0] = now
+        _WHITELIST_LAST_ONLINE_PROBE[key] = now
 
 
-def offline_whitelist_probe(host, port=25565, protocol=None, proxy=None, timeout=6):
-    """Whitelist check for offline-mode (cracked) servers without Mojang auth.
-
-    Sends an unauthenticated Login Start and interprets the reply:
-      - Login Success (0x02)            -> (False, open cracked server)
-      - Disconnect mentioning whitelist -> (True, whitelisted cracked server)
-      - Encryption Request (0x01)       -> (None, online-mode marker, needs_auth=True)
-    Returns (result, message, needs_auth, plugin_mod_warning).
-    Never contacts Mojang session servers.
-    """
-    if protocol is None:
-        try:
-            protocol = get_server_protocol(host, port)
-        except Exception:
-            protocol = DEFAULT_STATUS_PROTOCOL
-    username = "Player" + str(random.randint(1000, 9999))
-    sock = None
-    compression_threshold = -1
-    plugin_mod_warning = ""
+def _compute_mod_warning(status_data, version_hint):
+    """NeoForge/Forge warning from status data and/or the version string."""
     try:
-        sock = open_connection(host, port, proxy=proxy, timeout=timeout)
-        sock.settimeout(2.5)
-        handshake = (
-            varint_encode(0) +
-            varint_encode(protocol) +
-            write_string(host) +
-            struct.pack(">H", port) +
-            varint_encode(2)
-        )
-        send_mc_packet(sock, handshake)
-        send_mc_packet(sock, build_login_start(username, protocol))
-        while True:
-            packet_length = recv_varint(sock)
-            if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
-                raise ValueError("Packet too large")
-            packet_data = recv_exact(sock, packet_length)
-            buf = unpack_login_packet(packet_data, compression_threshold)
-            packet_id, pos = read_varint_from_bytes(buf, 0)
-            if packet_id == 0x03:
-                compression_threshold, _ = read_varint_from_bytes(buf, pos)
-                continue
-            if packet_id == 0x01:
-                # Online-mode: server wants Mojang auth. Caller falls through
-                # to the authenticated path.
-                return None, "ONLINE-MODE (auth required)", True, plugin_mod_warning
-            if packet_id == 0x02:
-                msg = f"Not Whitelisted (offline login accepted as {username})"
-                if plugin_mod_warning:
-                    msg = append_mod_warning(msg, plugin_mod_warning)
-                return False, msg, False, plugin_mod_warning
-            if packet_id == 0x04:
-                channel = read_login_plugin_channel(buf, pos)
-                loader, _detail = detect_modloader_from_channel(channel)
-                if loader:
-                    plugin_mod_warning = mod_warning_text(loader, channel)
-                # Cracked server behind a login plugin / proxy: no whitelist
-                # kick yet, so treat as open (not whitelisted) rather than
-                # burning a Mojang token on it.
-                msg = f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)"
-                if plugin_mod_warning:
-                    msg = append_mod_warning(msg, plugin_mod_warning)
-                return False, msg, False, plugin_mod_warning
-            if packet_id == 0x00:
-                reason = parse_disconnect_reason(buf, pos)
-                low = reason.lower()
-                if "whitelist" in low or "white list" in low or "not whitelisted" in low:
-                    msg = f"WHITELISTED ({reason}) [offline-mode, no Mojang auth used]"
-                    if plugin_mod_warning:
-                        msg = append_mod_warning(msg, plugin_mod_warning)
-                    return True, msg, False, plugin_mod_warning
-                if "outdated client" in low or "outdated server" in low:
-                    return None, f"Version mismatch ({reason})", False, plugin_mod_warning
-                # Any other disconnect on an offline-mode server still proves
-                # no Mojang auth was needed to get an answer.
-                msg = f"Not Whitelisted ({reason}) [offline-mode, no Mojang auth used]"
-                if plugin_mod_warning:
-                    msg = append_mod_warning(msg, plugin_mod_warning)
-                return False, msg, False, plugin_mod_warning
-            if packet_id == 0x05:
-                msg = "Not Whitelisted (entered configuration; no immediate whitelist kick) [offline-mode, no Mojang auth used]"
-                if plugin_mod_warning:
-                    msg = append_mod_warning(msg, plugin_mod_warning)
-                return False, msg, False, plugin_mod_warning
-    except socket.timeout:
-        return None, "Timed out during offline whitelist probe", False, plugin_mod_warning
-    except Exception as exc:
-        return None, f"Offline whitelist probe error: {str(exc)[:80]}", False, plugin_mod_warning
-    finally:
-        if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
+        loader, detail = detect_modloader_from_status(status_data or {}, version_hint or "")
+        if loader:
+            return mod_warning_text(loader, detail)
+    except Exception:
+        pass
+    if version_hint and "neoforge" in str(version_hint).lower():
+        return mod_warning_text("NeoForge", str(version_hint))
+    return ""
 
 
 def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=None, version_hint=""):
-    # 1) Status ping: protocol + NeoForge/Forge detection. No Mojang involved.
-    mod_warning = ""
+    """Whitelist check using exactly ONE login connection to the server.
+
+    Paper and similar servers kick rapid reconnects ("Connection throttled"),
+    so this probe deliberately opens a single game connection per attempt:
+      - The protocol comes from the scan entry (or a remembered earlier ping).
+        A status ping — a different, non-throttled connection type — is only
+        used when the protocol is unknown, and once more to recover from a
+        version-mismatch disconnect (stale protocol).
+      - One Login Start is sent: account credentials when the account has a
+        UUID (offline servers simply accept it — no Mojang involved),
+        otherwise a random offline name.
+      - Encryption Request means online-mode: the Mojang session join runs on
+        this same connection (still spaced per account by WHITELIST_PROBE_DELAY
+        and still with the original 429 backoff, except the cooldown sleep
+        never holds the game connection open).
+      - Anything else is answered without ever contacting Mojang.
+    NeoForge/Forge warnings come from the version hint, login plugin channels
+    and disconnect text (plus status data when a status ping was needed).
+    Returns (result, message) with result True/False/None.
+    """
+    ip_port = f"{host}:{port}"
     status_data = {}
+    did_fresh_status = False
+    if protocol is None:
+        protocol = _cached_protocol(ip_port)
     if protocol is None:
         try:
             protocol, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
         except Exception:
             protocol = DEFAULT_STATUS_PROTOCOL
             status_data = {}
-    else:
-        try:
-            _proto, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
-        except Exception:
-            status_data = {}
+        if protocol is not None:
+            _remember_protocol(ip_port, protocol)
+        did_fresh_status = True
     try:
-        loader, detail = detect_modloader_from_status(status_data, version_hint)
-        if loader:
-            mod_warning = mod_warning_text(loader, detail)
+        protocol = int(protocol)
     except Exception:
-        pass
-    if not mod_warning and version_hint and "neoforge" in str(version_hint).lower():
-        mod_warning = mod_warning_text("NeoForge", str(version_hint))
+        protocol = DEFAULT_STATUS_PROTOCOL
+    mod_warning = _compute_mod_warning(status_data, version_hint)
 
-    # 2) Offline-first probe: cracked servers never touch Mojang auth.
-    try:
-        off_result, off_message, needs_auth, plugin_warning = offline_whitelist_probe(
-            host, port, protocol=protocol, proxy=proxy
-        )
-    except Exception as exc:
-        off_result, off_message, needs_auth, plugin_warning = None, f"Offline probe failed: {exc}", False, ""
-    combined_warning = mod_warning or plugin_warning
-    if plugin_warning and mod_warning and plugin_warning not in mod_warning:
-        combined_warning = f"{mod_warning} + {plugin_warning}"
-    if not needs_auth:
-        # Definitive offline answer (or offline timeout/error): return as-is,
-        # Mojang sessionserver never contacted.
-        return off_result, append_mod_warning(off_message, combined_warning)
+    def _single_login_attempt(current_protocol):
+        """Open the single login connection.
 
-    # 3) Online-mode path: Mojang auth is unavoidable from here on.
-    # Same pacing as before: space out online probes, plus Mojang 429 backoff
-    # inside ensure_minecraft_session_join. Offline probes above never wait.
-    if not account:
-        msg = "No Minecraft account selected (online-mode server needs Mojang auth)"
-        return None, append_mod_warning(msg, combined_warning)
-    _throttle_online_whitelist_probe()
-    # USERNAME:TOKEN imports may not include a profile UUID. Resolve the
-    # profile before constructing Login Start; an empty selectedProfile is
-    # rejected by the session server as HTTP 400.
-    if not account.get("uuid") and account.get("access_token"):
-        resolved, ok, detail = probe_account(account)
-        if ok and resolved.get("uuid"):
-            account.clear()
-            account.update(resolved)
-            upsert_mc_accounts([account], active_uuid=account.get("uuid"))
-        else:
-            return None, append_mod_warning(f"Token profile lookup failed: {detail}", combined_warning)
-    if not account.get("uuid"):
-        return None, append_mod_warning("Minecraft profile UUID is missing; test the token first", combined_warning)
-    if not _CRYPTO_AVAILABLE:
-        return None, append_mod_warning("cryptography package is not available", combined_warning)
-    sock = None
-    compression_threshold = -1
-    encrypted = False
-    try:
-        sock = open_connection(host, port, proxy=proxy, timeout=6)
-        sock.settimeout(2.5)
-        handshake = (
-            varint_encode(0) +
-            varint_encode(protocol) +
-            write_string(host) +
-            struct.pack(">H", port) +
-            varint_encode(2)
-        )
-        send_mc_packet(sock, handshake)
-        send_mc_packet(sock, build_authenticated_login_start(account, protocol))
-
-        while True:
-            packet_length = recv_varint(sock)
-            if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
-                raise ValueError("Packet too large")
-            packet_data = recv_exact(sock, packet_length)
-            buf = unpack_login_packet(packet_data, compression_threshold)
-            packet_id, pos = read_varint_from_bytes(buf, 0)
-
-            if packet_id == 0x03:
-                compression_threshold, _ = read_varint_from_bytes(buf, pos)
-                continue
-
-            if packet_id == 0x01 and not encrypted:
-                server_id, pos = read_mc_string_from_bytes(buf, pos)
-                public_key_bytes, pos = read_mc_byte_array_from_bytes(buf, pos)
-                verify_token, pos = read_mc_byte_array_from_bytes(buf, pos)
-                public_key = load_der_public_key(public_key_bytes, backend=default_backend())
-                shared_secret = os.urandom(16)
-                server_hash = minecraft_sha1_hexdigest(
-                    server_id.encode("ascii", errors="ignore"),
-                    shared_secret,
-                    public_key_bytes
-                )
-                try:
-                    account = ensure_minecraft_session_join(account, server_hash)
-                except urllib.error.HTTPError as exc:
-                    try:
-                        detail = exc.read().decode("utf-8", errors="replace")[:180]
-                    except Exception:
-                        detail = ""
-                    return None, f"Mojang join failed: HTTP {exc.code}" + (f": {detail}" if detail else "")
-                except MinecraftSessionError as exc:
-                    return None, f"Auth/session failed before server login ({exc})"
-                encrypted_secret = public_key.encrypt(shared_secret, rsa_padding.PKCS1v15())
-                encrypted_token = public_key.encrypt(verify_token, rsa_padding.PKCS1v15())
-                response = varint_encode(0x01)
-                response += varint_encode(len(encrypted_secret)) + encrypted_secret
-                response += varint_encode(len(encrypted_token)) + encrypted_token
-                send_mc_packet(sock, response)
-                sock = EncryptedSocket(sock, shared_secret)
-                encrypted = True
-                continue
-
-            if packet_id == 0x00:
-                reason = parse_disconnect_reason(buf, pos)
-                low = reason.lower()
-                if "whitelist" in low or "white list" in low or "not whitelisted" in low:
-                    return True, append_mod_warning(f"WHITELISTED ({reason})", combined_warning)
-                if "outdated client" in low or "outdated server" in low:
-                    return None, append_mod_warning(f"Version mismatch ({reason})", combined_warning)
-                if (
-                    "multiplayer is disabled" in low or
-                    "authentication" in low or
-                    "invalid session" in low or
-                    "verify username" in low or
-                    "unverified_username" in low
-                ):
-                    return None, append_mod_warning(f"Auth/session rejected ({reason})", combined_warning)
-                # Modded servers often kick here with mod/channel mismatch text.
-                extra_warning = combined_warning
-                for marker in ("neoforge", "forge", "fml", "mod"):
-                    if marker in low and marker not in extra_warning.lower():
-                        extra_warning = append_mod_warning("", mod_warning_text("NeoForge" if marker == "neoforge" else "Forge", reason)) or extra_warning
-                        break
-                return False, append_mod_warning(f"Not Whitelisted ({reason})", extra_warning)
-
-            if packet_id == 0x02:
-                return False, append_mod_warning("Not Whitelisted (login accepted)", combined_warning)
-
-            if packet_id == 0x04:
-                channel = read_login_plugin_channel(buf, pos)
-                warn = combined_warning
-                loader, _d = detect_modloader_from_channel(channel)
-                if loader:
-                    warn = append_mod_warning(warn, mod_warning_text(loader, channel))
-                return False, append_mod_warning(
-                    f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)",
-                    warn)
-
-            if packet_id == 0x05:
-                return False, append_mod_warning("Not Whitelisted (entered configuration; no immediate whitelist kick)", combined_warning)
-
-    except socket.timeout:
-        return None, append_mod_warning("Timed out during whitelist probe", combined_warning)
-    except Exception as exc:
-        return None, append_mod_warning(f"Whitelist probe error: {str(exc)[:80]}", combined_warning)
-    finally:
-        if sock:
+        Returns (result, message, action) where action is "done",
+        "retry_rate" (Mojang 429: caller sleeps with no open connection, then
+        retries with a fresh one) or "retry_version" (stale protocol: caller
+        refreshes via status, then retries once).
+        """
+        use_auth_start = bool(account is not None and account.get("uuid"))
+        # A second connection is only ever opened for UUID-less imports
+        # (USERNAME:TOKEN never probed) that turn out to be online-mode:
+        # resolve the profile, then reconnect once with a proper Login Start.
+        for _conn_index in range(2):
+            if use_auth_start:
+                login_start = build_authenticated_login_start(account, current_protocol)
+                login_name = (account.get("name") or "Player")[:16] or "Player"
+            else:
+                login_name = "Player" + str(random.randint(1000, 9999))
+                login_start = build_login_start(login_name, current_protocol)
+            sock = None
+            compression_threshold = -1
+            encrypted = False
+            mojang_used = False
+            saw_encryption = False
+            reconnect_needed = False
             try:
-                sock.close()
+                sock = open_connection(host, port, proxy=proxy, timeout=6)
+                sock.settimeout(2.5)
+                handshake = (
+                    varint_encode(0) +
+                    varint_encode(current_protocol) +
+                    write_string(host) +
+                    struct.pack(">H", port) +
+                    varint_encode(2)
+                )
+                send_mc_packet(sock, handshake)
+                send_mc_packet(sock, login_start)
+
+                while True:
+                    packet_length = recv_varint(sock)
+                    if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
+                        raise ValueError("Packet too large")
+                    packet_data = recv_exact(sock, packet_length)
+                    buf = unpack_login_packet(packet_data, compression_threshold)
+                    packet_id, pos = read_varint_from_bytes(buf, 0)
+
+                    if packet_id == 0x03:
+                        compression_threshold, _ = read_varint_from_bytes(buf, pos)
+                        continue
+
+                    if packet_id == 0x01 and not encrypted:
+                        saw_encryption = True
+                        server_id, pos = read_mc_string_from_bytes(buf, pos)
+                        public_key_bytes, pos = read_mc_byte_array_from_bytes(buf, pos)
+                        verify_token, pos = read_mc_byte_array_from_bytes(buf, pos)
+                        if account is None:
+                            return None, append_mod_warning("No Minecraft account selected (online-mode server needs Mojang auth)", mod_warning), "done"
+                        if not account.get("uuid"):
+                            resolved, ok, detail = probe_account(account)
+                            if not (ok and resolved.get("uuid")):
+                                return None, append_mod_warning(f"Token profile lookup failed: {detail}", mod_warning), "done"
+                            account.clear()
+                            account.update(resolved)
+                            upsert_mc_accounts([account], active_uuid=account.get("uuid"))
+                            use_auth_start = True
+                            reconnect_needed = True
+                            _throttle_online_whitelist_probe(account)
+                            break
+                        if not _CRYPTO_AVAILABLE:
+                            return None, append_mod_warning("cryptography package is not available", mod_warning), "done"
+                        _throttle_online_whitelist_probe(account)
+                        public_key = load_der_public_key(public_key_bytes, backend=default_backend())
+                        shared_secret = os.urandom(16)
+                        server_hash = minecraft_sha1_hexdigest(
+                            server_id.encode("ascii", errors="ignore"),
+                            shared_secret,
+                            public_key_bytes
+                        )
+                        try:
+                            # Fail fast on 429: the caller sleeps the cooldown
+                            # with no game connection open, then retries with
+                            # a fresh single connection.
+                            ensure_minecraft_session_join(account, server_hash, cooldown=0, retries=0)
+                        except urllib.error.HTTPError as exc:
+                            try:
+                                detail = exc.read().decode("utf-8", errors="replace")[:180]
+                            except Exception:
+                                detail = ""
+                            return None, append_mod_warning(f"Mojang join failed: HTTP {exc.code}" + (f": {detail}" if detail else ""), mod_warning), "done"
+                        except MinecraftSessionError as exc:
+                            if "rate limited" in str(exc).lower():
+                                return None, f"Mojang sessionserver rate limited join ({exc})", "retry_rate"
+                            return None, append_mod_warning(f"Auth/session failed before server login ({exc})", mod_warning), "done"
+                        mojang_used = True
+                        encrypted_secret = public_key.encrypt(shared_secret, rsa_padding.PKCS1v15())
+                        encrypted_token = public_key.encrypt(verify_token, rsa_padding.PKCS1v15())
+                        response = varint_encode(0x01)
+                        response += varint_encode(len(encrypted_secret)) + encrypted_secret
+                        response += varint_encode(len(encrypted_token)) + encrypted_token
+                        send_mc_packet(sock, response)
+                        sock = EncryptedSocket(sock, shared_secret)
+                        encrypted = True
+                        continue
+
+                    if packet_id == 0x00:
+                        reason = parse_disconnect_reason(buf, pos)
+                        low = reason.lower()
+                        if "whitelist" in low or "white list" in low or "not whitelisted" in low:
+                            msg = f"WHITELISTED ({reason})"
+                            if not mojang_used and not saw_encryption:
+                                msg += " [offline-mode, no Mojang auth used]"
+                            return True, append_mod_warning(msg, mod_warning), "done"
+                        if "throttl" in low:
+                            return None, append_mod_warning(f"Connection throttled, retry later ({reason})", mod_warning), "done"
+                        if "outdated client" in low or "outdated server" in low:
+                            return None, append_mod_warning(f"Version mismatch ({reason})", mod_warning), "retry_version"
+                        if (
+                            "multiplayer is disabled" in low or
+                            "authentication" in low or
+                            "invalid session" in low or
+                            "verify username" in low or
+                            "unverified_username" in low
+                        ):
+                            return None, append_mod_warning(f"Auth/session rejected ({reason})", mod_warning), "done"
+                        # Modded servers often kick here with mod/channel mismatch text.
+                        extra_warning = mod_warning
+                        for marker in ("neoforge", "forge", "fml", "mod"):
+                            if marker in low and marker not in extra_warning.lower():
+                                extra_warning = append_mod_warning("", mod_warning_text("NeoForge" if marker == "neoforge" else "Forge", reason)) or extra_warning
+                                break
+                        msg = f"Not Whitelisted ({reason})"
+                        if not mojang_used and not saw_encryption:
+                            msg += " [offline-mode, no Mojang auth used]"
+                        return False, append_mod_warning(msg, extra_warning), "done"
+
+                    if packet_id == 0x02:
+                        if saw_encryption:
+                            return False, append_mod_warning("Not Whitelisted (login accepted)", mod_warning), "done"
+                        msg = f"Not Whitelisted (offline login accepted as {login_name}) [offline-mode, no Mojang auth used]"
+                        return False, append_mod_warning(msg, mod_warning), "done"
+
+                    if packet_id == 0x04:
+                        channel = read_login_plugin_channel(buf, pos)
+                        warn = mod_warning
+                        loader, _d = detect_modloader_from_channel(channel)
+                        if loader:
+                            warn = append_mod_warning(warn, mod_warning_text(loader, channel))
+                        msg = f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)"
+                        if not mojang_used and not saw_encryption:
+                            msg += " [offline-mode, no Mojang auth used]"
+                        return False, append_mod_warning(msg, warn), "done"
+
+                    if packet_id == 0x05:
+                        msg = "Not Whitelisted (entered configuration; no immediate whitelist kick)"
+                        if not mojang_used and not saw_encryption:
+                            msg += " [offline-mode, no Mojang auth used]"
+                        return False, append_mod_warning(msg, mod_warning), "done"
+
+            except socket.timeout:
+                return None, append_mod_warning("Timed out during whitelist probe", mod_warning), "done"
+            except Exception as exc:
+                return None, append_mod_warning(f"Whitelist probe error: {str(exc)[:80]}", mod_warning), "done"
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            if reconnect_needed:
+                continue
+            return None, append_mod_warning("Whitelist probe ended unexpectedly", mod_warning), "done"
+        return None, append_mod_warning("Minecraft profile UUID is missing; test the token first", mod_warning), "done"
+
+    rate_attempt = 0
+    while True:
+        result, message, action = _single_login_attempt(protocol)
+        if action == "retry_rate" and rate_attempt < MOJANG_JOIN_RETRIES:
+            # Same budget as the old join retries, but the cooldown sleep
+            # happens with no game connection open, and the retry uses one
+            # fresh single connection (safe for Paper-style throttles).
+            rate_attempt += 1
+            if MOJANG_RATE_LIMIT_COOLDOWN > 0:
+                time.sleep(MOJANG_RATE_LIMIT_COOLDOWN)
+            continue
+        if action == "retry_version" and not did_fresh_status:
+            try:
+                protocol, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
+                _remember_protocol(ip_port, protocol)
+                try:
+                    protocol = int(protocol)
+                except Exception:
+                    protocol = DEFAULT_STATUS_PROTOCOL
+                mod_warning = _compute_mod_warning(status_data, version_hint)
+                did_fresh_status = True
             except Exception:
-                pass
+                return result, message
+            continue
+        return result, message
 
 def _probe_whitelist_entry(entry, account, proxy=None):
     ip = entry.get("ip")
