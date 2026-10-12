@@ -2,7 +2,7 @@
 
 ![Screenshot](https://i.imgur.com/NCpx7u0.png)
 
-Minecraft Server Scanner is a Windows desktop application that discovers, checks, organizes, and exports Minecraft servers through a Tkinter GUI.
+Minecraft Server Scanner is a Windows desktop application that discovers, checks, organizes, and exports Minecraft servers through a Qt (PySide6) GUI.
 
 ## Features
 
@@ -121,6 +121,7 @@ Network Scan results remain in the scan result table unless they are explicitly 
 
 - Windows.
 - Python 3.10 or newer.
+- PySide6 for the Qt GUI (`pip install PySide6`).
 - A valid Shodan API key for Shodan searches.
 - The cryptography package for authenticated whitelist probes.
 - Network access for Shodan, Minecraft status probes, account services, and ASN prefix lookup.
@@ -130,7 +131,7 @@ Network Scan results remain in the scan result table unless they are explicitly 
 
 Run:
 
-    python MC_Scanner.py
+    python scanner.py
 
 The application stores its working files in the current working directory unless a path uses %APPDATA% explicitly.
 

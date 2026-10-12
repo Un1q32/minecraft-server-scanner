@@ -23,15 +23,33 @@ from nbtlib import Compound, String, Byte
 # Hide console window
 if os.name == "nt": __import__("ctypes").windll.user32.ShowWindow(__import__("ctypes").windll.kernel32.GetConsoleWindow(), 0)
 
-# Tkinter + threading
-import tkinter as tk  
-from tkinter import ttk, filedialog, messagebox, simpledialog  
-import threading  
+# Qt (PySide6) UI + threading
+import threading
+try:
+    from PySide6.QtCore import Qt, QTimer, QThread
+    from PySide6.QtGui import QIcon, QPixmap, QImage, QColor
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
+        QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
+        QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSplitter,
+        QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    )
+    from qt_helpers import (
+        QtBaseMixin, ResultTable, make_table_sortable, q_ask_open, q_ask_save,
+        q_ask_string, q_error, q_info, ask_reason_with_whitelist,
+        ensure_shodan_key_ui as _qt_ensure_shodan_key_ui,
+        SudoPasswordDialog, ui_after,
+    )
+except ImportError as _qt_err:
+    raise SystemExit(
+        "PySide6 is required for the Qt UI (pip install PySide6). "
+        f"Import failed: {_qt_err}"
+    )
 
 import base64  
 import io      
 try:
-    from PIL import Image, ImageTk  
+    from PIL import Image
     _PIL_AVAILABLE = True
 except Exception:
     _PIL_AVAILABLE = False
@@ -226,20 +244,9 @@ def ensure_shodan_key_ui(parent) -> str | None:
     """
     Main-thread only. If no key file exists, prompt the user and save it.
     Returns the key or None if the user cancels.
+    (Qt port: password-masked QInputDialog via qt_helpers.)
     """
-    key = _load_key_from_cwd()
-    if key:
-        return key
-    key = simpledialog.askstring(
-        "Shodan API Key",
-        "Enter your Shodan API key:",
-        parent=parent,
-        show="*"  # hides the text while typing
-    )
-    if key:
-        _save_key_to_cwd(key)
-        return key.strip()
-    return None
+    return _qt_ensure_shodan_key_ui(parent)
 
 # ========================================
 
@@ -1042,18 +1049,12 @@ def _version_key(val):  # "1.21.1" -> (1,21,1)
     return tuple(t) if t else (0,)
 
 def make_tree_sortable(tree, column_key_funcs):  #
-    sort_state = {}  # col -> bool
+    """Qt port: delegate header sorting to the ResultTable (custom keys)."""
+    try:
+        make_table_sortable(tree, column_key_funcs)
+    except Exception:
+        pass
 
-    def sort_by(col):
-        reverse = sort_state.get(col, False)
-        rows = [(column_key_funcs.get(col, str)(tree.set(iid, col)), iid) for iid in tree.get_children("")]
-        rows.sort(reverse=reverse)
-        for idx, (_, iid) in enumerate(rows):
-            tree.move(iid, "", idx)
-        sort_state[col] = not reverse
-
-    for col in tree["columns"]:
-        tree.heading(col, command=lambda c=col: sort_by(c))
 
 # Robust parser for "IP | MOTD: ... | Players: x/y | Version: ..."
 def parse_formatted_line(line):  #
@@ -2238,25 +2239,26 @@ def open_whitelist_log_file(parent=None):
         if os.name == "nt":
             os.startfile(os.path.abspath(WHITELIST_LOG_FILE))
         else:
-            messagebox.showinfo("Whitelist Log", os.path.abspath(WHITELIST_LOG_FILE), parent=parent)
+            q_info(parent, "Whitelist Log", os.path.abspath(WHITELIST_LOG_FILE))
     except Exception as exc:
         if parent is not None:
-            messagebox.showerror("Whitelist Log", f"Could not open log: {exc}", parent=parent)
+            q_error(parent, "Whitelist Log", f"Could not open log: {exc}")
 
 def check_selected_whitelist(parent, tree):
     """Manually probe the currently selected result rows.
 
     Cracked (offline-mode) servers are checked without any Minecraft account;
     only online-mode servers need the active token for Mojang auth.
+    (Qt port: identical logic, QMessageBox via qt_helpers.)
     """
     account = get_active_mc_account()
     selected = tree.selection()
     if not selected:
-        messagebox.showinfo("Check Whitelist", "Select one or more server rows first.", parent=parent)
+        q_info(parent, "Check Whitelist", "Select one or more server rows first.")
         return
     columns = list(tree["columns"])
     if "whitelist" not in columns:
-        messagebox.showinfo("Check Whitelist", "This result view has no whitelist column.", parent=parent)
+        q_info(parent, "Check Whitelist", "This result view has no whitelist column.")
         return
     entries = []
     for iid in selected:
@@ -2280,14 +2282,15 @@ def check_selected_whitelist(parent, tree):
     run_whitelist_verifier_async(entries, account, on_update, progress_cb=progress)
 
 def check_selected_cracked(parent, tree):
-    """Manually probe the currently selected result rows for offline-mode."""
+    """Manually probe the currently selected result rows for offline-mode.
+    (Qt port: identical logic, QMessageBox via qt_helpers.)"""
     selected = tree.selection()
     if not selected:
-        messagebox.showinfo("Check Cracked", "Select one or more server rows first.", parent=parent)
+        q_info(parent, "Check Cracked", "Select one or more server rows first.")
         return
     columns = list(tree["columns"])
     if "cracked" not in columns:
-        messagebox.showinfo("Check Cracked", "This result view has no cracked column.", parent=parent)
+        q_info(parent, "Check Cracked", "This result view has no cracked column.")
         return
     entries = []
     for iid in selected:
@@ -4140,212 +4143,145 @@ def save_ips_rows(rows, file_path=GLOBAL_IP_LOG):
             players = players or "N/A"
             f.write(f"{ip} | MOTD: {sanitize_motd(motd)} | Players: {players} | Version: {version}\n")
 
-def ask_reason_with_whitelist(parent, title="Reason", prompt="Why ignore? (optional)"):
 
-    dlg = tk.Toplevel(parent)
-    dlg.transient(parent)
-    dlg.grab_set()
-    dlg.title(title)
-
-    # Make small, non-resizable and center over parent (best-effort)
-    try:
-        dlg.resizable(False, False)
-    except Exception:
-        pass
-
-    frm = ttk.Frame(dlg, padding=(12, 10))
-    frm.pack(fill="both", expand=True)
-
-    ttk.Label(frm, text=prompt).pack(anchor="w", pady=(0,6))
-
-    var = tk.StringVar()
-    entry = ttk.Entry(frm, textvariable=var, width=60)
-    entry.pack(fill="x", expand=True)
-    entry.focus_set()
-
-    btns = ttk.Frame(frm)
-    btns.pack(fill="x", pady=(10,0))
-
-    def _close_with(val):
-        dlg.result = None if val is None else str(val)
-        try:
-            dlg.grab_release()
-        except Exception:
-            pass
-        dlg.destroy()
-
-    def _on_ok():
-        _close_with(var.get().strip() if var.get().strip() else "")
-
-    def _on_whitelist():
-        # immediate accept with "White List"
-        _close_with("White List")
-
-    def _on_cancel():
-        _close_with(None)
-
-    # Buttons: OK, White List, Cancel
-    ttk.Button(btns, text="OK", command=_on_ok).pack(side="left", padx=(0,6))
-    ttk.Button(btns, text="White List", command=_on_whitelist).pack(side="left", padx=(0,6))
-    ttk.Button(btns, text="Cancel", command=_on_cancel).pack(side="left")
-
-    # Bind Enter / Escape keys
-    dlg.bind("<Return>", lambda e: _on_ok())
-    dlg.bind("<Escape>", lambda e: _on_cancel())
-
-    # center over parent (best-effort)
-    try:
-        parent.update_idletasks()
-        px = parent.winfo_rootx()
-        py = parent.winfo_rooty()
-        pw = parent.winfo_width()
-        ph = parent.winfo_height()
-        dlg.update_idletasks()
-        w = dlg.winfo_reqwidth()
-        h = dlg.winfo_reqheight()
-        x = px + max(0, (pw - w) // 2)
-        y = py + max(0, (ph - h) // 2)
-        dlg.geometry(f"+{x}+{y}")
-    except Exception:
-        pass
-
-    parent.wait_window(dlg)
-    return getattr(dlg, "result", None)
-
-# ========================================  
+# ==================== Qt server icons + GUI (PySide6) ====================
+# ==================== Qt server icons ====================
+# Qt port of _IconManager (previously tkinter PhotoImage based).
+# Behavior is 1:1: per-IP favicon fetch with bounded caches, async lookup,
+# icon shown on the IP cell of attached result tables.
 
 class _IconManager:
     def __init__(self):
         self._cache_bytes = {}        # ip -> png bytes or None
-        self._cache_images = {}       # ip -> PhotoImage (or placeholder)
+        self._cache_icons = {}        # ip -> QIcon
         self._executor = ThreadPoolExecutor(max_workers=max(1, ICON_THREADS))
         self._attached = set()
-        self._placeholder_image = None
+        self._placeholder_icon = None
 
-    def _ensure_tree_ready(self, tree: ttk.Treeview):
-        # turn on the tree column to host images, center it, set width
-        try:
-            tree["show"] = "tree headings"
-        except Exception:
-            pass
-        tree.heading("#0", text="ICON")
-        tree.column("#0", width=ICON_SIZE + ICON_COL_EXTRA_PAD, stretch=False, anchor="center")
-
-        # increase row height just for this tree
-        sty = ttk.Style(tree)
-        style_name = f"IconTreeview{str(id(tree))}"
-        try:
-            sty.configure(style_name, rowheight=max(ICON_SIZE + 8, 24))
-            tree.configure(style=style_name)
-        except Exception:
-            pass
-
-        # storage for PhotoImage refs so they don't get GC'd
-        if not hasattr(tree, "_icon_images"):
-            tree._icon_images = {}
-
-    def attach_to_tree(self, tree: ttk.Treeview):
+    def attach_to_tree(self, tree):
         if not ICON_ENABLED:
             return
-        if tree in self._attached:
+        try:
+            key = id(tree)
+        except Exception:
             return
-        self._ensure_tree_ready(tree)
-
-        # monkeypatch insert to auto-register rows
+        if key in self._attached:
+            return
         if not hasattr(tree, "_orig_insert"):
-            tree._orig_insert = tree.insert
+            try:
+                tree._orig_insert = tree.insert
+            except Exception:
+                return
 
-            def _insert_wrapper(parent, index, iid=None, **kw):
-                values = kw.get("values")
-                new_iid = tree._orig_insert(parent, index, iid=iid, **kw)
-                if values and len(values) > 0:
-                    ip = values[0]
-                    if is_valid_ip_port(ip):
-                        self._fetch_and_set_icon(tree, new_iid, ip)
+            mgr = self
+
+            def _insert_wrapper(parent_ignored="", index_ignored="end", values=(), **kw):
+                if "values" in kw:
+                    values = kw["values"]
+                new_iid = tree._orig_insert(parent_ignored, index_ignored, values=values)
+                try:
+                    if values and len(values) > 0:
+                        ip = str(values[0])
+                        if is_valid_ip_port(ip):
+                            mgr._fetch_and_set_icon(tree, new_iid, ip)
+                except Exception:
+                    pass
                 return new_iid
 
-            tree.insert = _insert_wrapper  # type: ignore
+            try:
+                tree.insert = _insert_wrapper  # type: ignore
+            except Exception:
+                return
+        self._attached.add(key)
 
-        self._attached.add(tree)
-
-    def _fetch_and_set_icon(self, tree: ttk.Treeview, iid: str, ip: str):
-        # if already cached, set immediately on UI thread
+    def _fetch_and_set_icon(self, tree, iid, ip):
         if ip in self._cache_bytes:
             data = self._cache_bytes[ip]
-            self._apply_icon_to_item(tree, iid, ip, data)
+            ui_after(0, lambda: self._apply_icon_to_item(tree, iid, ip, data))
             return
 
-        # fetch in background
         def work():
-            data = fetch_server_favicon_bytes(ip)
-            # cache whether None or bytes to avoid repeat lookups
+            try:
+                data = fetch_server_favicon_bytes(ip)
+            except Exception:
+                data = None
             if len(self._cache_bytes) >= MAX_ICON_CACHE_ENTRIES and ip not in self._cache_bytes:
-                self._cache_bytes.pop(next(iter(self._cache_bytes)), None)
+                try:
+                    self._cache_bytes.pop(next(iter(self._cache_bytes)), None)
+                except Exception:
+                    pass
             self._cache_bytes[ip] = data
             try:
-                tree.after(0, lambda: self._apply_icon_to_item(tree, iid, ip, data))
+                ui_after(0, lambda: self._apply_icon_to_item(tree, iid, ip, data))
             except Exception:
                 pass
 
-        self._executor.submit(work)
-
-    def _apply_icon_to_item(self, tree: ttk.Treeview, iid: str, ip: str, png_bytes: bytes | None):
         try:
-            photo = self._photo_for_ip(ip, png_bytes)
-            # keep ref
-            if len(tree._icon_images) >= MAX_ICON_CACHE_ENTRIES and iid not in tree._icon_images:
-                tree._icon_images.pop(next(iter(tree._icon_images)), None)
-            tree._icon_images[iid] = photo
-            tree.item(iid, image=photo, text="")
+            self._executor.submit(work)
         except Exception:
-            # ignore per-row failures silently
             pass
 
-    def _photo_for_ip(self, ip: str, png_bytes: bytes | None):
-        if ip in self._cache_images:
-            return self._cache_images[ip]
-        photo = self._make_photo(png_bytes)
-        if photo is None:
-            photo = self._placeholder_photo()
-        if len(self._cache_images) >= MAX_ICON_CACHE_ENTRIES and ip not in self._cache_images:
-            self._cache_images.pop(next(iter(self._cache_images)), None)
-        self._cache_images[ip] = photo
-        return photo
+    def _apply_icon_to_item(self, tree, iid, ip, png_bytes):
+        try:
+            icon = self._icon_for_ip(ip, png_bytes)
+            tree.set_row_icon(iid, icon)
+        except Exception:
+            pass
 
-    def _make_photo(self, png_bytes):
+    def _icon_for_ip(self, ip, png_bytes):
+        if ip in self._cache_icons:
+            return self._cache_icons[ip]
+        icon = self._make_icon(png_bytes)
+        if icon is None:
+            icon = self._placeholder_icon_fn()
+        if len(self._cache_icons) >= MAX_ICON_CACHE_ENTRIES and ip not in self._cache_icons:
+            try:
+                self._cache_icons.pop(next(iter(self._cache_icons)), None)
+            except Exception:
+                pass
+        self._cache_icons[ip] = icon
+        return icon
+
+    def _make_icon(self, png_bytes):
         if not png_bytes:
             return None
-        if _PIL_AVAILABLE:
-            try:
-                im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-                im = im.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
-                return ImageTk.PhotoImage(im)
-            except Exception:
-                return None
-        # fallback: try raw PhotoImage (cannot upscale; can downscale via subsample)
         try:
-            b64 = base64.b64encode(png_bytes)
-            img = tk.PhotoImage(data=b64)
-            w = img.width()
-            if w > 0 and ICON_SIZE < w:
-                factor = max(1, round(w / ICON_SIZE))
-                img = img.subsample(factor)
-            return img
+            img = QImage.fromData(bytes(png_bytes))
+            if img.isNull():
+                return None
+            pix = QPixmap.fromImage(img)
+            if pix.isNull():
+                return None
+            try:
+                pix = pix.scaled(
+                    ICON_SIZE, ICON_SIZE,
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                )
+            except Exception:
+                pass
+            return QIcon(pix)
         except Exception:
             return None
 
-    def _placeholder_photo(self):
-        if self._placeholder_image is not None:
-            return self._placeholder_image
-        # simple solid square to reserve space
-        img = tk.PhotoImage(width=ICON_SIZE, height=ICON_SIZE)
-        img.put(ICON_PLACEHOLDER, to=(0, 0, ICON_SIZE, ICON_SIZE))
-        self._placeholder_image = img
-        return img
+    def _placeholder_icon_fn(self):
+        if self._placeholder_icon is not None:
+            return self._placeholder_icon
+        try:
+            pix = QPixmap(ICON_SIZE, ICON_SIZE)
+            try:
+                pix.fill(QColor(ICON_PLACEHOLDER))
+            except Exception:
+                pass
+            self._placeholder_icon = QIcon(pix)
+        except Exception:
+            self._placeholder_icon = QIcon()
+        return self._placeholder_icon
 
 
 # singleton accessor
 _ICON_MANAGER_SINGLETON = None
+
+
 def _get_icon_manager():
     global _ICON_MANAGER_SINGLETON
     if _ICON_MANAGER_SINGLETON is None:
@@ -4353,44 +4289,100 @@ def _get_icon_manager():
     return _ICON_MANAGER_SINGLETON
 
 
-# ==================== GUI ====================
+# ==================== GUI entry ====================
 
-class AccountTab(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
+
+# ===== Qt port section: qt_account (PySide6, 1:1 behavior) =====
+"""PySide6 port of AccountTab (scanner.py lines 4358-4636)
+and sudo password dialog (lines 4637-4739). 1:1 behavior, Qt widgets only.
+
+Backend symbols (reference as-is, provided by scanner.py):
+    _load_mc_accounts, _save_mc_accounts, _account_key, get_active_mc_account,
+    import_prism_accounts, PRISM_ACCOUNTS_PATH, _normalize_mc_account,
+    upsert_mc_accounts, import_tokens_from_text, probe_accounts_async,
+    probe_account, open_whitelist_log_file
+"""
+
+import os
+import threading
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+from PySide6.QtCore import Qt, QTimer
+
+
+
+class AccountTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self._probe_results = {}   # account key -> (ok, message)
         self._row_keys = {}        # tree iid -> account key
+        self.status_text = "Ready."
         self._build_ui()
         self.refresh()
 
+    # -- helpers provided locally (contract assumes QtBaseMixin provides
+    # -- after()/set_status(); defined here so the file is standalone) --
+    def after(self, ms, func):
+        QTimer.singleShot(int(ms), func)
+
+    def set_status(self, msg):
+        self.status_text = msg
+        try:
+            self.status_label.setText(msg)
+        except Exception:
+            pass
+
     def _build_ui(self):
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=8, pady=8)
-        ttk.Button(bar, text="Import Prism Accounts", command=self.import_prism).pack(side="left", padx=4)
-        ttk.Button(bar, text="Import Tokens", command=self.import_tokens).pack(side="left", padx=4)
-        ttk.Button(bar, text="Add Manual Token", command=self.add_manual).pack(side="left", padx=4)
-        ttk.Button(bar, text="Set Active", command=self.set_active).pack(side="left", padx=4)
-        ttk.Button(bar, text="Test Selected", command=self.test_selected).pack(side="left", padx=4)
-        ttk.Button(bar, text="Probe All", command=self.probe_accounts).pack(side="left", padx=4)
-        ttk.Button(bar, text="Remove", command=self.remove_selected).pack(side="left", padx=4)
-        ttk.Button(bar, text="Remove Failed", command=self.remove_failed).pack(side="left", padx=4)
-        ttk.Button(bar, text="Open Whitelist Log", command=lambda: open_whitelist_log_file(self)).pack(side="left", padx=12)
+        layout = QVBoxLayout(self)
 
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        bar = QHBoxLayout()
+        layout.addLayout(bar)
+        btn_import_prism = QPushButton("Import Prism Accounts")
+        btn_import_prism.clicked.connect(self.import_prism)
+        bar.addWidget(btn_import_prism)
+        btn_import_tokens = QPushButton("Import Tokens")
+        btn_import_tokens.clicked.connect(self.import_tokens)
+        bar.addWidget(btn_import_tokens)
+        btn_add_manual = QPushButton("Add Manual Token")
+        btn_add_manual.clicked.connect(self.add_manual)
+        bar.addWidget(btn_add_manual)
+        btn_set_active = QPushButton("Set Active")
+        btn_set_active.clicked.connect(self.set_active)
+        bar.addWidget(btn_set_active)
+        btn_test = QPushButton("Test Selected")
+        btn_test.clicked.connect(self.test_selected)
+        bar.addWidget(btn_test)
+        btn_probe = QPushButton("Probe All")
+        btn_probe.clicked.connect(self.probe_accounts)
+        bar.addWidget(btn_probe)
+        btn_remove = QPushButton("Remove")
+        btn_remove.clicked.connect(self.remove_selected)
+        bar.addWidget(btn_remove)
+        btn_remove_failed = QPushButton("Remove Failed")
+        btn_remove_failed.clicked.connect(self.remove_failed)
+        bar.addWidget(btn_remove_failed)
+        btn_log = QPushButton("Open Whitelist Log")
+        btn_log.clicked.connect(lambda: open_whitelist_log_file(self))
+        bar.addWidget(btn_log)
+        bar.addStretch(1)
+
         cols = ("active", "name", "uuid", "source", "token_source", "status")
-        self.tree = ttk.Treeview(frame, columns=cols, show="headings", height=16, selectmode="extended")
-        widths = {"active": 70, "name": 170, "uuid": 250, "source": 130, "token_source": 150, "status": 210}
-        for col in cols:
-            self.tree.heading(col, text=col.upper())
-            self.tree.column(col, width=widths.get(col, 120), anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        sb.pack(side="left", fill="y")
-        self.tree.config(yscrollcommand=sb.set)
+        self.tree = ResultTable()
+        self.tree.set_columns(cols)
+        layout.addWidget(self.tree, 1)
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0,8))
+        self.status_label = QLabel(self.status_text)
+        layout.addWidget(self.status_label)
 
     def refresh(self):
         data = _load_mc_accounts()
@@ -4419,9 +4411,9 @@ class AccountTab(ttk.Frame):
             self._row_keys[iid] = key
         active = get_active_mc_account()
         if active:
-            self.status.set(f"{count} account(s). Active: {active.get('name')}.")
+            self.set_status(f"{count} account(s). Active: {active.get('name')}.")
         else:
-            self.status.set(f"{count} account(s). No active account.")
+            self.set_status(f"{count} account(s). No active account.")
 
     def _status_for(self, account, key):
         for k in (key, account.get("uuid"), account.get("name")):
@@ -4451,9 +4443,10 @@ class AccountTab(ttk.Frame):
     def import_prism(self):
         path = PRISM_ACCOUNTS_PATH
         if not os.path.exists(path):
-            picked = filedialog.askopenfilename(
-                title="Pick Prism accounts.json",
-                filetypes=[("accounts.json", "accounts.json"), ("JSON", "*.json"), ("All files", "*.*")]
+            picked = q_ask_open(
+                self,
+                "Pick Prism accounts.json",
+                "accounts.json (accounts.json);;JSON (*.json);;All files (*.*)"
             )
             if not picked:
                 return
@@ -4461,77 +4454,79 @@ class AccountTab(ttk.Frame):
         try:
             imported = import_prism_accounts(path)
             self.refresh()
-            self.status.set(f"Imported {len(imported)} Prism account(s).")
+            self.set_status(f"Imported {len(imported)} Prism account(s).")
         except Exception as exc:
-            messagebox.showerror("Accounts", f"Import failed: {exc}")
-            self.status.set(f"Import failed: {exc}")
+            q_error(self, "Accounts", f"Import failed: {exc}")
+            self.set_status(f"Import failed: {exc}")
 
     def add_manual(self):
-        name = simpledialog.askstring("Minecraft Account", "Minecraft username:", parent=self)
+        name = q_ask_string(self, "Minecraft Account", "Minecraft username:")
         if not name:
             return
-        profile_id = simpledialog.askstring("Minecraft Account", "Profile UUID (with or without dashes):", parent=self)
+        profile_id = q_ask_string(self, "Minecraft Account", "Profile UUID (with or without dashes):")
         if not profile_id:
             return
-        access_token = simpledialog.askstring("Minecraft Account", "Session/access token:", parent=self, show="*")
+        access_token = q_ask_string(self, "Minecraft Account", "Session/access token:", show="*")
         if not access_token:
             return
-        refresh_token = simpledialog.askstring("Minecraft Account", "Refresh token (optional):", parent=self, show="*") or ""
+        refresh_token = q_ask_string(self, "Minecraft Account", "Refresh token (optional):", show="*") or ""
         account = _normalize_mc_account(name, profile_id, access_token, refresh_token)
         account["source"] = "manual"
         account["token_source"] = "manual"
         if refresh_token:
-            account["msa_client_id"] = simpledialog.askstring(
+            account["msa_client_id"] = q_ask_string(
+                self,
                 "Minecraft Account",
-                "MSA client id (optional; Prism fills this automatically):",
-                parent=self
+                "MSA client id (optional; Prism fills this automatically):"
             ) or ""
         upsert_mc_accounts([account], active_uuid=account.get("uuid"))
         self.refresh()
 
     def import_tokens(self):
         """Import access/refresh tokens pasted as text (JWT eyJ... or M.C... Artifacts)."""
-        dialog = tk.Toplevel(self)
-        dialog.title("Import Tokens")
-        dialog.geometry("560x400")
-        dialog.transient(self)
-        ttk.Label(
-            dialog,
-            text=(
-                "Paste tokens, one per line.\n"
-                "  eyJ...            -> Minecraft access token\n"
-                "  name:M.C...       -> MSA refresh token (Artifacts)\n"
-                "  M.C...            -> MSA refresh token (no name)"
-            ),
-            anchor="w",
-            justify="left"
-        ).pack(fill="x", padx=10, pady=8)
-        text = tk.Text(dialog, height=14)
-        text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        row = ttk.Frame(dialog)
-        row.pack(fill="x", padx=10, pady=(0, 10))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Import Tokens")
+        dialog.resize(560, 400)
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            "Paste tokens, one per line.\n"
+            "  eyJ...            -> Minecraft access token\n"
+            "  name:M.C...       -> MSA refresh token (Artifacts)\n"
+            "  M.C...            -> MSA refresh token (no name)"
+        ))
+        text = QPlainTextEdit(dialog)
+        layout.addWidget(text, 1)
+        row = QHBoxLayout()
+        layout.addLayout(row)
 
         def do_import():
-            imported = import_tokens_from_text(text.get("1.0", "end"))
+            imported = import_tokens_from_text(text.toPlainText())
             if not imported:
-                messagebox.showinfo("Import Tokens", "No valid tokens found.", parent=dialog)
+                q_info(dialog, "Import Tokens", "No valid tokens found.")
                 return
             upsert_mc_accounts(imported)
-            dialog.destroy()
+            dialog.accept()
             self.refresh()
-            self.status.set(f"Imported {len(imported)} token(s). Probe them to fetch names/UUIDs.")
+            self.set_status(f"Imported {len(imported)} token(s). Probe them to fetch names/UUIDs.")
 
-        ttk.Button(row, text="Import", command=do_import).pack(side="left", padx=4)
-        ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side="left", padx=4)
+        btn_import = QPushButton("Import")
+        btn_import.clicked.connect(do_import)
+        row.addWidget(btn_import)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(dialog.reject)
+        row.addWidget(btn_cancel)
+        row.addStretch(1)
+        dialog.exec()
 
     def probe_accounts(self):
         """Test/enrich all stored accounts (refresh M.C... tokens, verify JWT tokens)."""
         data = _load_mc_accounts()
         pairs = [(a, _account_key(a)) for a in data.get("accounts", []) if a.get("access_token") or a.get("refresh_token")]
         if not pairs:
-            messagebox.showinfo("Accounts", "No accounts to probe.")
+            q_info(self, "Accounts", "No accounts to probe.")
             return
-        self.status.set(f"Probing {len(pairs)} account(s)...")
+        self.set_status(f"Probing {len(pairs)} account(s)...")
         idx = [0]
 
         def on_update(acc, ok, msg):
@@ -4541,7 +4536,7 @@ class AccountTab(ttk.Frame):
 
         def on_progress(done, total):
             if done >= total:
-                self.after(0, lambda: self.status.set(f"Probe complete: {total} account(s) tested."))
+                self.after(0, lambda: self.set_status(f"Probe complete: {total} account(s) tested."))
 
         probe_accounts_async([a for a, _ in pairs], on_update, progress_cb=on_progress)
 
@@ -4552,21 +4547,21 @@ class AccountTab(ttk.Frame):
         if acc.get("name") and acc["name"] != key:
             self._probe_results[acc["name"]] = (ok, msg)
         self.refresh()
-        self.status.set(f"Test {acc.get('name') or key}: {'OK' if ok else 'FAILED'} ({msg})")
+        self.set_status(f"Test {acc.get('name') or key}: {'OK' if ok else 'FAILED'} ({msg})")
 
     def test_selected(self):
         keys = self._selected_keys()
         if not keys:
-            messagebox.showinfo("Accounts", "Select one or more accounts first.")
+            q_info(self, "Accounts", "Select one or more accounts first.")
             return
         data = _load_mc_accounts()
         by_key = {_account_key(a): a for a in data.get("accounts", [])}
         accounts = [a for k in keys if k in by_key for a in [by_key[k]]]
         accounts = [a for a in accounts if a.get("access_token") or a.get("refresh_token")]
         if not accounts:
-            messagebox.showinfo("Accounts", "No selected account has a token to test.")
+            q_info(self, "Accounts", "No selected account has a token to test.")
             return
-        self.status.set(f"Testing {len(accounts)} account(s)...")
+        self.set_status(f"Testing {len(accounts)} account(s)...")
         def worker():
             for a in accounts:
                 acc, ok, msg = probe_account(a)
@@ -4577,12 +4572,12 @@ class AccountTab(ttk.Frame):
     def set_active(self):
         key = self._selected_key()
         if not key:
-            messagebox.showinfo("Accounts", "Select an account first.")
+            q_info(self, "Accounts", "Select an account first.")
             return
         data = _load_mc_accounts()
         account = next((a for a in data.get("accounts", []) if _account_key(a) == key), None)
         if not account or not account.get("uuid"):
-            messagebox.showinfo("Accounts", "This account has no UUID yet. Probe it first to fetch its UUID.")
+            q_info(self, "Accounts", "This account has no UUID yet. Probe it first to fetch its UUID.")
             return
         data["active_uuid"] = account["uuid"]
         _save_mc_accounts(data)
@@ -4591,7 +4586,7 @@ class AccountTab(ttk.Frame):
     def remove_selected(self):
         keys = self._selected_keys()
         if not keys:
-            messagebox.showinfo("Accounts", "Select one or more accounts first.")
+            q_info(self, "Accounts", "Select one or more accounts first.")
             return
         data = _load_mc_accounts()
         kept = [a for a in data.get("accounts", []) if _account_key(a) not in keys]
@@ -4606,7 +4601,7 @@ class AccountTab(ttk.Frame):
         for k in keys:
             self._probe_results.pop(k, None)
         self.refresh()
-        self.status.set(f"Removed {removed} account(s).")
+        self.set_status(f"Removed {removed} account(s).")
 
     def remove_failed(self):
         """Remove every account whose last probe FAILED (bad/expired token)."""
@@ -4620,7 +4615,7 @@ class AccountTab(ttk.Frame):
             else:
                 kept.append(a)
         if not removed:
-            messagebox.showinfo("Accounts", "No failed accounts to remove.")
+            q_info(self, "Accounts", "No failed accounts to remove.")
             return
         data["accounts"] = kept
         active = data.get("active_uuid")
@@ -4631,235 +4626,383 @@ class AccountTab(ttk.Frame):
         _save_mc_accounts(data)
         self._probe_results = {}
         self.refresh()
-        self.status.set(f"Removed {len(removed)} failed account(s).")
+        self.set_status(f"Removed {len(removed)} failed account(s).")
 
 
-class _SudoPasswordDialog:
-    """Hand-built sudo password prompt.
 
-    Plain simpledialog prompts fail silently on some macOS Tk builds
-    (grab/focus errors → instant cancel with no window ever shown), so this
-    builds the Toplevel step by step, forces it frontmost, and records the
-    exact failing step instead of swallowing it.
-    """
 
-    def __init__(self, parent):
-        self.password = None
-        self.error = None
+# ===== Qt port section: qt_network (PySide6, 1:1 behavior) =====
+"""PySide6 port of NetworkScanTab (scanner.py lines 4740-5317).
+
+1:1 logic port — only the widget framework changes (tkinter/ttk -> Qt).
+Method names, button labels, columns, and background-thread logic preserved.
+"""
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+class _TextVarAdapter:
+    """Compat shim exposing Tk-style .get()/.set() over a QLineEdit."""
+
+    def __init__(self, widget):
+        self._w = widget
+
+    def get(self):
         try:
-            top = tk.Toplevel(parent)
-        except Exception as exc:
-            self.error = f"open dialog window: {exc}"
-            return
-        self.top = top
-        self.entry = None
-        try:
-            top.title("masscan needs root")
-            try:
-                top.resizable(False, False)
-            except Exception:
-                pass
-            try:
-                top.attributes("-topmost", True)
-            except Exception:
-                pass
-            try:
-                top.lift()
-            except Exception:
-                pass
-            ttk.Label(
-                top,
-                text=("masscan needs raw-socket privileges.\n"
-                      "Enter your sudo password to rerun discovery with sudo\n"
-                      "(used once for this scan, never stored):"),
-                wraplength=360, justify="left").pack(padx=14, pady=(12, 8))
-            self.entry = ttk.Entry(top, show="*", width=32)
-            self.entry.pack(padx=14, pady=(0, 6))
-            btns = ttk.Frame(top)
-            btns.pack(padx=14, pady=(0, 14))
-            ttk.Button(btns, text="OK", command=self._on_ok).pack(side="left", padx=(0, 8))
-            ttk.Button(btns, text="Cancel", command=self._on_cancel).pack(side="left")
-            top.protocol("WM_DELETE_WINDOW", self._on_cancel)
-            top.bind("<Return>", lambda _e: self._on_ok())
-            top.bind("<Escape>", lambda _e: self._on_cancel())
-            try:
-                top.update_idletasks()
-                px, py = parent.winfo_rootx(), parent.winfo_rooty()
-                pw, ph = parent.winfo_width(), parent.winfo_height()
-                dw, dh = top.winfo_reqwidth(), top.winfo_reqheight()
-                if pw > 1 and ph > 1:
-                    top.geometry(f"+{max(0, px + (pw - dw) // 2)}+{max(0, py + (ph - dh) // 2)}")
-            except Exception:
-                pass
-            try:
-                self.entry.focus_force()
-            except Exception:
-                pass
-            try:
-                top.after(150, self._force_front)
-            except Exception:
-                pass
-            top.wait_window(top)
-        except Exception as exc:
-            if self.error is None:
-                self.error = f"{exc}"
-            try:
-                top.destroy()
-            except Exception:
-                pass
-
-    def _force_front(self):
-        try:
-            self.top.lift()
+            return self._w.text()
         except Exception:
-            pass
-        try:
-            if self.entry is not None:
-                self.entry.focus_force()
-        except Exception:
-            pass
+            return ""
 
-    def _on_ok(self):
+    def set(self, value):
         try:
-            self.password = self.entry.get() if self.entry is not None else None
-        except Exception as exc:
-            self.error = f"read password field: {exc}"
-            self.password = None
-        try:
-            self.top.destroy()
-        except Exception:
-            pass
-
-    def _on_cancel(self):
-        try:
-            self.top.destroy()
+            self._w.setText(str(value))
         except Exception:
             pass
 
 
-class NetworkScanTab(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
+class _ComboVarAdapter:
+    """Compat shim exposing Tk-style .get()/.set() over a QComboBox."""
+
+    def __init__(self, widget):
+        self._w = widget
+
+    def get(self):
+        try:
+            return self._w.currentText()
+        except Exception:
+            return ""
+
+    def set(self, value):
+        try:
+            self._w.setCurrentText(str(value))
+        except Exception:
+            pass
+
+
+class _BoolVarAdapter:
+    """Compat shim exposing Tk-style .get()/.set() over a QCheckBox."""
+
+    def __init__(self, widget):
+        self._w = widget
+
+    def get(self):
+        try:
+            return bool(self._w.isChecked())
+        except Exception:
+            return False
+
+    def set(self, value):
+        try:
+            self._w.setChecked(bool(value))
+        except Exception:
+            pass
+
+
+class _PlainTextVarAdapter:
+    """Compat shim exposing Tk-style .get() over a QPlainTextEdit."""
+
+    def __init__(self, widget):
+        self._w = widget
+
+    def get(self, *args, **kwargs):
+        try:
+            return self._w.toPlainText()
+        except Exception:
+            return ""
+
+
+class NetworkScanTab(QtBaseMixin, QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.scan_rows = []
         self._scan_row_map = {}
         self._current_scan_ip = None
         self._cracked_job_id = 0
         self._whitelist_job_id = 0
-        self.version_filter_var = tk.StringVar(value="All versions")
-        self.pre_version_var = tk.StringVar(value="")
         self._build_ui()
 
+    # ---- Tk-compat var properties (read through to the Qt widgets) ----
+    @property
+    def ports_var(self):
+        return _TextVarAdapter(self.ports_edit)
+
+    @property
+    def max_hosts_var(self):
+        return _TextVarAdapter(self.max_hosts_edit)
+
+    @property
+    def backend_var(self):
+        return _ComboVarAdapter(self.backend_combo)
+
+    @property
+    def masscan_rate_var(self):
+        return _TextVarAdapter(self.masscan_rate_edit)
+
+    @property
+    def masscan_wait_var(self):
+        return _TextVarAdapter(self.masscan_wait_edit)
+
+    @property
+    def masscan_status_var(self):
+        return _TextVarAdapter(self.masscan_status_label)
+
+    @property
+    def version_filter_var(self):
+        return _ComboVarAdapter(self.version_filter_combo)
+
+    @property
+    def pre_version_var(self):
+        return _TextVarAdapter(self.pre_version_edit)
+
+    @property
+    def only_players_var(self):
+        return _BoolVarAdapter(self.only_players_check)
+
+    @property
+    def check_cracked_var(self):
+        return _BoolVarAdapter(self.check_cracked_check)
+
+    @property
+    def check_whitelist_var(self):
+        return _BoolVarAdapter(self.check_whitelist_check)
+
     def _build_ui(self):
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        main = QVBoxLayout(self)
 
-        content = ttk.Frame(self)
-        content.grid(row=0, column=0, sticky="nsew")
-        top = ttk.Frame(content)
-        top.pack(fill="x", padx=8, pady=8)
-
-        ttk.Label(top, text="Targets (IPs/CIDRs/ranges/ASNs — comma, space or newline separated):").grid(row=0, column=0, sticky="w")
-        self.targets_text = tk.Text(top, height=4, width=70)
-        self.targets_text.grid(row=1, column=0, rowspan=4, sticky="ew", padx=(0, 8))
-        top.grid_columnconfigure(0, weight=1)
-
-        ttk.Label(top, text="Ports:").grid(row=0, column=1, sticky="w")
-        self.ports_var = tk.StringVar(value=NETWORK_SCAN_DEFAULT_PORTS)
-        ttk.Entry(top, textvariable=self.ports_var, width=18).grid(row=1, column=1, sticky="ew")
-
-        ttk.Label(top, text="Max hosts:").grid(row=2, column=1, sticky="w", pady=(6,0))
-        self.max_hosts_var = tk.StringVar(value=str(NETWORK_SCAN_MAX_HOSTS))
-        ttk.Entry(top, textvariable=self.max_hosts_var, width=18).grid(row=3, column=1, sticky="ew")
-
-        backend_bar = ttk.Frame(content)
-        backend_bar.pack(fill="x", padx=8, pady=(0,8))
-        ttk.Label(backend_bar, text="Backend:").pack(side="left")
-        self.backend_var = tk.StringVar(value="Auto (masscan → Python)")
-        self.backend_combo = ttk.Combobox(
-            backend_bar,
-            textvariable=self.backend_var,
-            values=["Auto (masscan → Python)", "masscan (fast SYN + handshake)", "Python (handshake only)"],
-            state="readonly",
-            width=30,
+        # Top: targets text + ports / max hosts grid.
+        top = QWidget(self)
+        top_grid = QGridLayout(top)
+        top_grid.setContentsMargins(8, 8, 8, 8)
+        lbl_targets = QLabel(
+            "Targets (IPs/CIDRs/ranges/ASNs \u2014 comma, space or newline separated):", top
         )
-        self.backend_combo.pack(side="left", padx=4)
-        ttk.Label(backend_bar, text="Rate (pps):").pack(side="left", padx=(12, 2))
-        self.masscan_rate_var = tk.StringVar(value=str(MASSCAN_DEFAULT_RATE))
-        ttk.Entry(backend_bar, textvariable=self.masscan_rate_var, width=8).pack(side="left")
-        ttk.Label(backend_bar, text="Wait (s):").pack(side="left", padx=(12, 2))
-        self.masscan_wait_var = tk.StringVar(value=str(MASSCAN_DEFAULT_WAIT))
-        ttk.Entry(backend_bar, textvariable=self.masscan_wait_var, width=5).pack(side="left")
-        self.masscan_status_var = tk.StringVar(value=masscan_status_line())
-        ttk.Label(backend_bar, textvariable=self.masscan_status_var).pack(side="left", padx=(12, 2))
-        ttk.Button(backend_bar, text="Recheck", command=lambda: self.masscan_status_var.set(masscan_status_line())).pack(side="left", padx=4)
+        top_grid.addWidget(lbl_targets, 0, 0)
+        self.targets_text = QPlainTextEdit(top)
+        self.targets_text.setMinimumHeight(4 * 18)
+        top_grid.addWidget(self.targets_text, 1, 0, 4, 1)
+        top_grid.setColumnStretch(0, 1)
 
-        controls = ttk.Frame(content)
-        controls.pack(fill="x", padx=8, pady=(0,8))
-        ttk.Button(controls, text="Scan Targets", command=self.scan_targets).pack(side="left", padx=4)
-        ttk.Button(controls, text="Copy IP(s)", command=self.copy_selected).pack(side="left", padx=4)
-        ttk.Button(controls, text="Add to Ignore", command=self.ignore_selected).pack(side="left", padx=4)
-        ttk.Button(controls, text="Add to Saved", command=self.save_selected).pack(side="left", padx=4)
-        ttk.Button(controls, text="Add to Monitor", command=self.add_selected_to_monitor).pack(side="left", padx=4)
-        ttk.Label(controls, text="Pre version:").pack(side="left", padx=(14,4))
-        ttk.Entry(controls, textvariable=self.pre_version_var, width=16).pack(side="left")
-        ttk.Label(controls, text="Found version:").pack(side="left", padx=(14,4))
-        self.version_filter_combo = ttk.Combobox(
-            controls,
-            textvariable=self.version_filter_var,
-            values=["All versions"],
-            width=18
+        top_grid.addWidget(QLabel("Ports:", top), 0, 1)
+        self.ports_edit = QLineEdit(top)
+        try:
+            self.ports_edit.setText(NETWORK_SCAN_DEFAULT_PORTS)
+        except Exception:
+            self.ports_edit.setText("")
+        self.ports_edit.setMaximumWidth(220)
+        top_grid.addWidget(self.ports_edit, 1, 1)
+
+        lbl_max = QLabel("Max hosts:", top)
+        top_grid.addWidget(lbl_max, 2, 1)
+        self.max_hosts_edit = QLineEdit(top)
+        try:
+            self.max_hosts_edit.setText(str(NETWORK_SCAN_MAX_HOSTS))
+        except Exception:
+            self.max_hosts_edit.setText("")
+        self.max_hosts_edit.setMaximumWidth(220)
+        top_grid.addWidget(self.max_hosts_edit, 3, 1)
+        main.addWidget(top)
+
+        # Backend bar.
+        backend_bar = QWidget(self)
+        bb = QHBoxLayout(backend_bar)
+        bb.setContentsMargins(8, 0, 8, 8)
+        bb.addWidget(QLabel("Backend:", backend_bar))
+        self.backend_combo = QComboBox(backend_bar)
+        self.backend_combo.setEditable(False)
+        self.backend_combo.addItems(
+            [
+                "Auto (masscan \u2192 Python)",
+                "masscan (fast SYN + handshake)",
+                "Python (handshake only)",
+            ]
         )
-        self.version_filter_combo.pack(side="left")
-        self.version_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_scan_tree())
-        self.version_filter_combo.bind("<KeyRelease>", lambda _e: self.refresh_scan_tree())
-        self.only_players_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Only players > 0", variable=self.only_players_var).pack(side="left", padx=(14, 4))
-        self.check_cracked_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Check cracked", variable=self.check_cracked_var).pack(side="left", padx=4)
-        self.check_whitelist_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Check whitelist", variable=self.check_whitelist_var).pack(side="left", padx=4)
+        self.backend_combo.setCurrentText("Auto (masscan \u2192 Python)")
+        self.backend_combo.setMinimumWidth(240)
+        bb.addWidget(self.backend_combo)
+        bb.addWidget(QLabel("Rate (pps):", backend_bar))
+        self.masscan_rate_edit = QLineEdit(backend_bar)
+        try:
+            self.masscan_rate_edit.setText(str(MASSCAN_DEFAULT_RATE))
+        except Exception:
+            self.masscan_rate_edit.setText("")
+        self.masscan_rate_edit.setMaximumWidth(80)
+        bb.addWidget(self.masscan_rate_edit)
+        bb.addWidget(QLabel("Wait (s):", backend_bar))
+        self.masscan_wait_edit = QLineEdit(backend_bar)
+        try:
+            self.masscan_wait_edit.setText(str(MASSCAN_DEFAULT_WAIT))
+        except Exception:
+            self.masscan_wait_edit.setText("")
+        self.masscan_wait_edit.setMaximumWidth(60)
+        bb.addWidget(self.masscan_wait_edit)
+        self.masscan_status_label = QLabel(backend_bar)
+        try:
+            self.masscan_status_label.setText(masscan_status_line())
+        except Exception:
+            self.masscan_status_label.setText("")
+        bb.addWidget(self.masscan_status_label)
+        recheck_btn = QPushButton("Recheck", backend_bar)
+        recheck_btn.clicked.connect(
+            lambda: self.masscan_status_label.setText(masscan_status_line())
+        )
+        bb.addWidget(recheck_btn)
+        bb.addStretch(1)
+        main.addWidget(backend_bar)
 
-        frame = ttk.Frame(content)
-        frame.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        # Controls row.
+        controls = QWidget(self)
+        cl = QHBoxLayout(controls)
+        cl.setContentsMargins(8, 0, 8, 8)
+        scan_btn = QPushButton("Scan Targets", controls)
+        scan_btn.clicked.connect(self.scan_targets)
+        cl.addWidget(scan_btn)
+        copy_btn = QPushButton("Copy IP(s)", controls)
+        copy_btn.clicked.connect(self.copy_selected)
+        cl.addWidget(copy_btn)
+        ignore_btn = QPushButton("Add to Ignore", controls)
+        ignore_btn.clicked.connect(self.ignore_selected)
+        cl.addWidget(ignore_btn)
+        save_btn = QPushButton("Add to Saved", controls)
+        save_btn.clicked.connect(self.save_selected)
+        cl.addWidget(save_btn)
+        mon_btn = QPushButton("Add to Monitor", controls)
+        mon_btn.clicked.connect(self.add_selected_to_monitor)
+        cl.addWidget(mon_btn)
+        cl.addWidget(QLabel("Pre version:", controls))
+        self.pre_version_edit = QLineEdit(controls)
+        self.pre_version_edit.setText("")
+        self.pre_version_edit.setMaximumWidth(140)
+        cl.addWidget(self.pre_version_edit)
+        cl.addWidget(QLabel("Found version:", controls))
+        self.version_filter_combo = QComboBox(controls)
+        self.version_filter_combo.setEditable(True)
+        self.version_filter_combo.addItems(["All versions"])
+        self.version_filter_combo.setCurrentText("All versions")
+        self.version_filter_combo.setMinimumWidth(150)
+        self.version_filter_combo.currentTextChanged.connect(
+            lambda _t: self.refresh_scan_tree()
+        )
+        self.version_filter_combo.lineEdit().textChanged.connect(
+            lambda _t: self.refresh_scan_tree()
+        )
+        cl.addWidget(self.version_filter_combo)
+        self.only_players_check = QCheckBox("Only players > 0", controls)
+        self.only_players_check.setChecked(False)
+        cl.addWidget(self.only_players_check)
+        self.check_cracked_check = QCheckBox("Check cracked", controls)
+        self.check_cracked_check.setChecked(False)
+        cl.addWidget(self.check_cracked_check)
+        self.check_whitelist_check = QCheckBox("Check whitelist", controls)
+        self.check_whitelist_check.setChecked(False)
+        cl.addWidget(self.check_whitelist_check)
+        cl.addStretch(1)
+        main.addWidget(controls)
+
+        # Results table.
         cols = ("ip", "motd", "players", "version", "cracked", "whitelist", "active_players")
-        self.scan_tree = ttk.Treeview(frame, columns=cols, show="headings", height=18, selectmode="extended")
-        for col in cols:
-            self.scan_tree.heading(col, text=col.upper())
-            if col in ("motd", "active_players"):
-                width = 260
-            elif col == "whitelist":
-                width = 220
-            elif col in ("players", "version"):
-                width = 120
-            elif col == "cracked":
-                width = 90
-            else:
-                width = 170
-            self.scan_tree.column(col, width=width, anchor="w")
-        self.scan_tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.scan_tree.yview)
-        sb.pack(side="left", fill="y")
-        self.scan_tree.config(yscrollcommand=sb.set)
-        bottom = ttk.Frame(content)
-        bottom.pack(fill="x", padx=8, pady=(0,8))
-        ttk.Button(bottom, text="Check Cracked", command=lambda: check_selected_cracked(self, self.scan_tree)).pack(side="left", padx=(0,8))
-        ttk.Button(bottom, text="Check Whitelist", command=lambda: check_selected_whitelist(self, self.scan_tree)).pack(side="left")
-        make_tree_sortable(self.scan_tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key,
-            "cracked": lambda v: (0 if str(v).lower() in ("false", "no", "0") else 1) if v is not None else -1,
-            "whitelist": lambda v: str(v).lower(),
-            "active_players": lambda v: str(v).lower()
-        })
-        _get_icon_manager().attach_to_tree(self.scan_tree)
+        self.scan_tree = ResultTable(self)
+        self.scan_tree.set_columns(cols)
+        try:
+            widths = {
+                "motd": 260,
+                "active_players": 260,
+                "whitelist": 220,
+                "players": 120,
+                "version": 120,
+                "cracked": 90,
+                "ip": 170,
+            }
+            for idx, col in enumerate(cols):
+                try:
+                    self.scan_tree.setColumnWidth(idx, widths.get(col, 170))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        main.addWidget(self.scan_tree, 1)
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").grid(row=1, column=0, sticky="ew", padx=8, pady=(0,8))
+        # Bottom row.
+        bottom = QWidget(self)
+        bl = QHBoxLayout(bottom)
+        bl.setContentsMargins(8, 0, 8, 8)
+        cracked_btn = QPushButton("Check Cracked", bottom)
+        cracked_btn.clicked.connect(
+            lambda: check_selected_cracked(self, self.scan_tree)
+        )
+        bl.addWidget(cracked_btn)
+        wl_btn = QPushButton("Check Whitelist", bottom)
+        wl_btn.clicked.connect(
+            lambda: check_selected_whitelist(self, self.scan_tree)
+        )
+        bl.addWidget(wl_btn)
+        bl.addStretch(1)
+        main.addWidget(bottom)
+
+        try:
+            self.scan_tree.set_sort_keys(
+                {
+                    "ip": _ip_key,
+                    "motd": lambda v: str(v).lower(),
+                    "players": _players_key,
+                    "version": _version_key,
+                    "cracked": lambda v: (0 if str(v).lower() in ("false", "no", "0") else 1)
+                    if v is not None
+                    else -1,
+                    "whitelist": lambda v: str(v).lower(),
+                    "active_players": lambda v: str(v).lower(),
+                }
+            )
+        except Exception:
+            try:
+
+                make_tree_sortable(
+                    self.scan_tree,
+                    {
+                        "ip": _ip_key,
+                        "motd": lambda v: str(v).lower(),
+                        "players": _players_key,
+                        "version": _version_key,
+                        "cracked": lambda v: (0 if str(v).lower() in ("false", "no", "0") else 1)
+                        if v is not None
+                        else -1,
+                        "whitelist": lambda v: str(v).lower(),
+                        "active_players": lambda v: str(v).lower(),
+                    },
+                )
+            except Exception:
+                pass
+        try:
+
+            _get_icon_manager().attach_to_tree(self.scan_tree)
+        except Exception:
+            pass
+
+        self.status_label = QLabel("Ready.", self)
+        main.addWidget(self.status_label)
 
     def set_status(self, msg):
-        self.status.set(msg)
+        try:
+            super().set_status(msg)  # type: ignore[misc]
+        except Exception:
+            pass
+        try:
+            self.status_label.setText(str(msg))
+        except Exception:
+            pass
 
     def _selected_rows(self):
         rows = []
@@ -4871,19 +5014,52 @@ class NetworkScanTab(ttk.Frame):
 
     def _update_version_filter_choices(self, rows):
         choices = collect_version_options([(r[0], r[1], r[2], r[3]) for r in rows])
-        current = self.version_filter_var.get() or "All versions"
-        self.version_filter_combo["values"] = choices
-        if current not in choices:
+        try:
+            current = self.version_filter_combo.currentText() or "All versions"
+        except Exception:
             current = "All versions"
-        self.version_filter_var.set(current)
+        try:
+            self.version_filter_combo.blockSignals(True)
+            self.version_filter_combo.clear()
+            self.version_filter_combo.addItems(list(choices))
+            if current not in choices:
+                current = "All versions"
+            self.version_filter_combo.setCurrentText(current)
+        finally:
+            try:
+                self.version_filter_combo.blockSignals(False)
+            except Exception:
+                pass
 
     def refresh_scan_tree(self):
-        self.scan_tree.delete(*self.scan_tree.get_children())
+        self.scan_tree.delete(*self.scan_tree.get_children(""))
         self._scan_row_map = {}
+        try:
+            filt = self.version_filter_combo.currentText()
+        except Exception:
+            filt = "All versions"
         for row in self.scan_rows:
-            if version_filter_allows(row[3], self.version_filter_var.get()):
+            if version_filter_allows(row[3], filt):
                 iid = self.scan_tree.insert("", "end", values=row)
                 self._scan_row_map[row[0]] = iid
+
+    def _set_tree_row_values(self, iid, vals):
+        # Prefer native item setter; fall back to per-column set().
+        try:
+            self.scan_tree.item(iid, values=vals)
+            return
+        except Exception:
+            pass
+        try:
+            cols = list(self.scan_tree.columns)
+        except Exception:
+            cols = []
+        for idx, val in enumerate(vals):
+            try:
+                col = cols[idx] if idx < len(cols) else idx
+                self.scan_tree.set(iid, col, val)
+            except Exception:
+                pass
 
     def _update_scan_row_cracked(self, ip, text):
         iid = self._scan_row_map.get(ip)
@@ -4892,7 +5068,7 @@ class NetworkScanTab(ttk.Frame):
         vals = list(self.scan_tree.item(iid, "values"))
         if len(vals) >= 5:
             vals[4] = text
-            self.scan_tree.item(iid, values=vals)
+            self._set_tree_row_values(iid, vals)
         for idx, row in enumerate(self.scan_rows):
             if row and row[0] == ip:
                 row = list(row)
@@ -4907,7 +5083,7 @@ class NetworkScanTab(ttk.Frame):
         vals = list(self.scan_tree.item(iid, "values"))
         if len(vals) >= 6:
             vals[5] = text
-            self.scan_tree.item(iid, values=vals)
+            self._set_tree_row_values(iid, vals)
         for idx, row in enumerate(self.scan_rows):
             if row and row[0] == ip:
                 row = list(row)
@@ -4926,14 +5102,14 @@ class NetworkScanTab(ttk.Frame):
 
         def ask():
             try:
-                top = self.winfo_toplevel()
                 try:
-                    top.lift()
+                    self.activateWindow()
+                    self.raise_()
                 except Exception:
                     pass
-                dlg = _SudoPasswordDialog(top)
-                holder["pw"] = dlg.password
-                holder["err"] = dlg.error
+                pw, err = SudoPasswordDialog.ask(self)
+                holder["pw"] = pw
+                holder["err"] = err
             except Exception as exc:
                 holder["pw"] = None
                 holder["err"] = f"prompt crashed: {exc}"
@@ -4950,34 +5126,34 @@ class NetworkScanTab(ttk.Frame):
 
     def scan_targets(self):
         try:
-            max_hosts_raw = int(self.max_hosts_var.get().strip() or NETWORK_SCAN_MAX_HOSTS)
+            max_hosts_raw = int(self.max_hosts_edit.text().strip() or NETWORK_SCAN_MAX_HOSTS)
         except ValueError:
             max_hosts_raw = NETWORK_SCAN_MAX_HOSTS
         backend = ""
         try:
-            backend = self.backend_var.get()
+            backend = self.backend_combo.currentText()
         except Exception:
-            backend = "Auto (masscan → Python)"
+            backend = "Auto (masscan \u2192 Python)"
         use_masscan = backend != "Python (handshake only)"
         if use_masscan:
             max_hosts = max(1, min(max_hosts_raw, MASSCAN_MAX_HOSTS))
         else:
             max_hosts = max(1, min(max_hosts_raw, 65536))
-        ports = parse_ports(self.ports_var.get())
+        ports = parse_ports(self.ports_edit.text())
         try:
-            masscan_rate = int((self.masscan_rate_var.get() or "").strip() or MASSCAN_DEFAULT_RATE)
+            masscan_rate = int((self.masscan_rate_edit.text() or "").strip() or MASSCAN_DEFAULT_RATE)
         except ValueError:
             masscan_rate = MASSCAN_DEFAULT_RATE
         try:
-            masscan_wait = int((self.masscan_wait_var.get() or "").strip() or MASSCAN_DEFAULT_WAIT)
+            masscan_wait = int((self.masscan_wait_edit.text() or "").strip() or MASSCAN_DEFAULT_WAIT)
         except ValueError:
             masscan_wait = MASSCAN_DEFAULT_WAIT
-        targets_raw = self.targets_text.get("1.0", "end")
-        # Snapshot Tk vars here (main thread); work() runs in the background.
-        only_players = self.only_players_var.get()
-        pre_version = self.pre_version_var.get().strip()
-        check_cracked_flag = self.check_cracked_var.get()
-        check_whitelist_flag = self.check_whitelist_var.get()
+        targets_raw = self.targets_text.toPlainText()
+        # Snapshot widget state here (main thread); work() runs in the background.
+        only_players = self.only_players_check.isChecked()
+        pre_version = self.pre_version_edit.text().strip()
+        check_cracked_flag = self.check_cracked_check.isChecked()
+        check_whitelist_flag = self.check_whitelist_check.isChecked()
         self.set_status("Expanding targets...")
 
         def work():
@@ -4989,7 +5165,7 @@ class NetworkScanTab(ttk.Frame):
                 # the table the moment their handshake completes.
                 self.scan_rows = []
                 self._scan_row_map = {}
-                self.after(0, lambda: self.scan_tree.delete(*self.scan_tree.get_children()))
+                self.after(0, lambda: self.scan_tree.delete(*self.scan_tree.get_children("")))
                 check_whitelist = check_whitelist_flag
                 check_cracked = check_cracked_flag
                 # Cracked servers need no account (offline probe, no Mojang auth);
@@ -5039,11 +5215,17 @@ class NetworkScanTab(ttk.Frame):
                         format_player_list(r.get("players_sample"))
                     )
                     self.scan_rows.append(row)
+
                     def add_row(row=row):
-                        if not version_filter_allows(row[3], self.version_filter_var.get()):
+                        try:
+                            filt = self.version_filter_combo.currentText()
+                        except Exception:
+                            filt = "All versions"
+                        if not version_filter_allows(row[3], filt):
                             return
                         iid = self.scan_tree.insert("", "end", values=row)
                         self._scan_row_map[row[0]] = iid
+
                     self.after(0, add_row)
                     if check_cracked and cracked_text == "Queued":
                         with lock:
@@ -5163,7 +5345,7 @@ class NetworkScanTab(ttk.Frame):
                                     self.after(0, lambda: self.set_status("masscan: retrying with sudo..."))
                                 else:
                                     self.after(0, lambda: self.set_status(
-                                        "sudo password required — waiting for the popup..."))
+                                        "sudo password required \u2014 waiting for the popup..."))
                                     sudo_pw, sudo_err = self._prompt_sudo_password()
                                 if passwordless or sudo_pw:
                                     try:
@@ -5228,7 +5410,7 @@ class NetworkScanTab(ttk.Frame):
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
                 if _masscan_note_is_partial(masscan_note):
                     self.after(0, lambda n=len(results): self.set_status(
-                        "Scan complete — masscan stopped early (timeout), results partial. "
+                        "Scan complete \u2014 masscan stopped early (timeout), results partial. "
                         f"Minecraft servers: {n}."))
                 else:
                     self.after(0, lambda n=len(results): self.set_status(f"Scan complete. Minecraft servers: {n}."))
@@ -5236,6 +5418,7 @@ class NetworkScanTab(ttk.Frame):
                 if check_cracked:
                     with lock:
                         entries = list(cracked_entries)
+
                     def handle_cracked_update(entry, result, message, was_cached):
                         if cracked_job != self._cracked_job_id:
                             return
@@ -5247,6 +5430,7 @@ class NetworkScanTab(ttk.Frame):
                             label = "Unknown"
                         self.after(0, lambda ip=entry.get("ip"), label=label:
                                    self._update_scan_row_cracked(ip, label))
+
                     def handle_cracked_progress(done, total):
                         if cracked_job != self._cracked_job_id:
                             return
@@ -5257,12 +5441,14 @@ class NetworkScanTab(ttk.Frame):
                 if check_whitelist:
                     with lock:
                         entries = list(whitelist_entries)
+
                     def handle_update(entry, result, message):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         label = whitelist_result_label(result, message)
                         self.after(0, lambda ip=entry.get("ip"), label=label:
                                    self._update_scan_row_whitelist(ip, label))
+
                     def handle_progress(done, total):
                         if whitelist_job != self._whitelist_job_id:
                             return
@@ -5278,16 +5464,18 @@ class NetworkScanTab(ttk.Frame):
     def copy_selected(self):
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("Network Scan", "Select one or more rows.")
+            q_info(self, "Network Scan", "Select one or more rows.")
             return
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(row[0] for row in rows))
+        try:
+            QApplication.clipboard().setText("\n".join(row[0] for row in rows))
+        except Exception:
+            pass
         self.set_status(f"Copied {len(rows)} IP(s).")
 
     def ignore_selected(self):
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("Network Scan", "Select one or more rows.")
+            q_info(self, "Network Scan", "Select one or more rows.")
             return
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
         if reason is None:
@@ -5299,9 +5487,9 @@ class NetworkScanTab(ttk.Frame):
     def save_selected(self):
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("Network Scan", "Select one or more rows.")
+            q_info(self, "Network Scan", "Select one or more rows.")
             return
-        reason = simpledialog.askstring("Reason", "Why save? (optional)")
+        reason = q_ask_string(self, "Reason", "Why save? (optional)")
         for row in rows:
             add_to_saved(row[0], reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt.")
@@ -5309,20 +5497,37 @@ class NetworkScanTab(ttk.Frame):
     def add_selected_to_monitor(self):
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("Network Scan", "Select one or more rows.")
+            q_info(self, "Network Scan", "Select one or more rows.")
             return
         added, invalid, duplicates = add_ips_to_monitor_list([row[0] for row in rows])
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
-class ProxyTab(ttk.Frame):
+
+# ===== Qt port section: qt_proxy (PySide6, 1:1 behavior) =====
+"""PySide6 port of ProxyTab (scanner.py:5317-5696). 1:1 logic, widget calls translated."""
+
+import os
+import threading
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QLineEdit, QPlainTextEdit, QCheckBox, QRadioButton, QComboBox,
+    QGroupBox, QButtonGroup,
+)
+
+
+
+
+class ProxyTab(QWidget, QtBaseMixin):
     """
     Proxy manager + bulk whitelist scanner.
       - Paste proxies as 'ip:port' (HTTP) or 'ip:port:user:pass' (SOCKS5).
       - Test each proxy, save the list to proxies.json.
       - Run a bulk whitelist scan that cycles accounts AND proxies in parallel.
     """
-    def __init__(self, master):
-        super().__init__(master)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.proxies = []
         self.servers = []          # list[str] ip:port
         self._bulk_job = 0
@@ -5331,101 +5536,133 @@ class ProxyTab(ttk.Frame):
         self.refresh()
 
     def _build_ui(self):
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=8, pady=8)
-        ttk.Button(bar, text="Import from Text", command=self.import_text).pack(side="left", padx=4)
-        ttk.Button(bar, text="Import from File", command=self.import_file).pack(side="left", padx=4)
-        ttk.Button(bar, text="Save", command=self.save).pack(side="left", padx=4)
-        ttk.Button(bar, text="Test All", command=self.test_all).pack(side="left", padx=4)
-        ttk.Button(bar, text="Test Selected", command=self.test_selected).pack(side="left", padx=4)
-        ttk.Button(bar, text="Clear", command=self.clear).pack(side="left", padx=4)
-        ttk.Button(bar, text="Reload", command=self.refresh).pack(side="left", padx=4)
-        self.use_proxy_mode_var = tk.BooleanVar(value=whitelist_proxy_mode())
-        ttk.Checkbutton(
-            bar,
-            text="Use proxies for all whitelist scans",
-            variable=self.use_proxy_mode_var,
-            command=self._toggle_proxy_mode
-        ).pack(side="left", padx=(16, 4))
+        root = QVBoxLayout(self)
 
-        paste_frame = ttk.Frame(self)
-        paste_frame.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Label(paste_frame, text="Paste proxies, one per line. 'ip:port' = HTTP, 'ip:port:user:pass' = SOCKS5:").pack(anchor="w")
-        self.paste_text = tk.Text(paste_frame, height=5)
-        self.paste_text.pack(fill="x")
+        bar = QHBoxLayout()
+        root.addLayout(bar)
+        btn_import_text = QPushButton("Import from Text")
+        btn_import_text.clicked.connect(self.import_text)
+        bar.addWidget(btn_import_text)
+        btn_import_file = QPushButton("Import from File")
+        btn_import_file.clicked.connect(self.import_file)
+        bar.addWidget(btn_import_file)
+        btn_save = QPushButton("Save")
+        btn_save.clicked.connect(self.save)
+        bar.addWidget(btn_save)
+        btn_test_all = QPushButton("Test All")
+        btn_test_all.clicked.connect(self.test_all)
+        bar.addWidget(btn_test_all)
+        btn_test_selected = QPushButton("Test Selected")
+        btn_test_selected.clicked.connect(self.test_selected)
+        bar.addWidget(btn_test_selected)
+        btn_clear = QPushButton("Clear")
+        btn_clear.clicked.connect(self.clear)
+        bar.addWidget(btn_clear)
+        btn_reload = QPushButton("Reload")
+        btn_reload.clicked.connect(self.refresh)
+        bar.addWidget(btn_reload)
+        self.use_proxy_mode = QCheckBox("Use proxies for all whitelist scans")
+        self.use_proxy_mode.setChecked(whitelist_proxy_mode())
+        self.use_proxy_mode.toggled.connect(self._toggle_proxy_mode)
+        bar.addWidget(self.use_proxy_mode)
+        bar.addStretch(1)
 
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        paste_label = QLabel("Paste proxies, one per line. 'ip:port' = HTTP, 'ip:port:user:pass' = SOCKS5:")
+        root.addWidget(paste_label)
+        self.paste_text = QPlainTextEdit()
+        self.paste_text.setFixedHeight(90)
+        root.addWidget(self.paste_text)
+
         cols = ("host", "port", "type", "user", "status", "message")
-        self.tree = ttk.Treeview(frame, columns=cols, show="headings", height=9, selectmode="extended")
-        widths = {"host": 150, "port": 60, "type": 65, "user": 110, "status": 80, "message": 240}
-        for col in cols:
-            self.tree.heading(col, text=col.upper())
-            self.tree.column(col, width=widths.get(col, 120), anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        sb.pack(side="left", fill="y")
-        self.tree.config(yscrollcommand=sb.set)
+        self.tree = ResultTable(self, columns=list(cols), headers=[c.upper() for c in cols])
+        root.addWidget(self.tree)
 
         # --- Bulk whitelist scan ---
-        scan = ttk.LabelFrame(self, text="Bulk Whitelist Scan  (cycles accounts + proxies in parallel)")
-        scan.pack(fill="x", padx=8, pady=(0, 8))
+        scan = QGroupBox("Bulk Whitelist Scan  (cycles accounts + proxies in parallel)")
+        root.addWidget(scan)
+        scan_layout = QVBoxLayout(scan)
 
-        row = ttk.Frame(scan)
-        row.pack(fill="x", padx=8, pady=6)
-        ttk.Label(row, text="Server list (.txt):").pack(side="left")
-        self.server_file_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.server_file_var, width=44).pack(side="left", padx=4)
-        ttk.Button(row, text="Browse", command=self._pick_server_file).pack(side="left", padx=4)
-        ttk.Button(row, text="Load", command=self._load_server_list).pack(side="left", padx=4)
-        ttk.Label(row, text="  Loaded: ").pack(side="left")
-        self.server_count_var = tk.StringVar(value="0")
-        ttk.Label(row, textvariable=self.server_count_var, width=6).pack(side="left")
+        row = QHBoxLayout()
+        scan_layout.addLayout(row)
+        row.addWidget(QLabel("Server list (.txt):"))
+        self.server_file = QLineEdit()
+        self.server_file.setMinimumWidth(300)
+        row.addWidget(self.server_file)
+        btn_browse = QPushButton("Browse")
+        btn_browse.clicked.connect(self._pick_server_file)
+        row.addWidget(btn_browse)
+        btn_load = QPushButton("Load")
+        btn_load.clicked.connect(self._load_server_list)
+        row.addWidget(btn_load)
+        row.addWidget(QLabel("  Loaded: "))
+        self.server_count_label = QLabel("0")
+        self.server_count_label.setMinimumWidth(40)
+        row.addWidget(self.server_count_label)
+        row.addStretch(1)
 
-        row2 = ttk.Frame(scan)
-        row2.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(row2, text="Workers (0 = auto / per working proxy):").pack(side="left")
-        self.workers_var = tk.StringVar(value="0")
-        ttk.Entry(row2, textvariable=self.workers_var, width=6).pack(side="left", padx=4)
-        self.use_all_accounts_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="Use all accounts", variable=self.use_all_accounts_var).pack(side="left", padx=4)
-        ttk.Button(row2, text="Start Scan", command=self.start_bulk_scan).pack(side="left", padx=8)
-        ttk.Button(row2, text="Stop", command=self.stop_bulk_scan).pack(side="left", padx=4)
-        ttk.Button(row2, text="Export Results", command=self.export_bulk_results).pack(side="left", padx=4)
+        row2 = QHBoxLayout()
+        scan_layout.addLayout(row2)
+        row2.addWidget(QLabel("Workers (0 = auto / per working proxy):"))
+        self.workers_edit = QLineEdit("0")
+        self.workers_edit.setMaximumWidth(60)
+        row2.addWidget(self.workers_edit)
+        self.use_all_accounts = QCheckBox("Use all accounts")
+        self.use_all_accounts.setChecked(True)
+        row2.addWidget(self.use_all_accounts)
+        btn_start = QPushButton("Start Scan")
+        btn_start.clicked.connect(self.start_bulk_scan)
+        row2.addWidget(btn_start)
+        btn_stop = QPushButton("Stop")
+        btn_stop.clicked.connect(self.stop_bulk_scan)
+        row2.addWidget(btn_stop)
+        btn_export = QPushButton("Export Results")
+        btn_export.clicked.connect(self.export_bulk_results)
+        row2.addWidget(btn_export)
+        row2.addStretch(1)
 
-        row3 = ttk.Frame(scan)
-        row3.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(row3, text="Initial scan via:").pack(side="left")
-        self.initial_proxy_var = tk.StringVar(value="realip")
-        ttk.Radiobutton(row3, text="My IP", variable=self.initial_proxy_var, value="realip").pack(side="left", padx=(8, 2))
-        ttk.Radiobutton(row3, text="Single proxy", variable=self.initial_proxy_var, value="single").pack(side="left", padx=2)
-        self.initial_proxy_choice_var = tk.StringVar()
-        self.initial_proxy_combo = ttk.Combobox(row3, textvariable=self.initial_proxy_choice_var, state="readonly", width=26)
-        self.initial_proxy_combo.pack(side="left", padx=4)
-        ttk.Label(row3, text="  (status scan finds live servers, then whitelist scan uses the proxies)").pack(side="left")
+        row3 = QHBoxLayout()
+        scan_layout.addLayout(row3)
+        row3.addWidget(QLabel("Initial scan via:"))
+        self.realip_radio = QRadioButton("My IP")
+        self.realip_radio.setChecked(True)
+        row3.addWidget(self.realip_radio)
+        self.single_radio = QRadioButton("Single proxy")
+        row3.addWidget(self.single_radio)
+        self._initial_proxy_group = QButtonGroup(self)
+        self._initial_proxy_group.addButton(self.realip_radio)
+        self._initial_proxy_group.addButton(self.single_radio)
+        self.initial_proxy_choice = QComboBox()
+        self.initial_proxy_choice.setEditable(False)
+        self.initial_proxy_choice.setMinimumWidth(200)
+        row3.addWidget(self.initial_proxy_choice)
+        row3.addWidget(QLabel("  (status scan finds live servers, then whitelist scan uses the proxies)"))
+        row3.addStretch(1)
 
-        self.scan_status_var = tk.StringVar(value="Load a server list to begin.")
-        ttk.Label(scan, textvariable=self.scan_status_var, anchor="w").pack(fill="x", padx=8, pady=(0, 6))
+        self.scan_status_label = QLabel("Load a server list to begin.")
+        self.scan_status_label.setWordWrap(True)
+        scan_layout.addWidget(self.scan_status_label)
 
-        res_frame = ttk.Frame(scan)
-        res_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.res_tree = ttk.Treeview(
-            res_frame,
-            columns=("ip", "result", "detail", "account", "proxy"),
-            show="headings",
-            height=8,
-            selectmode="extended"
-        )
-        for c, w in (("ip", 180), ("result", 140), ("detail", 300), ("account", 130), ("proxy", 150)):
-            self.res_tree.heading(c, text=c.upper())
-            self.res_tree.column(c, width=w, anchor="w")
-        self.res_tree.pack(side="left", fill="both", expand=True)
-        rsb = ttk.Scrollbar(res_frame, orient="vertical", command=self.res_tree.yview)
-        rsb.pack(side="left", fill="y")
-        self.res_tree.config(yscrollcommand=rsb.set)
+        res_cols = ("ip", "result", "detail", "account", "proxy")
+        self.res_tree = ResultTable(self, columns=list(res_cols), headers=[c.upper() for c in res_cols])
+        scan_layout.addWidget(self.res_tree)
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0, 8))
+        self.status_label = QLabel("Ready.")
+        root.addWidget(self.status_label)
+
+    # QtBaseMixin is assumed to provide after() / set_status(); keep local
+    # status label in sync for the translated StringVar calls.
+    def set_status(self, msg):
+        try:
+            super().set_status(msg)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            self.status_label.setText(msg)
+        except Exception:
+            pass
+
+    def _initial_mode(self):
+        return "single" if self.single_radio.isChecked() else "realip"
 
     # ---- proxy list management ----
     def refresh(self):
@@ -5446,22 +5683,28 @@ class ProxyTab(ttk.Frame):
                 )
             )
         working = sum(1 for p in self.proxies if p.get("working") is True)
-        self.status.set(f"{len(self.proxies)} proxy(ies) loaded. {working} working.")
+        self.set_status(f"{len(self.proxies)} proxy(ies) loaded. {working} working.")
         choices = [proxy_display(p) for p in self.proxies]
-        self.initial_proxy_combo["values"] = choices
-        if choices and not self.initial_proxy_choice_var.get():
-            self.initial_proxy_choice_var.set(choices[0])
+        current = self.initial_proxy_choice.currentText()
+        self.initial_proxy_choice.clear()
+        if choices:
+            self.initial_proxy_choice.addItems(choices)
+            if not current:
+                self.initial_proxy_choice.setCurrentIndex(0)
+            else:
+                idx = self.initial_proxy_choice.findText(current)
+                self.initial_proxy_choice.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _toggle_proxy_mode(self):
-        enabled = self.use_proxy_mode_var.get()
+        enabled = self.use_proxy_mode.isChecked()
         set_whitelist_proxy_mode(enabled)
         if enabled:
-            self.status.set("Proxy mode ON: all whitelist scans cycle proxies + all accounts.")
+            self.set_status("Proxy mode ON: all whitelist scans cycle proxies + all accounts.")
         else:
-            self.status.set("Proxy mode OFF: whitelist scans use a single account directly.")
+            self.set_status("Proxy mode OFF: whitelist scans use a single account directly.")
 
     def import_text(self):
-        text = self.paste_text.get("1.0", "end")
+        text = self.paste_text.toPlainText()
         added = 0
         seen = {(p.get("host"), p.get("port")) for p in self.proxies}
         for line in text.splitlines():
@@ -5472,21 +5715,18 @@ class ProxyTab(ttk.Frame):
                 added += 1
         save_proxies(self.proxies)
         self.refresh()
-        self.status.set(f"Imported {added} new proxy(ies).")
-        self.paste_text.delete("1.0", "end")
+        self.set_status(f"Imported {added} new proxy(ies).")
+        self.paste_text.clear()
 
     def import_file(self):
-        path = filedialog.askopenfilename(
-            title="Import proxies",
-            filetypes=[("Text", "*.txt"), ("All files", "*.*")]
-        )
+        path = q_ask_open("Import proxies", "Text (*.txt);;All files (*.*)")
         if not path:
             return
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
         except Exception as exc:
-            messagebox.showerror("Proxies", f"Could not read file: {exc}")
+            q_error("Proxies", f"Could not read file: {exc}")
             return
         added = 0
         seen = {(p.get("host"), p.get("port")) for p in self.proxies}
@@ -5498,11 +5738,11 @@ class ProxyTab(ttk.Frame):
                 added += 1
         save_proxies(self.proxies)
         self.refresh()
-        self.status.set(f"Imported {added} new proxy(ies) from file.")
+        self.set_status(f"Imported {added} new proxy(ies) from file.")
 
     def save(self):
         save_proxies(self.proxies)
-        self.status.set("Proxies saved to proxies.json.")
+        self.set_status("Proxies saved to proxies.json.")
 
     def clear(self):
         self.proxies = []
@@ -5511,72 +5751,71 @@ class ProxyTab(ttk.Frame):
 
     def test_all(self):
         if not self.proxies:
-            messagebox.showinfo("Proxies", "No proxies loaded.")
+            q_info("Proxies", "No proxies loaded.")
             return
-        self.status.set(f"Testing {len(self.proxies)} proxy(ies) in parallel...")
+        self.set_status(f"Testing {len(self.proxies)} proxy(ies) in parallel...")
+
         def on_progress(done, total):
             if done >= total:
                 self.after(150, self.refresh)
-                self.after(0, lambda d=done: self.status.set(f"Proxy test complete: {d}/{total} tested."))
+                self.after(0, lambda d=done: self.set_status(f"Proxy test complete: {d}/{total} tested."))
             else:
-                self.after(0, lambda d=done, t=total: self.status.set(f"Testing proxies: {d}/{t}"))
+                self.after(0, lambda d=done, t=total: self.set_status(f"Testing proxies: {d}/{t}"))
         probe_proxies_async(self.proxies, lambda p, ok, msg: None, progress_cb=on_progress)
 
     def test_selected(self):
         selected = set(self.tree.selection())
         if not selected:
-            messagebox.showinfo("Proxies", "Select one or more proxies first.")
+            q_info("Proxies", "Select one or more proxies first.")
             return
         targets = [p for iid, p in zip(self.tree.get_children(), self.proxies) if iid in selected]
         if not targets:
             return
-        self.status.set(f"Testing {len(targets)} selected proxy(ies) in parallel...")
+        self.set_status(f"Testing {len(targets)} selected proxy(ies) in parallel...")
+
         def on_progress(done, total):
             if done >= total:
                 self.after(150, self.refresh)
-                self.after(0, lambda d=done: self.status.set(f"Selected proxy test complete: {d}/{total} tested."))
+                self.after(0, lambda d=done: self.set_status(f"Selected proxy test complete: {d}/{total} tested."))
             else:
-                self.after(0, lambda d=done, t=total: self.status.set(f"Testing selected proxies: {d}/{t}"))
+                self.after(0, lambda d=done, t=total: self.set_status(f"Testing selected proxies: {d}/{t}"))
         probe_proxies_async(targets, lambda p, ok, msg: None, progress_cb=on_progress)
 
     # ---- bulk whitelist scan ----
     def _pick_server_file(self):
-        path = filedialog.askopenfilename(
-            title="Pick server list",
-            filetypes=[("Text", "*.txt"), ("All files", "*.*")]
-        )
+        path = q_ask_open("Pick server list", "Text (*.txt);;All files (*.*)")
         if path:
-            self.server_file_var.set(path)
+            self.server_file.setText(path)
             self._load_server_list()
 
     def _load_server_list(self):
-        path = self.server_file_var.get().strip()
+        path = self.server_file.text().strip()
         if not path:
-            messagebox.showinfo("Bulk Whitelist", "Pick a server list file first.")
+            q_info("Bulk Whitelist", "Pick a server list file first.")
             return
         try:
             self.servers = read_servers(path)
         except Exception as exc:
-            messagebox.showerror("Bulk Whitelist", f"Could not read server list: {exc}")
+            q_error("Bulk Whitelist", f"Could not read server list: {exc}")
             return
-        self.server_count_var.set(str(len(self.servers)))
-        self.scan_status_var.set(f"Loaded {len(self.servers)} server(s) from {os.path.basename(path)}.")
+        self.server_count_label.setText(str(len(self.servers)))
+        self.scan_status_label.setText(f"Loaded {len(self.servers)} server(s) from {os.path.basename(path)}.")
 
     def start_bulk_scan(self):
         if not self.servers:
-            messagebox.showinfo("Bulk Whitelist", "Load a server list first.")
+            q_info("Bulk Whitelist", "Load a server list first.")
             return
         # Use all proxies that aren't known-dead. No need to pre-test the list —
         # dead proxies simply fail per-probe and are skipped as workers.
         proxies = [p for p in self.proxies if p.get("working") is not False]
         if not proxies:
-            messagebox.showinfo("Bulk Whitelist", "No proxies loaded. Add some in the Proxies tab first.")
+            q_info("Bulk Whitelist", "No proxies loaded. Add some in the Proxies tab first.")
             return
-        accounts = get_all_mc_accounts() if self.use_all_accounts_var.get() else [a for a in [get_active_mc_account()] if a]
+        accounts = get_all_mc_accounts() if self.use_all_accounts.isChecked() else [a for a in [get_active_mc_account()] if a]
         # Cracked servers need no account (offline probe, no Mojang auth), so
         # allow the scan with zero accounts; online-mode hits will report it.
         try:
-            workers = int(self.workers_var.get().strip() or "0")
+            workers = int(self.workers_edit.text().strip() or "0")
         except ValueError:
             workers = 0
         job = self._bulk_job + 1
@@ -5587,14 +5826,14 @@ class ProxyTab(ttk.Frame):
         # Stage 1: initial status scan (real IP, or optionally a single proxy) to
         # find live hosts before spending proxies + account auth on whitelist probes.
         initial_proxy = None
-        if self.initial_proxy_var.get() == "single":
-            chosen = self.initial_proxy_choice_var.get()
+        if self._initial_mode() == "single":
+            chosen = self.initial_proxy_choice.currentText()
             for p in proxies:
                 if proxy_display(p) == chosen:
                     initial_proxy = p
                     break
         via = proxy_display(initial_proxy) if initial_proxy else "your IP"
-        self.scan_status_var.set(f"Initial scan of {len(self.servers)} server(s) via {via}...")
+        self.scan_status_label.setText(f"Initial scan of {len(self.servers)} server(s) via {via}...")
 
         live = []
         live_lock = threading.Lock()
@@ -5612,7 +5851,7 @@ class ProxyTab(ttk.Frame):
             if done >= total:
                 self.after(0, lambda: self._start_whitelist_stage(job, list(live)))
             else:
-                self.after(0, lambda d=done, t=total, n=len(live): self.scan_status_var.set(
+                self.after(0, lambda d=done, t=total, n=len(live): self.scan_status_label.setText(
                     f"Initial scan: {d}/{t} (found {n} live)..."))
 
         run_status_scan_async(self.servers, on_init_result, progress_cb=on_init_progress, proxy=initial_proxy)
@@ -5622,13 +5861,13 @@ class ProxyTab(ttk.Frame):
         if job != self._bulk_job:
             return
         if not entries:
-            self.scan_status_var.set("Initial scan found no live servers.")
+            self.scan_status_label.setText("Initial scan found no live servers.")
             return
         bulk = self._current_bulk
         accounts = bulk["accounts"]
         proxies = bulk["proxies"]
         workers = bulk["workers"]
-        self.scan_status_var.set(
+        self.scan_status_label.setText(
             f"Initial scan done: {len(entries)} live. Whitelist scan through {len(proxies)} proxy(ies)..."
         )
 
@@ -5648,18 +5887,18 @@ class ProxyTab(ttk.Frame):
             if job != self._bulk_job:
                 return
             if done >= total:
-                self.after(0, lambda: self.scan_status_var.set(
+                self.after(0, lambda: self.scan_status_label.setText(
                     f"Bulk whitelist scan complete: {done}/{total} live servers. Export below."
                 ))
             else:
-                self.after(0, lambda d=done, t=total: self.scan_status_var.set(
+                self.after(0, lambda d=done, t=total: self.scan_status_label.setText(
                     f"Whitelist scan: {d}/{t} of {len(entries)} live servers"))
 
         run_bulk_whitelist_verifier_async(entries, accounts, proxies, on_update, progress_cb=on_progress, workers=workers)
 
     def stop_bulk_scan(self):
         self._bulk_job += 1
-        self.scan_status_var.set("Bulk scan stopped.")
+        self.scan_status_label.setText("Bulk scan stopped.")
 
     def export_bulk_results(self):
         whitelisted = []
@@ -5674,13 +5913,9 @@ class ProxyTab(ttk.Frame):
             elif label.lower().startswith("not whitelisted"):
                 not_whitelisted.append(ip)
         if not (whitelisted or not_whitelisted):
-            messagebox.showinfo("Bulk Whitelist", "No results to export yet.")
+            q_info("Bulk Whitelist", "No results to export yet.")
             return
-        path = filedialog.asksaveasfilename(
-            title="Export bulk whitelist results",
-            defaultextension=".txt",
-            initialfile="bulk_whitelist_results.txt"
-        )
+        path = q_ask_save("Export bulk whitelist results", "bulk_whitelist_results.txt", "Text (*.txt)")
         if not path:
             return
         try:
@@ -5689,70 +5924,77 @@ class ProxyTab(ttk.Frame):
                 f.write("\n".join(whitelisted) + "\n")
                 f.write("# Not Whitelisted\n")
                 f.write("\n".join(not_whitelisted) + "\n")
-            self.scan_status_var.set(f"Exported {len(whitelisted)} whitelisted / {len(not_whitelisted)} not-whitelisted.")
+            self.scan_status_label.setText(f"Exported {len(whitelisted)} whitelisted / {len(not_whitelisted)} not-whitelisted.")
         except Exception as exc:
-            messagebox.showerror("Bulk Whitelist", f"Export failed: {exc}")
+            q_error("Bulk Whitelist", f"Export failed: {exc}")
 
-class FullAppGUI(tk.Tk):  #
-    def __init__(self):
-        super().__init__()
-        self.title("Minecraft Server Scanner — GUI")
-        self.geometry("1100x760")  # slightly taller
-        self.create_widgets()
 
-    def create_widgets(self):
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
+# ===== Qt port section: qt_servers (PySide6, 1:1 behavior) =====
+"""PySide6 port of ServersTab (scanner.py lines 5737-6349).
 
-        # Tabs
-        self.shodan_tab = ShodanTab(nb)
-        self.network_tab = NetworkScanTab(nb)
-        self.json_tab = JSONTab(nb)
-        self.servers_tab = ServersTab(nb)
-        self.import_tab = ExportTab(nb)
-        self.saved_tab = SavedTab(nb)    
-        self.ignore_tab = IgnoreTab(nb)  
-        self.iplog_tab = IpLogTab(nb)    
-        self.user_log_tab = UserLogTab(nb)
-        self.account_tab = AccountTab(nb)
-        self.monitor_tab = ServerMonitorTab(nb)
-        self.proxy_tab = ProxyTab(nb)
+1:1 translation of the Tk ``ServersTab`` (``FullAppGUI`` is ported by a
+separate worker and is intentionally NOT included here).
 
-        nb.add(self.shodan_tab, text="Shodan")
-        nb.add(self.network_tab, text="Network Scan")
-        nb.add(self.json_tab, text="JSON Search")
-        nb.add(self.servers_tab, text="Servers")
-        nb.add(self.import_tab, text="Export To MC")
-        nb.add(self.saved_tab, text="Saved List")  
-        nb.add(self.ignore_tab, text="Ignore List")
-        nb.add(self.iplog_tab, text="IP Log")     
-        nb.add(self.user_log_tab, text="User Log")
-        nb.add(self.account_tab, text="Accounts")
-        nb.add(self.proxy_tab, text="Proxies")
-        nb.add(self.monitor_tab, text="Server Monitor")
+Widget translation map (logic unchanged):
+  - ttk.Frame + grid/pack          -> QWidget + QVBoxLayout/QHBoxLayout
+  - tk.PanedWindow (vertical)      -> QSplitter(Qt.Vertical)
+  - ttk.Treeview                   -> ResultTable (qt_helpers, Treeview-API
+                                     compatible: insert/delete/get_children/
+                                     selection/item/selection_set/
+                                     selection_remove/focus/see)
+  - BooleanVar/Checkbutton         -> QCheckBox (+ isChecked/setChecked)
+  - StringVar/Combobox (editable)  -> QComboBox editable (+ currentText)
+  - StringVar/Entry                -> QLineEdit (+ text)
+  - StringVar/Label                -> QLabel (+ setText)
+  - messagebox/simpledialog/filedialog -> q_info/q_error/q_ask_string/
+                                     q_ask_open/q_ask_save (qt_helpers)
+  - ask_reason_with_whitelist      -> qt_helpers.ask_reason_with_whitelist
+  - clipboard_clear/append         -> QApplication.clipboard().setText
+  - self.after                     -> QtBaseMixin.after (unchanged call sites)
 
-        USER_LOG_MANAGER.attach_tab(self.user_log_tab)
+Backend references (scan helpers, ignore/saved lists, monitor list,
+whitelist/cracked verifiers, formatting/parsing utils) are imported
+as-is from ``scanner``.
+"""
 
-# ---- Servers Tab ----
-class ServersTab(ttk.Frame):  #
-    def __init__(self, master):
-        super().__init__(master)
+import os
+import threading
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+
+
+class ServersTab(QWidget, QtBaseMixin):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.current_source = None
         self.servers = []  # list[str] of IP:PORT
         self.source_rows = []  # list[tuple(ip,motd,players,version)]
         self._in_ignore = False  # re-entrancy guard
-        self.version_filter_var = tk.StringVar(value="All versions")
-        self.check_whitelist_var = tk.BooleanVar(value=False)
         self._build_ui()
-        self._current_scan_ip = None 
+        self._current_scan_ip = None
         self._scan_row_map = {}
         self._cracked_job_id = 0
         self._whitelist_job_id = 0
 
-    def add_ignore(self):  #
+    def add_ignore(self):
         sel = self._selected_ips_any()
         if not sel:
-            messagebox.showinfo("Info","Select one or more.")
+            q_info(self, "Info", "Select one or more.")
             return
         # use the new dialog that offers a "White List" shortcut button
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
@@ -5767,174 +6009,165 @@ class ServersTab(ttk.Frame):  #
         self.refresh_list()
         self.set_status(f"Added {len(sel)} to ignore.txt")
 
-    def add_saved(self):  #
+    def add_saved(self):
         sel = self._selected_ips_any()
         if not sel:
-            messagebox.showinfo("Info","Select one or more.")
+            q_info(self, "Info", "Select one or more.")
             return
-        reason = simpledialog.askstring("Reason","Why save? (optional)")
+        reason = q_ask_string(self, "Reason", "Why save? (optional)")
         for ip in sel:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(sel)} to saved.txt")
 
     def _build_ui(self):
-        # Root grid: content (row 0) + footer (row 1) pinned
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        root = QVBoxLayout(self)
 
-        content = ttk.Frame(self)
-        content.grid(row=0, column=0, sticky="nsew")
-
-        # Paned: top (source) / middle (results)
-        pane = tk.PanedWindow(content, orient="vertical", sashwidth=8)
-        pane.pack(fill="both", expand=True, padx=8, pady=(8,0))
-        pane_top = ttk.Frame(pane)
-        pane_mid = ttk.Frame(pane)
-        pane.add(pane_top, minsize=160)
-        pane.add(pane_mid, minsize=220)
+        # Splitter: top (source) / middle (results) — replaces PanedWindow
+        splitter = QSplitter(Qt.Vertical, self)
+        root.addWidget(splitter, 1)
 
         # --- Source area (TOP) ---
-        top = ttk.Frame(pane_top)
-        top.pack(fill="x", padx=8, pady=8)
+        pane_top = QWidget(splitter)
+        top_layout = QVBoxLayout(pane_top)
+        top_layout.setContentsMargins(8, 8, 8, 8)
 
-        self.src_label = ttk.Label(top, text="Source: (none)")
-        self.src_label.pack(side="left")
+        self.src_label = QLabel("Source: (none)", pane_top)
+        top_layout.addWidget(self.src_label)
 
-        middle = ttk.Frame(pane_top)
-        middle.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        middle = QWidget(pane_top)
+        middle_layout = QHBoxLayout(middle)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addWidget(middle, 1)
 
-        # Source Tree (no icons here)
-        cols = ("ip", "motd", "players", "version", "cracked")
-        self.source_tree = ttk.Treeview(middle, columns=cols, show="headings", height=12, selectmode="extended")
-        for c in cols:
-            self.source_tree.heading(c, text=c.upper())
-            if c == "motd":
-                width = 240
-            elif c == "players":
-                width = 120
-            elif c == "version":
-                width = 120
-            elif c == "cracked":
-                width = 90
-            else:
-                width = 170
-            self.source_tree.column(c, width=width, anchor="w")
-        self.source_tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(middle, orient="vertical", command=self.source_tree.yview)
-        sb.pack(side="left", fill="y")
-        self.source_tree.config(yscrollcommand=sb.set)
-        make_tree_sortable(self.source_tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key,
-            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1
-        })
+        # Source Table
+        source_cols = ["ip", "motd", "players", "version", "cracked"]
+        self.source_tree = ResultTable(middle, columns=source_cols)
+        self.source_tree.setHorizontalHeaderLabels([c.upper() for c in source_cols])
+        _source_widths = {"motd": 240, "players": 120, "version": 120,
+                          "cracked": 90}
+        for i, c in enumerate(source_cols):
+            self.source_tree.setColumnWidth(i, _source_widths.get(c, 170))
+        self.source_tree.setSortingEnabled(True)
+        middle_layout.addWidget(self.source_tree, 1)
 
-        right = ttk.Frame(middle)
-        right.pack(side="right", fill="y", padx=8)
-        ttk.Button(right, text="Import .txt", command=self.load_txt).pack(fill="x", pady=(0,6))
-        ttk.Button(right, text="Copy IP", command=self.copy_ip).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Ignore", command=self.add_ignore).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Saved", command=self.add_saved).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Monitor", command=self.add_search_selected_to_monitor).pack(fill="x", pady=2)
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Button(right, text="Scan Selected", command=self.scan_selected).pack(fill="x", pady=2)
-        ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
-        self.only_players_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(right, text="Only players > 0", variable=self.only_players_var).pack(anchor="w", pady=(8,0))
-        self.only_cracked_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="Only cracked servers", variable=self.only_cracked_var).pack(anchor="w")
-        ttk.Checkbutton(right, text="Check whitelist", variable=self.check_whitelist_var).pack(anchor="w")
-        ttk.Label(right, text="Version filter:").pack(anchor="w", pady=(8, 2))
-        self.version_filter_combo = ttk.Combobox(
-            right,
-            textvariable=self.version_filter_var,
-            values=["All versions"],
-            width=18
-        )
-        self.version_filter_combo.pack(fill="x", pady=(0, 2))
-        self.version_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_list())
-        self.version_filter_combo.bind("<KeyRelease>", lambda _e: self.refresh_list())
+        # Right-side button column
+        right = QWidget(middle)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 0, 0, 0)
+        middle_layout.addWidget(right, 0)
+
+        def _right_btn(label, slot):
+            btn = QPushButton(label, right)
+            btn.clicked.connect(slot)
+            right_layout.addWidget(btn)
+            return btn
+
+        _right_btn("Import .txt", self.load_txt)
+        _right_btn("Copy IP", self.copy_ip)
+        _right_btn("Add to Ignore", self.add_ignore)
+        _right_btn("Add to Saved", self.add_saved)
+        _right_btn("Add to Monitor", self.add_search_selected_to_monitor)
+        sep = QFrame(right)
+        sep.setFrameShape(QFrame.HLine)
+        right_layout.addWidget(sep)
+        _right_btn("Scan Selected", self.scan_selected)
+        _right_btn("Scan All", self.scan_all)
+
+        self.only_players = QCheckBox("Only players > 0", right)
+        self.only_players.setChecked(True)
+        right_layout.addWidget(self.only_players)
+        self.only_cracked = QCheckBox("Only cracked servers", right)
+        self.only_cracked.setChecked(False)
+        right_layout.addWidget(self.only_cracked)
+        self.check_whitelist = QCheckBox("Check whitelist", right)
+        self.check_whitelist.setChecked(False)
+        right_layout.addWidget(self.check_whitelist)
+
+        right_layout.addWidget(QLabel("Version filter:", right))
+        self.version_filter = QComboBox(right)
+        self.version_filter.setEditable(True)
+        self.version_filter.addItems(["All versions"])
+        self.version_filter.setCurrentText("All versions")
+        right_layout.addWidget(self.version_filter)
+        self.version_filter.currentTextChanged.connect(lambda _t: self.refresh_list())
+        if self.version_filter.lineEdit() is not None:
+            self.version_filter.lineEdit().textEdited.connect(lambda _t: self.refresh_list())
+        right_layout.addStretch(1)
+
+        splitter.addWidget(pane_top)
 
         # --- Results area (MIDDLE) ---
-        bottom = ttk.Frame(pane_mid)
-        bottom.pack(fill="both", expand=True, padx=8, pady=8)
-        ttk.Label(bottom, text="Results (select to copy/save/ignore):").pack(anchor="w")
+        pane_mid = QWidget(splitter)
+        mid_layout = QVBoxLayout(pane_mid)
+        mid_layout.setContentsMargins(8, 8, 8, 8)
+        mid_layout.addWidget(QLabel("Results (select to copy/save/ignore):", pane_mid))
 
-        res_frame = ttk.Frame(bottom)
-        res_frame.pack(fill="both", expand=True)
+        results_cols = ["ip", "motd", "players", "version", "cracked",
+                        "whitelist", "active_players"]
+        self.results_tree = ResultTable(pane_mid, columns=results_cols)
+        self.results_tree.setHorizontalHeaderLabels([c.upper() for c in results_cols])
+        _results_widths = {"motd": 240, "active_players": 240, "players": 130,
+                           "version": 130, "whitelist": 220, "cracked": 90}
+        for i, c in enumerate(results_cols):
+            self.results_tree.setColumnWidth(i, _results_widths.get(c, 170))
+        self.results_tree.setSortingEnabled(True)
+        mid_layout.addWidget(self.results_tree, 1)
+        try:
+            _get_icon_manager().attach_to_tree(self.results_tree)
+        except Exception:
+            pass
 
-        cols2 = ("ip", "motd", "players", "version", "cracked", "whitelist", "active_players")
-        # show icons ONLY in results tree
-        self.results_tree = ttk.Treeview(res_frame, columns=cols2, show="headings", height=10, selectmode="extended")
-        for c in cols2:
-            self.results_tree.heading(c, text=c.upper())
-            if c in ("motd", "active_players"):
-                width = 240
-            elif c == "players":
-                width = 130
-            elif c == "version":
-                width = 130
-            elif c == "whitelist":
-                width = 220
-            elif c == "cracked":
-                width = 90
-            else:
-                width = 170
-            self.results_tree.column(c, width=width, anchor="w")
-        self.results_tree.pack(side="left", fill="both", expand=True)
-        res_sb = ttk.Scrollbar(res_frame, orient="vertical", command=self.results_tree.yview)
-        res_sb.pack(side="left", fill="y")
-        self.results_tree.config(yscrollcommand=res_sb.set)
-        make_tree_sortable(self.results_tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key,
-            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1,
-            "whitelist": lambda v: str(v).lower(),
-            "active_players": lambda v: str(v).lower()
-        })
+
+        splitter.addWidget(pane_mid)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
 
         # ------- Footer (pinned) -------
-        footer = ttk.Frame(self)
-        footer.grid(row=1, column=0, sticky="ew", padx=8, pady=(6,8))
-        footer.grid_columnconfigure(1, weight=1)
+        footer = QWidget(self)
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(8, 6, 8, 8)
+        root.addWidget(footer)
 
-        res_btns = ttk.Frame(footer)
-        res_btns.grid(row=0, column=0, sticky="w")
-        ttk.Button(res_btns, text="Copy IP(s)", command=self.copy_scan_selected).pack(side="left", padx=4)
-        ttk.Button(res_btns, text="Add to Ignore", command=self.ignore_scan_selected).pack(side="left", padx=4)
-        ttk.Button(res_btns, text="Add to Saved", command=self.save_scan_selected).pack(side="left", padx=4)
-        ttk.Button(res_btns, text="Add to Monitor", command=self.add_scan_selected_to_monitor).pack(side="left", padx=4)
-        ttk.Button(res_btns, text="Export Scan…", command=self.export_scan_results).pack(side="left", padx=4)
-        ttk.Button(res_btns, text="Check Whitelist", command=lambda: check_selected_whitelist(self, self.results_tree)).pack(side="left", padx=4)
-        self.player_search_var = tk.StringVar()
-        search_entry = ttk.Entry(res_btns, textvariable=self.player_search_var, width=18)
-        search_entry.pack(side="left", padx=(12,4))
-        search_entry.bind("<Return>", lambda _e: self.search_players())
-        ttk.Button(res_btns, text="Find Player", command=self.search_players).pack(side="left", padx=4)
+        def _foot_btn(label, slot):
+            btn = QPushButton(label, footer)
+            btn.clicked.connect(slot)
+            footer_layout.addWidget(btn)
+            return btn
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(footer, textvariable=self.status, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12,0))
+        _foot_btn("Copy IP(s)", self.copy_scan_selected)
+        _foot_btn("Add to Ignore", self.ignore_scan_selected)
+        _foot_btn("Add to Saved", self.save_scan_selected)
+        _foot_btn("Add to Monitor", self.add_scan_selected_to_monitor)
+        _foot_btn("Export Scan…", self.export_scan_results)
+        _foot_btn("Check Whitelist",
+                 lambda: check_selected_whitelist(self, self.results_tree))
+        self.player_search = QLineEdit(footer)
+        self.player_search.setMaximumWidth(180)
+        self.player_search.returnPressed.connect(self.search_players)
+        footer_layout.addWidget(self.player_search)
+        _foot_btn("Find Player", self.search_players)
 
-        # ---------- ICONS attach (Servers: results only) ----------
-        _get_icon_manager().attach_to_tree(self.results_tree)
+        self.status_label = QLabel("Ready.", footer)
+        footer_layout.addWidget(self.status_label, 1)
 
     def set_status(self, msg):
-        self.status.set(msg)
+        self.status_label.setText(msg)
 
     def _update_version_filter_choices(self, rows):
         choices = collect_version_options(rows)
-        current = self.version_filter_var.get() or "All versions"
-        self.version_filter_combo["values"] = choices
-        if current not in choices:
-            current = "All versions"
-        self.version_filter_var.set(current)
+        current = self.version_filter.currentText() or "All versions"
+        self.version_filter.blockSignals(True)
+        try:
+            self.version_filter.clear()
+            self.version_filter.addItems(choices)
+            if current not in choices:
+                current = "All versions"
+            self.version_filter.setCurrentText(current)
+        finally:
+            self.version_filter.blockSignals(False)
 
     def refresh_list(self, items=None):
-        #populate source_tree using parsed rows when available
+        # populate source_tree using parsed rows when available
         for iid in self.source_tree.get_children():
             self.source_tree.delete(iid)
         if items is not None:
@@ -5944,12 +6177,13 @@ class ServersTab(ttk.Frame):  #
         else:
             rows = [(ip, "", "", "") for ip in self.servers]
         if items is None and rows and len(rows[0]) >= 4:
-            rows = [row for row in rows if version_filter_allows(row[3], self.version_filter_var.get())]
+            rows = [row for row in rows
+                    if version_filter_allows(row[3], self.version_filter.currentText())]
         for row in rows:
             self.source_tree.insert("", "end", values=row)
 
     def load_txt(self):
-        path = filedialog.askopenfilename(title="Open .txt", filetypes=[("Text files","*.txt"),("All files","*.*")])
+        path = q_ask_open(self, "Open .txt", "Text files (*.txt);;All files (*.*)")
         if not path:
             return
         try:
@@ -5981,10 +6215,11 @@ class ServersTab(ttk.Frame):  #
                     rows.append((ip, motd, players, version))
             # update state
             self.current_source = path
-            self.source_rows = rows  #
+            self.source_rows = rows
             self.servers = [ip for (ip, _, _, _) in rows]  # keep scan list intact
             self._update_version_filter_choices(rows)
-            self.src_label.config(text=f"Source: {os.path.basename(path)} ({len(rows)} entries)")
+            self.src_label.setText(
+                f"Source: {os.path.basename(path)} ({len(rows)} entries)")
             self.refresh_list()
             # Build status message with helpful stats
             parts = [f"Loaded {len(rows)} entries."]
@@ -5996,7 +6231,7 @@ class ServersTab(ttk.Frame):  #
                 parts.append(f"{skipped_ignored} ignored (in ignore.txt) skipped.")
             self.set_status(" ".join(parts))
         except Exception as e:
-            messagebox.showerror("Load error", str(e))
+            q_error(self, "Load error", str(e))
 
     def _selected_ips_from_tree(self, tree):
         sel = []
@@ -6021,10 +6256,9 @@ class ServersTab(ttk.Frame):  #
     def copy_ip(self):
         sel = self._selected_ips_any()
         if not sel:
-            messagebox.showinfo("Info","Select one or more.")
+            q_info(self, "Info", "Select one or more.")
             return
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(sel))
+        QApplication.clipboard().setText("\n".join(sel))
         self.set_status(f"Copied {len(sel)} IP(s).")
 
     # Helpers to read selected rows from results tree
@@ -6036,20 +6270,19 @@ class ServersTab(ttk.Frame):  #
                 out.append(vals)
         return out
 
-    def copy_scan_selected(self):  
+    def copy_scan_selected(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select results first.")
+            q_info(self, "Info", "Select results first.")
             return
         ips = [row[0] for row in rows]
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(ips))
+        QApplication.clipboard().setText("\n".join(ips))
         self.set_status(f"Copied {len(ips)} IP(s) from results.")
 
-    def ignore_scan_selected(self):  
+    def ignore_scan_selected(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select results first.")
+            q_info(self, "Info", "Select results first.")
             return
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
         if reason is None:
@@ -6061,12 +6294,12 @@ class ServersTab(ttk.Frame):  #
             self.results_tree.delete(iid)
         self.set_status(f"Added {len(rows)} to ignore.txt from results.")
 
-    def save_scan_selected(self):  
+    def save_scan_selected(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select results first.")
+            q_info(self, "Info", "Select results first.")
             return
-        reason = simpledialog.askstring("Reason","Why save? (optional)")
+        reason = q_ask_string(self, "Reason", "Why save? (optional)")
         for ip, *_ in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt from results.")
@@ -6074,20 +6307,20 @@ class ServersTab(ttk.Frame):  #
     def add_scan_selected_to_monitor(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select results first.")
+            q_info(self, "Info", "Select results first.")
             return
         ips = [row[0] for row in rows]
         added, invalid, duplicates = add_ips_to_monitor_list(ips)
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
-    def export_scan_results(self):  
+    def export_scan_results(self):
         rows = []
         for iid in self.results_tree.get_children():
             vals = self.results_tree.item(iid, "values")
             if vals:
                 rows.append(vals)
         if not rows:
-            messagebox.showinfo("Info", "No scan results to export.")
+            q_info(self, "Info", "No scan results to export.")
             return
         # default name uses source file name (if any)
         if self.current_source:
@@ -6095,12 +6328,8 @@ class ServersTab(ttk.Frame):  #
             base = sanitize_query_for_filename(base_name + "_scan")
         else:
             base = "servers_scan"
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files","*.txt")],
-            title="Export Servers Scan Results",
-            initialfile=f"{base}.txt"
-        )
+        path = q_ask_save(self, "Export Servers Scan Results",
+                          "Text files (*.txt)", f"{base}.txt")
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
@@ -6119,7 +6348,7 @@ class ServersTab(ttk.Frame):  #
         self.set_status(f"Exported {len(rows)} scan rows to {os.path.basename(path)}")
 
     def search_players(self):
-        query_raw = self.player_search_var.get() or ""
+        query_raw = self.player_search.text() or ""
         query = query_raw.strip().lower()
         if not query:
             self.set_status("Enter a player name to search.")
@@ -6176,8 +6405,8 @@ class ServersTab(ttk.Frame):  #
         for iid in self.results_tree.get_children():
             self.results_tree.delete(iid)
         self.set_status("Preparing scan...")
-        only_cracked = self.only_cracked_var.get()
-        check_whitelist = self.check_whitelist_var.get()
+        only_cracked = self.only_cracked.isChecked()
+        check_whitelist = self.check_whitelist.isChecked()
         # Cracked servers need no account (offline probe, no Mojang auth).
         account = get_active_mc_account() if check_whitelist else None
         if only_cracked or check_whitelist:
@@ -6198,21 +6427,26 @@ class ServersTab(ttk.Frame):  #
         def work():
             try:
                 total = len(items)
+
                 def on_start(ip):
                     self._current_scan_ip = ip
-                    self.after(0, lambda ip=ip: self.set_status(f"Currently scanning: {ip} [0/{total}]"))
+                    self.after(0, lambda ip=ip: self.set_status(
+                        f"Currently scanning: {ip} [0/{total}]"))
 
                 def on_result(r, line):
                     if not r:
                         return
-                    discovered_rows.append((r['ip'], r['motd'], f"{r['players']}/{r['max_players']}", r['version']))
+                    discovered_rows.append((r['ip'], r['motd'],
+                                           f"{r['players']}/{r['max_players']}",
+                                           r['version']))
 
-                    if self.only_players_var.get() and r.get('players', 0) <= 0:
+                    if self.only_players.isChecked() and r.get('players', 0) <= 0:
                         return
 
                     if only_cracked and should_skip_cracked_probe(r):
                         return
-                    if not version_filter_allows(r.get("version", ""), self.version_filter_var.get()):
+                    if not version_filter_allows(r.get("version", ""),
+                                                self.version_filter.currentText()):
                         return
 
                     cracked_text = "Yes" if r.get('cracked') else "No"
@@ -6236,6 +6470,7 @@ class ServersTab(ttk.Frame):  #
                         whitelist_text,
                         active_players
                     )
+
                     def add_row(ip=r['ip'], v=vals):
                         iid = self.results_tree.insert("", "end", values=v)
                         if only_cracked or check_whitelist:
@@ -6266,15 +6501,19 @@ class ServersTab(ttk.Frame):  #
                     on_result=on_result,
                     on_progress=on_progress
                 )
-                self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
+                self.after(0, lambda: self.set_status(
+                    f"Scan complete. Responded: {len(results)}; "
+                    f"With 1+: {len(online_lines)}"))
 
                 if only_cracked:
                     with pending_lock:
                         verify_entries = list(pending_entries)
+
                     def handle_update(entry, result, message, was_cached):
                         if current_job != self._cracked_job_id:
                             return
                         ip = entry.get("ip")
+
                         def ui():
                             if was_cached or result is True:
                                 label = "Yes (cached)" if was_cached else "Yes"
@@ -6282,41 +6521,55 @@ class ServersTab(ttk.Frame):  #
                             else:
                                 self._remove_scan_row(ip)
                         self.after(0, ui)
+
                     def handle_progress(done, total):
                         if current_job != self._cracked_job_id:
                             return
                         if done < total:
                             self.after(0, lambda d=done, t=total:
-                                       self.set_status(f"Verifying cracked servers: {d}/{t}"))
+                                       self.set_status(
+                                           f"Verifying cracked servers: {d}/{t}"))
                         else:
                             def finish():
                                 remaining = len(self.results_tree.get_children())
-                                self.set_status(f"Cracked verification complete. Showing {remaining} server(s).")
+                                self.set_status(
+                                    "Cracked verification complete. "
+                                    f"Showing {remaining} server(s).")
                             self.after(0, finish)
-                    run_cracked_verifier_async(verify_entries, handle_update, progress_cb=handle_progress)
+                    run_cracked_verifier_async(verify_entries, handle_update,
+                                              progress_cb=handle_progress)
                 if check_whitelist:
                     with pending_lock:
                         verify_whitelist = list(whitelist_entries)
+
                     def handle_whitelist_update(entry, result, message):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         ip = entry.get("ip")
+
                         def ui():
                             label = whitelist_result_label(result, message)
                             self._update_scan_row_whitelist(ip, label)
                         self.after(0, ui)
+
                     def handle_whitelist_progress(done, total):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         if done < total:
                             self.after(0, lambda d=done, t=total:
-                                       self.set_status(f"Checking whitelist: {d}/{t}"))
+                                       self.set_status(
+                                           f"Checking whitelist: {d}/{t}"))
                         else:
                             self.after(0, lambda:
-                                       self.set_status(f"Whitelist check complete for {total} server(s)."))
-                    run_whitelist_verifier_async(verify_whitelist, account, handle_whitelist_update, progress_cb=handle_whitelist_progress)
+                                       self.set_status(
+                                           "Whitelist check complete for "
+                                           f"{total} server(s)."))
+                    run_whitelist_verifier_async(verify_whitelist, account,
+                                                handle_whitelist_update,
+                                                progress_cb=handle_whitelist_progress)
                 if discovered_rows:
-                    self.after(0, lambda rows=discovered_rows: self._update_version_filter_choices(rows))
+                    self.after(0, lambda rows=discovered_rows:
+                               self._update_version_filter_choices(rows))
             except Exception as e:
                 self.after(0, lambda: self.set_status(f"Scan failed: {e}"))
 
@@ -6325,34 +6578,66 @@ class ServersTab(ttk.Frame):  #
     def scan_selected(self):
         sel = self._selected_ips_any()
         if not sel:
-            messagebox.showinfo("Info","Select one or more.")
+            q_info(self, "Info", "Select one or more.")
             return
         self._scan(sel)
 
     def scan_all(self):
         if not self.servers:
-            messagebox.showinfo("Info","Load a .txt first.")
+            q_info(self, "Info", "Load a .txt first.")
             return
         self._scan(self.servers)
 
+    def add_search_selected_to_monitor(self):
+        sel = self._selected_ips_any()
+        if not sel:
+            q_info(self, "Info", "Select items first.")
+            return
+        added, invalid, duplicates = add_ips_to_monitor_list(sel)
+        self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
-def _servers_tab_add_search_selected_to_monitor(self):
-    sel = self._selected_ips_any()
-    if not sel:
-        messagebox.showinfo("Info","Select items first.")
-        return
-    added, invalid, duplicates = add_ips_to_monitor_list(sel)
-    self.set_status(format_monitor_feedback(added, invalid, duplicates))
+
+# ===== Qt port section: qt_monitor (PySide6, 1:1 behavior) =====
+"""PySide6 port of ServerMonitorTab (scanner.py lines 6350-6737)."""
+import threading
+import time
+
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QColor, QBrush
+from PySide6.QtWidgets import (
+    QApplication,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+SERVER_COLUMNS = ("ip", "status", "players", "version", "cracked", "motd", "last_ping")
+PLAYER_COLUMNS = ("uuid", "name", "last_seen")
+
+_SERVER_WIDTHS = {
+    "ip": 150,
+    "status": 100,
+    "players": 110,
+    "version": 120,
+    "cracked": 90,
+    "motd": 260,
+    "last_ping": 170,
+}
+_PLAYER_WIDTHS = {"uuid": 260, "name": 200, "last_seen": 170}
 
 
-ServersTab.add_search_selected_to_monitor = _servers_tab_add_search_selected_to_monitor
-
-class ServerMonitorTab(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
+class ServerMonitorTab(QtBaseMixin, QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.monitor_state = load_server_monitor_state()
-        self.interval_var = tk.IntVar(value=DEFAULT_MONITOR_INTERVAL)
-        self.status_var = tk.StringVar(value="Monitor idle.")
         self._monitor_thread = None
         self._monitoring = False
         self._monitor_interval = DEFAULT_MONITOR_INTERVAL
@@ -6364,114 +6649,136 @@ class ServerMonitorTab(ttk.Frame):
         self._refresh_players_tree()
 
     def _build_ui(self):
-        self.grid_rowconfigure(2, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        layout = QVBoxLayout(self)
 
-        input_frame = ttk.Frame(self)
-        input_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        input_frame.columnconfigure(0, weight=1)
-        ttk.Label(input_frame, text="Add servers (one IP:PORT per line):").grid(row=0, column=0, sticky="w")
-        self.server_input = tk.Text(input_frame, height=3, wrap="none")
-        self.server_input.grid(row=1, column=0, sticky="ew", padx=(0, 4))
-        input_scroll = ttk.Scrollbar(input_frame, orient="vertical", command=self.server_input.yview)
-        input_scroll.grid(row=1, column=1, sticky="ns")
-        self.server_input.configure(yscrollcommand=input_scroll.set)
-        btn_frame = ttk.Frame(input_frame)
-        btn_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Button(btn_frame, text="Add to Monitor", command=self.add_servers_from_input).pack(side="left")
-        ttk.Button(btn_frame, text="Clear Input", command=self.clear_input).pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="Remove Selected", command=self.remove_selected_servers).pack(side="left")
-        ttk.Button(btn_frame, text="Copy Selected", command=self.copy_monitored_ips).pack(side="left", padx=6)
+        # --- Input group ---
+        layout.addWidget(QLabel("Add servers (one IP:PORT per line):"))
+        self.server_input = QPlainTextEdit()
+        self.server_input.setMaximumBlockCount(0)
+        self.server_input.setFixedHeight(64)
+        layout.addWidget(self.server_input)
 
-        control_frame = ttk.Frame(self)
-        control_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
-        control_frame.columnconfigure(6, weight=1)
-        ttk.Label(control_frame, text="Ping interval (secs):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(control_frame, width=6, textvariable=self.interval_var).grid(row=0, column=1, sticky="w", padx=(4, 12))
-        self.start_btn = ttk.Button(control_frame, text="Start Monitoring", command=self.start_monitoring)
-        self.start_btn.grid(row=0, column=2, padx=4)
-        self.stop_btn = ttk.Button(control_frame, text="Stop", command=self.stop_monitoring, state="disabled")
-        self.stop_btn.grid(row=0, column=3, padx=4)
-        ttk.Button(control_frame, text="Export Player Log", command=self.export_players).grid(row=0, column=4, padx=4)
+        btn_row = QHBoxLayout()
+        self.add_btn = QPushButton("Add to Monitor")
+        self.add_btn.clicked.connect(self.add_servers_from_input)
+        btn_row.addWidget(self.add_btn)
+        self.clear_btn = QPushButton("Clear Input")
+        self.clear_btn.clicked.connect(self.clear_input)
+        btn_row.addWidget(self.clear_btn)
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self.remove_selected_servers)
+        btn_row.addWidget(self.remove_btn)
+        self.copy_btn = QPushButton("Copy Selected")
+        self.copy_btn.clicked.connect(self.copy_monitored_ips)
+        btn_row.addWidget(self.copy_btn)
+        self.copy_ips_btn = QPushButton("Copy IPs")
+        self.copy_ips_btn.clicked.connect(self.copy_monitored_ips)
+        btn_row.addWidget(self.copy_ips_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
 
-        main_pane = tk.PanedWindow(self, orient="vertical", sashwidth=8)
-        main_pane.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
-        main_pane.rowconfigure(0, weight=1)
-        main_pane.columnconfigure(0, weight=1)
+        # --- Control row ---
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel("Ping interval (secs):"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setMinimum(5)
+        self.interval_spin.setMaximum(86400)
+        self.interval_spin.setValue(DEFAULT_MONITOR_INTERVAL)
+        ctrl_row.addWidget(self.interval_spin)
+        self.start_btn = QPushButton("Start Monitoring")
+        self.start_btn.clicked.connect(self.start_monitoring)
+        ctrl_row.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self.stop_monitoring)
+        self.stop_btn.setEnabled(False)
+        ctrl_row.addWidget(self.stop_btn)
+        self.export_btn = QPushButton("Export Player Log")
+        self.export_btn.clicked.connect(self.export_players)
+        ctrl_row.addWidget(self.export_btn)
+        ctrl_row.addStretch(1)
+        layout.addLayout(ctrl_row)
 
-        server_frame = ttk.Frame(main_pane)
-        server_frame.rowconfigure(0, weight=1)
-        server_frame.columnconfigure(0, weight=1)
-        cols = ("ip", "status", "players", "version", "cracked", "motd", "last_ping")
-        self.server_tree = ttk.Treeview(server_frame, columns=cols, show="headings", height=10, selectmode="extended")
-        for col in cols:
-            self.server_tree.heading(col, text=col.replace("_", " ").title())
-            if col == "ip":
-                width = 150
-            elif col == "status":
-                width = 100
-            elif col == "players":
-                width = 110
-            elif col == "version":
-                width = 120
-            elif col == "cracked":
-                width = 90
-            elif col == "motd":
-                width = 260
-            else:
-                width = 170
-            self.server_tree.column(col, width=width, anchor="w")
-        self.server_tree.grid(row=0, column=0, sticky="nsew")
-        tree_scroll = ttk.Scrollbar(server_frame, orient="vertical", command=self.server_tree.yview)
-        tree_scroll.grid(row=0, column=1, sticky="ns")
-        self.server_tree.configure(yscrollcommand=tree_scroll.set)
-        self.server_tree.bind("<<TreeviewSelect>>", lambda e: self._on_server_selected())
-        self.server_tree.tag_configure("status_offline", background="#ffe6e6")
-        make_tree_sortable(self.server_tree, {
-            "ip": _ip_key,
-            "status": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key,
-            "cracked": lambda v: 0 if str(v).lower() in ("false","no","0") else 1,
-            "motd": lambda v: str(v).lower(),
-            "last_ping": lambda v: v or ""
-        })
-        main_pane.add(server_frame, minsize=260)
+        # --- Tables (vertical splitter) ---
+        splitter = QSplitter(Qt.Vertical)
 
-        players_frame = ttk.Frame(main_pane)
-        players_frame.rowconfigure(1, weight=1)
-        players_frame.columnconfigure(0, weight=1)
-        ttk.Label(players_frame, text="Recorded players for selected server:").grid(row=0, column=0, sticky="w", pady=(0,4))
-        player_cols = ("uuid", "name", "last_seen")
-        self.players_tree = ttk.Treeview(players_frame, columns=player_cols, show="headings", height=6)
-        for col in player_cols:
-            self.players_tree.heading(col, text=col.replace("_", " ").title())
-            if col == "uuid":
-                width = 260
-            elif col == "name":
-                width = 200
-            else:
-                width = 170
-            self.players_tree.column(col, width=width, anchor="w")
-        self.players_tree.grid(row=1, column=0, sticky="nsew")
-        player_scroll = ttk.Scrollbar(players_frame, orient="vertical", command=self.players_tree.yview)
-        player_scroll.grid(row=1, column=1, sticky="ns")
-        self.players_tree.configure(yscrollcommand=player_scroll.set)
-        self.players_tree.tag_configure("player_online", foreground="#0b8f0b")
-        btn_frame = ttk.Frame(players_frame)
-        btn_frame.grid(row=2, column=0, sticky="w", pady=(4,0))
-        ttk.Button(btn_frame, text="Copy Username(s)", command=self.copy_selected_player_names).pack(side="left")
-        main_pane.add(players_frame, minsize=160)
+        server_wrap = QWidget()
+        server_layout = QVBoxLayout(server_wrap)
+        server_layout.setContentsMargins(0, 0, 0, 0)
+        self.server_tree = ResultTable(SERVER_COLUMNS)
+        self.server_tree.setSortingEnabled(True)
+        for idx, col in enumerate(SERVER_COLUMNS):
+            self.server_tree.setColumnWidth(idx, _SERVER_WIDTHS[col])
+        self.server_tree.itemSelectionChanged.connect(self._on_server_selected)
+        server_layout.addWidget(self.server_tree)
+        splitter.addWidget(server_wrap)
 
-        footer = ttk.Frame(self)
-        footer.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 8))
-        ttk.Label(footer, textvariable=self.status_var, anchor="w").pack(fill="x")
+        players_wrap = QWidget()
+        players_layout = QVBoxLayout(players_wrap)
+        players_layout.setContentsMargins(0, 0, 0, 0)
+        players_layout.addWidget(QLabel("Recorded players for selected server:"))
+        self.players_tree = ResultTable(PLAYER_COLUMNS)
+        self.players_tree.setSortingEnabled(True)
+        for idx, col in enumerate(PLAYER_COLUMNS):
+            self.players_tree.setColumnWidth(idx, _PLAYER_WIDTHS[col])
+        players_layout.addWidget(self.players_tree)
+        prow = QHBoxLayout()
+        self.copy_names_btn = QPushButton("Copy Username(s)")
+        self.copy_names_btn.clicked.connect(self.copy_selected_player_names)
+        prow.addWidget(self.copy_names_btn)
+        prow.addStretch(1)
+        players_layout.addLayout(prow)
+        splitter.addWidget(players_wrap)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
 
+        # --- Footer status ---
+        self.status_label = QLabel("Monitor idle.")
+        layout.addWidget(self.status_label)
+
+    # ---- helpers ----
     def _set_status(self, msg):
-        self.status_var.set(msg)
+        self.status_label.setText(msg)
 
+    def _server_selected_rows(self):
+        rows = sorted({i.row() for i in self.server_tree.selectedIndexes()})
+        return rows
+
+    def _server_row_values(self, row):
+        vals = []
+        for col in range(self.server_tree.columnCount()):
+            item = self.server_tree.item(row, col)
+            vals.append(item.text() if item else "")
+        return tuple(vals)
+
+    def _players_selected_rows(self):
+        return sorted({i.row() for i in self.players_tree.selectedIndexes()})
+
+    def _players_row_values(self, row):
+        vals = []
+        for col in range(self.players_tree.columnCount()):
+            item = self.players_tree.item(row, col)
+            vals.append(item.text() if item else "")
+        return tuple(vals)
+
+    def _add_table_row(self, table, values, fg=None, bg=None):
+        table.setSortingEnabled(False)
+        row = table.rowCount()
+        table.insertRow(row)
+        for col, val in enumerate(values):
+            item = QTableWidgetItem(str(val))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            if fg is not None:
+                item.setForeground(QBrush(QColor(fg)))
+            if bg is not None:
+                item.setBackground(QBrush(QColor(bg)))
+            table.setItem(row, col, item)
+        table.setSortingEnabled(True)
+        return row
+
+    # ---- input actions ----
     def add_servers_from_input(self):
-        raw = self.server_input.get("1.0", "end").strip()
+        raw = self.server_input.toPlainText().strip()
         if not raw:
             self._set_status("Paste one or more servers first.")
             return
@@ -6496,20 +6803,20 @@ class ServerMonitorTab(ttk.Frame):
             self._set_status("Skipped invalid entries.")
         else:
             self._set_status("No new servers added.")
-        self.server_input.delete("1.0", "end")
+        self.server_input.clear()
 
     def clear_input(self):
-        self.server_input.delete("1.0", "end")
+        self.server_input.clear()
         self._set_status("Input cleared.")
 
     def remove_selected_servers(self):
-        selected = self.server_tree.selection()
+        selected = self._server_selected_rows()
         if not selected:
-            messagebox.showinfo("Info", "Select rows to remove.")
+            q_info(self, "Info", "Select rows to remove.")
             return
         removed = 0
-        for iid in selected:
-            vals = self.server_tree.item(iid, "values")
+        for row in selected:
+            vals = self._server_row_values(row)
             if not vals:
                 continue
             ip = vals[0]
@@ -6525,40 +6832,46 @@ class ServerMonitorTab(ttk.Frame):
         else:
             self._set_status("No servers removed.")
 
+    # alias (contract name)
+    def remove_selected(self):
+        return self.remove_selected_servers()
+
     def copy_monitored_ips(self):
-        selected = self.server_tree.selection()
+        selected = self._server_selected_rows()
         if not selected:
-            messagebox.showinfo("Info", "Select rows first.")
+            q_info(self, "Info", "Select rows first.")
             return
         ips = []
-        for iid in selected:
-            vals = self.server_tree.item(iid, "values")
+        for row in selected:
+            vals = self._server_row_values(row)
             if vals:
                 ips.append(vals[0])
         if not ips:
-            messagebox.showinfo("Info", "No valid IPs selected.")
+            q_info(self, "Info", "No valid IPs selected.")
             return
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(ips))
+        QApplication.clipboard().setText("\n".join(ips))
         self._set_status(f"Copied {len(ips)} monitored server(s).")
 
+    # alias (contract name)
+    def copy_ips(self):
+        return self.copy_monitored_ips()
+
     def copy_selected_player_names(self):
-        selected = self.players_tree.selection()
+        selected = self._players_selected_rows()
         if not selected:
-            messagebox.showinfo("Info", "Select player rows first.")
+            q_info(self, "Info", "Select player rows first.")
             return
         names = []
-        for iid in selected:
-            vals = self.players_tree.item(iid, "values")
+        for row in selected:
+            vals = self._players_row_values(row)
             if vals and len(vals) >= 2:
                 name = vals[1]
                 if isinstance(name, str) and name.strip():
                     names.append(name.strip())
         if not names:
-            messagebox.showinfo("Info", "No player names selected.")
+            q_info(self, "Info", "No player names selected.")
             return
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(names))
+        QApplication.clipboard().setText("\n".join(names))
         self._set_status(f"Copied {len(names)} player name(s).")
 
     def start_monitoring(self):
@@ -6566,29 +6879,37 @@ class ServerMonitorTab(ttk.Frame):
             return
         interval = self._read_interval()
         if not interval:
-            messagebox.showinfo("Info", "Enter a valid interval (in seconds).")
+            q_info(self, "Info", "Enter a valid interval (in seconds).")
             return
         ips = self._get_monitored_ips()
         if not ips:
-            messagebox.showinfo("Info", "Add at least one server to monitor.")
+            q_info(self, "Info", "Add at least one server to monitor.")
             return
         self._monitor_interval = interval
         self._stop_event.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
         self._monitoring = True
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
         self._set_status(f"Monitoring {len(ips)} server(s) every {interval}s.")
+
+    # alias (contract name)
+    def start_monitor(self):
+        return self.start_monitoring()
 
     def stop_monitoring(self):
         if not self._monitoring:
             return
         self._stop_event.set()
         self._monitoring = False
-        self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
         self._set_status("Monitoring paused.")
+
+    # alias (contract name)
+    def stop_monitor(self):
+        return self.stop_monitoring()
 
     def _monitor_loop(self):
         while not self._stop_event.is_set():
@@ -6637,22 +6958,22 @@ class ServerMonitorTab(ttk.Frame):
     def export_players(self):
         ip = self._last_selected_ip
         if not ip:
-            messagebox.showinfo("Info", "Select a server first.")
+            q_info(self, "Info", "Select a server first.")
             return
         entry = self.monitor_state.get("servers", {}).get(ip)
         if not entry:
-            messagebox.showinfo("Info", "Server data unavailable.")
+            q_info(self, "Info", "Server data unavailable.")
             return
         log = entry.get("player_log", {})
         if not log:
-            messagebox.showinfo("Info", "No player data for this server yet.")
+            q_info(self, "Info", "No player data for this server yet.")
             return
         safe_name = ip.replace(":", "_")
-        path = filedialog.asksaveasfilename(
-            title="Export Player Log",
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt")],
-            initialfile=f"{safe_name}_players.txt"
+        path = q_ask_save(
+            self,
+            "Export Player Log",
+            f"{safe_name}_players.txt",
+            "Text files (*.txt)",
         )
         if not path:
             return
@@ -6664,20 +6985,25 @@ class ServerMonitorTab(ttk.Frame):
                 f.write(f"{uid} | {name} | Last seen: {seen}\n")
         self._set_status(f"Exported {len(rows)} player entries for {ip}.")
 
+    # alias (contract name)
+    def export(self):
+        return self.export_players()
+
     def _get_monitored_ips(self):
         return list(self.monitor_state.get("servers", {}).keys())
 
     def _read_interval(self):
         try:
-            val = int(self.interval_var.get())
+            val = int(self.interval_spin.value())
             return max(5, val)
         except Exception:
             return None
 
     def _refresh_server_tree(self):
         current = self._last_selected_ip
-        target_iid = None
-        self.server_tree.delete(*self.server_tree.get_children())
+        target_row = None
+        self.server_tree.setSortingEnabled(False)
+        self.server_tree.setRowCount(0)
         for ip in sorted(self.monitor_state.get("servers", {})):
             entry = self.monitor_state["servers"][ip]
             players = entry.get("players_online", 0)
@@ -6687,26 +7013,32 @@ class ServerMonitorTab(ttk.Frame):
             version = entry.get("version", "N/A")
             cracked = "Yes" if entry.get("cracked") else "No"
             motd = sanitize_motd(entry.get("motd", ""))
-            iid = self.server_tree.insert(
-                "",
-                "end",
-                values=(ip, status.title(), f"{players}/{max_players}", version, cracked, motd, last_ping),
-                tags=("status_offline",) if status.strip().lower() != "online" and status.strip() else ()
+            offline = status.strip().lower() != "online" and status.strip()
+            row = self._add_table_row(
+                self.server_tree,
+                (ip, status.title(), f"{players}/{max_players}", version, cracked, motd, last_ping),
+                bg="#ffe6e6" if offline else None,
             )
             if ip == current:
-                target_iid = iid
-        if target_iid:
-            self.server_tree.selection_set(target_iid)
-            self.server_tree.see(target_iid)
+                target_row = row
+        self.server_tree.setSortingEnabled(True)
+        if target_row is not None:
+            self.server_tree.selectRow(target_row)
+            item = self.server_tree.item(target_row, 0)
+            if item is not None:
+                self.server_tree.scrollToItem(item)
 
     def _refresh_players_tree(self, ip=None):
         if ip is None:
             ip = self._last_selected_ip
-        self.players_tree.delete(*self.players_tree.get_children())
+        self.players_tree.setSortingEnabled(False)
+        self.players_tree.setRowCount(0)
         if not ip:
+            self.players_tree.setSortingEnabled(True)
             return
         entry = self.monitor_state.get("servers", {}).get(ip)
         if not entry:
+            self.players_tree.setSortingEnabled(True)
             return
         current_online = set(entry.get("current_players") or [])
         rows = []
@@ -6714,21 +7046,26 @@ class ServerMonitorTab(ttk.Frame):
             rows.append((uid, pdata.get("name", ""), pdata.get("last_seen", 0)))
         rows.sort(key=lambda item: item[2], reverse=True)
         for uid, name, last_seen in rows:
-            tags = ("player_online",) if uid in current_online else ()
-            self.players_tree.insert("", "end", values=(uid, name, format_timestamp(last_seen)), tags=tags)
+            online = uid in current_online
+            self._add_table_row(
+                self.players_tree,
+                (uid, name, format_timestamp(last_seen)),
+                fg="#0b8f0b" if online else None,
+            )
+        self.players_tree.setSortingEnabled(True)
 
     def _on_server_selected(self):
-        selection = self.server_tree.selection()
+        selection = self._server_selected_rows()
         if not selection:
             self._last_selected_ip = None
             self._refresh_players_tree(None)
             return
-        vals = self.server_tree.item(selection[0], "values")
+        vals = self._server_row_values(selection[0])
         if not vals:
             return
         self._last_selected_ip = vals[0]
         self._refresh_players_tree(self._last_selected_ip)
-    
+
     def reload_state(self):
         self.monitor_state = load_server_monitor_state()
         if self._last_selected_ip not in self.monitor_state.get("servers", {}):
@@ -6736,182 +7073,273 @@ class ServerMonitorTab(ttk.Frame):
         self._refresh_server_tree()
         self._refresh_players_tree(self._last_selected_ip)
 
-# ---- Shodan Tab ----
-class ShodanTab(ttk.Frame):  
-    def __init__(self, master):
-        super().__init__(master)
+
+# ===== Qt port section: qt_shodan (PySide6, 1:1 behavior) =====
+"""PySide6 port of ShodanTab (scanner.py lines 6740-7369). 1:1 logic port.
+
+Original: class ShodanTab(ttk.Frame) with ttk.Treeview tables, tk.StringVar/
+BooleanVar state, messagebox/simpledialog/filedialog, self.after / threading.
+
+Qt mapping:
+  ttk.Frame -> QWidget + layouts (QSplitter vertical replaces tk.PanedWindow)
+  ttk.Entry(query) -> QLineEdit
+  ttk.Combobox (editable) -> QComboBox (editable)
+  ttk.Checkbutton -> QCheckBox
+  ttk.Button -> QPushButton (exact same labels)
+  ttk.Treeview -> ResultTable (QTableWidget-based, from qt_helpers)
+  tk.StringVar status -> QLabel; set_status sets text
+  self.after -> QtBaseMixin.after (QTimer.singleShot)
+  messagebox -> q_info / q_error; simpledialog -> q_ask_string;
+    filedialog -> q_ask_save; ask_reason_with_whitelist / ensure_shodan_key_ui
+    from qt_helpers (QInputDialog-based)
+  clipboard_clear/append -> QApplication.clipboard().setText
+Backend refs (search_shodan, parse_*, scan_servers_gui, verifiers, etc.)
+imported from scanner module as-is (guarded import so module loads standalone).
+No QPlainTextEdit in original ShodanTab: none added here.
+Note: original ShodanTab.search_players references self.player_search_var
+which is never created in ShodanTab._build_ui (only BulkTab/JSONTab create
+it) and has no search entry/button wired. Port keeps the method with
+identical logic, reading from an optional player_search_edit if present.
+"""
+
+import os
+import threading
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+    QAbstractItemView,
+)
+from PySide6.QtCore import Qt
+
+
+# Backend refs as-is (same names as scanner.py globals).
+SEARCH_COLS = ("ip", "motd", "players", "version")
+SCAN_COLS = ("ip", "motd", "players", "version", "cracked", "whitelist", "active_players")
+
+
+def _table_row_values(table, row):
+    """Return list of cell texts for QTableWidget-like table row."""
+    cols = table.columnCount()
+    out = []
+    for c in range(cols):
+        item = table.item(row, c)
+        out.append(item.text() if item is not None else "")
+    return out
+
+
+def _selected_rows(table):
+    """Sorted unique selected row indices (SelectRows mode)."""
+    rows = set()
+    for idx in table.selectionModel().selectedRows():
+        rows.add(idx.row())
+    # Fallback for cell selection without row selection model update
+    for item in table.selectedItems():
+        rows.add(item.row())
+    return sorted(rows)
+
+
+class ShodanTab(QWidget, QtBaseMixin):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.results = []  # list[tuple(ip,motd,players,version)]
         self.scan_rows = []
         self._in_ignore = False
-        self.version_filter_var = tk.StringVar(value="All versions")
-        self.check_whitelist_var = tk.BooleanVar(value=False)
+        self._version_filter = "All versions"
         self._build_ui()
         self._current_scan_ip = None
         self._scan_row_map = {}
         self._cracked_job_id = 0
         self._whitelist_job_id = 0
 
+    # ---------- UI ----------
     def _build_ui(self):
-        # Root grid: content (row 0) + footer (row 1) pinned
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
 
-        content = ttk.Frame(self)
-        content.grid(row=0, column=0, sticky="nsew")
+        pane = QSplitter(Qt.Vertical, self)
+        root.addWidget(pane, 1)
 
-        # Paned window: top (search + table) / bottom (scan output)
-        pane = tk.PanedWindow(content, orient="vertical", sashwidth=8)
-        pane.pack(fill="both", expand=True, padx=8, pady=(8,0))
-        pane_top = ttk.Frame(pane)
-        pane_bottom = ttk.Frame(pane)
-        pane.add(pane_top, minsize=300)
-        pane.add(pane_bottom, minsize=240)
+        pane_top = QWidget(pane)
+        top_layout = QVBoxLayout(pane_top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        pane.addWidget(pane_top)
 
-        bar = ttk.Frame(pane_top)
-        bar.pack(fill="x", padx=8, pady=8)
-        ttk.Label(bar, text="Query (without 'minecraft'): ").pack(side="left")
-        self.query_var = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.query_var, width=50).pack(side="left", padx=6)
-        ttk.Button(bar, text="Search", command=self.do_search).pack(side="left")
-        ttk.Button(bar, text="Export Search…", command=self.export_search_results).pack(side="left", padx=6)
-        ttk.Label(bar, text="Version:").pack(side="left", padx=(12, 4))
-        self.version_filter_combo = ttk.Combobox(
-            bar,
-            textvariable=self.version_filter_var,
-            values=["All versions"],
-            width=18
+        pane_bottom = QWidget(pane)
+        bottom_layout = QVBoxLayout(pane_bottom)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        pane.addWidget(pane_bottom)
+        pane.setSizes([420, 280])
+
+        # --- top bar ---
+        bar = QWidget(pane_top)
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(8, 8, 8, 4)
+        bar_layout.addWidget(QLabel("Query (without 'minecraft'): ", bar))
+        self.query_edit = QLineEdit(bar)
+        self.query_edit.setMinimumWidth(340)
+        bar_layout.addWidget(self.query_edit)
+        self.search_btn = QPushButton("Search", bar)
+        self.search_btn.clicked.connect(self.do_search)
+        bar_layout.addWidget(self.search_btn)
+        self.export_search_btn = QPushButton("Export Search…", bar)
+        self.export_search_btn.clicked.connect(self.export_search_results)
+        bar_layout.addWidget(self.export_search_btn)
+        bar_layout.addWidget(QLabel("Version:", bar))
+        self.version_filter_combo = QComboBox(bar)
+        self.version_filter_combo.setEditable(True)
+        self.version_filter_combo.addItem("All versions")
+        self.version_filter_combo.setMinimumWidth(140)
+        self.version_filter_combo.currentTextChanged.connect(
+            lambda _t: self._refresh_search_tree()
         )
-        self.version_filter_combo.pack(side="left")
-        self.version_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_search_tree())
-        self.version_filter_combo.bind("<KeyRelease>", lambda _e: self._refresh_search_tree())
+        self.version_filter_combo.lineEdit().textChanged.connect(
+            lambda _t: self._refresh_search_tree()
+        )
+        bar_layout.addWidget(self.version_filter_combo)
+        bar_layout.addStretch(1)
+        top_layout.addWidget(bar)
 
-        mid = ttk.Frame(pane_top)
-        mid.pack(fill="both", expand=True, padx=8, pady=4)
+        # --- mid: search table + right buttons ---
+        mid = QWidget(pane_top)
+        mid_layout = QHBoxLayout(mid)
+        mid_layout.setContentsMargins(8, 4, 8, 4)
+        top_layout.addWidget(mid, 1)
 
-        cols = ("ip","motd","players","version")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=14, selectmode="extended")
-        for c in cols:
-            self.tree.heading(c, text=c.upper())
-            if c == "motd":
-                width = 240
-            elif c == "players":
-                width = 120
-            elif c == "version":
-                width = 120
-            else:
-                width = 170
-            self.tree.column(c, width=width, anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        sb.pack(side="left", fill="y")
-        self.tree.config(yscrollcommand=sb.set)
+        self.tree = ResultTable(mid, list(SEARCH_COLS))
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        mid_layout.addWidget(self.tree, 1)
+        try:
+            _get_icon_manager().attach_to_tree(self.tree)
+        except Exception:
+            pass
 
-        make_tree_sortable(self.tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key
-        })
 
-        right = ttk.Frame(mid)
-        right.pack(side="right", fill="y", padx=8)
-        ttk.Button(right, text="Copy IP(s)", command=self.copy_selected).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Ignore", command=self.ignore_selected).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Saved", command=self.save_selected).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Monitor", command=self.add_search_selected_to_monitor).pack(fill="x", pady=2)
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Button(right, text="Scan Selected", command=self.scan_selected).pack(fill="x", pady=2)
-        ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
-        self.only_players_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(right, text="Only players > 0", variable=self.only_players_var).pack(anchor="w", pady=(8,0))
-        self.only_cracked_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="Only cracked servers", variable=self.only_cracked_var).pack(anchor="w")
-        ttk.Checkbutton(right, text="Check whitelist", variable=self.check_whitelist_var).pack(anchor="w")
+        right = QWidget(mid)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 0, 0, 0)
+        mid_layout.addWidget(right)
 
-        # BOTTOM: Scan output table
-        out = ttk.Frame(pane_bottom)
-        out.pack(fill="both", expand=True, padx=8, pady=(0,8))
-        ttk.Label(out, text="Scan Output (select to copy/save/ignore):").pack(anchor="w")
-        of = ttk.Frame(out)
-        of.pack(fill="both", expand=True)
+        self.copy_btn = QPushButton("Copy IP(s)", right)
+        self.copy_btn.clicked.connect(self.copy_selected)
+        right_layout.addWidget(self.copy_btn)
+        self.ignore_btn = QPushButton("Add to Ignore", right)
+        self.ignore_btn.clicked.connect(self.ignore_selected)
+        right_layout.addWidget(self.ignore_btn)
+        self.save_btn = QPushButton("Add to Saved", right)
+        self.save_btn.clicked.connect(self.save_selected)
+        right_layout.addWidget(self.save_btn)
+        self.monitor_btn = QPushButton("Add to Monitor", right)
+        self.monitor_btn.clicked.connect(self.add_search_selected_to_monitor)
+        right_layout.addWidget(self.monitor_btn)
+        sep = QWidget(right)
+        sep.setFixedHeight(8)
+        right_layout.addWidget(sep)
+        self.scan_sel_btn = QPushButton("Scan Selected", right)
+        self.scan_sel_btn.clicked.connect(self.scan_selected)
+        right_layout.addWidget(self.scan_sel_btn)
+        self.scan_all_btn = QPushButton("Scan All", right)
+        self.scan_all_btn.clicked.connect(self.scan_all)
+        right_layout.addWidget(self.scan_all_btn)
+        self.only_players_cb = QCheckBox("Only players > 0", right)
+        self.only_players_cb.setChecked(True)
+        right_layout.addWidget(self.only_players_cb)
+        self.only_cracked_cb = QCheckBox("Only cracked servers", right)
+        self.only_cracked_cb.setChecked(False)
+        right_layout.addWidget(self.only_cracked_cb)
+        self.check_whitelist_cb = QCheckBox("Check whitelist", right)
+        self.check_whitelist_cb.setChecked(False)
+        right_layout.addWidget(self.check_whitelist_cb)
+        right_layout.addStretch(1)
 
-        cols_out = ("ip","motd","players","version","cracked","whitelist","active_players")
-        self.scan_tree = ttk.Treeview(of, columns=cols_out, show="headings", height=8, selectmode="extended")
-        for c in cols_out:
-            self.scan_tree.heading(c, text=c.upper())
-            if c in ("motd", "active_players"):
-                width = 240
-            elif c == "players":
-                width = 130
-            elif c == "version":
-                width = 130
-            elif c == "whitelist":
-                width = 220
-            elif c == "cracked":
-                width = 90
-            else:
-                width = 170
-            self.scan_tree.column(c, width=width, anchor="w")
-        self.scan_tree.pack(side="left", fill="both", expand=True)
-        osb = ttk.Scrollbar(of, orient="vertical", command=self.scan_tree.yview)
-        osb.pack(side="left", fill="y")
-        self.scan_tree.config(yscrollcommand=osb.set)
-        make_tree_sortable(self.scan_tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key,
-            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1,
-            "whitelist": lambda v: str(v).lower(),
-            "active_players": lambda v: str(v).lower()
-        })
+        # --- bottom: scan output table ---
+        bottom_layout.addWidget(
+            QLabel("Scan Output (select to copy/save/ignore):", pane_bottom)
+        )
+        self.scan_tree = ResultTable(pane_bottom, list(SCAN_COLS))
+        self.scan_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.scan_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        bottom_layout.addWidget(self.scan_tree, 1)
+        try:
+            _get_icon_manager().attach_to_tree(self.scan_tree)
+        except Exception:
+            pass
 
-        # ------- Footer (pinned) -------
-        footer = ttk.Frame(self)
-        footer.grid(row=1, column=0, sticky="ew", padx=8, pady=(6,8))
-        footer.grid_columnconfigure(1, weight=1)
 
-        obtns = ttk.Frame(footer)
-        obtns.grid(row=0, column=0, sticky="w")
-        ttk.Button(obtns, text="Copy IP(s)", command=self.copy_scan_selected).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Add to Ignore", command=self.ignore_scan_selected_from_output).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Add to Saved", command=self.save_scan_selected_from_output).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Add to Monitor", command=self.add_scan_output_selected_to_monitor).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Export Scan…", command=self.export_scan_output).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Check Whitelist", command=lambda: check_selected_whitelist(self, self.scan_tree)).pack(side="left", padx=4)
+        # --- footer (pinned) ---
+        footer = QWidget(self)
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 6, 0, 0)
+        root.addWidget(footer)
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(footer, textvariable=self.status, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12,0))
+        self.copy_scan_btn = QPushButton("Copy IP(s)", footer)
+        self.copy_scan_btn.clicked.connect(self.copy_scan_selected)
+        footer_layout.addWidget(self.copy_scan_btn)
+        self.ignore_scan_btn = QPushButton("Add to Ignore", footer)
+        self.ignore_scan_btn.clicked.connect(self.ignore_scan_selected_from_output)
+        footer_layout.addWidget(self.ignore_scan_btn)
+        self.save_scan_btn = QPushButton("Add to Saved", footer)
+        self.save_scan_btn.clicked.connect(self.save_scan_selected_from_output)
+        footer_layout.addWidget(self.save_scan_btn)
+        self.monitor_scan_btn = QPushButton("Add to Monitor", footer)
+        self.monitor_scan_btn.clicked.connect(self.add_scan_output_selected_to_monitor)
+        footer_layout.addWidget(self.monitor_scan_btn)
+        self.export_scan_btn = QPushButton("Export Scan…", footer)
+        self.export_scan_btn.clicked.connect(self.export_scan_output)
+        footer_layout.addWidget(self.export_scan_btn)
+        self.check_wl_btn = QPushButton("Check Whitelist", footer)
+        self.check_wl_btn.clicked.connect(
+            lambda: check_selected_whitelist(self, self.scan_tree)
+        )
+        footer_layout.addWidget(self.check_wl_btn)
 
-        # ---------- ICONS: attach (Shodan: search & output) ----------
-        _get_icon_manager().attach_to_tree(self.tree)
-        _get_icon_manager().attach_to_tree(self.scan_tree)
+        self.status_label = QLabel("Ready.", footer)
+        footer_layout.addWidget(self.status_label, 1)
 
     def set_status(self, msg):
-        self.status.set(msg)
+        self.status_label.setText(msg)
+
+    # ---------- version filter ----------
+    def _version_filter_text(self):
+        return self.version_filter_combo.currentText() or "All versions"
 
     def _update_version_filter_choices(self, rows):
         choices = collect_version_options(rows)
-        current = self.version_filter_var.get() or "All versions"
-        self.version_filter_combo["values"] = choices
-        if current not in choices:
-            current = "All versions"
-        self.version_filter_var.set(current)
+        current = self._version_filter_text() or "All versions"
+        self.version_filter_combo.blockSignals(True)
+        try:
+            self.version_filter_combo.clear()
+            self.version_filter_combo.addItems(choices)
+            if current not in choices:
+                current = "All versions"
+            self.version_filter_combo.setCurrentText(current)
+        finally:
+            self.version_filter_combo.blockSignals(False)
 
     def _refresh_search_tree(self):
-        self.tree.delete(*self.tree.get_children())
+        self.tree.clear_rows()
         for row in self.results:
-            if version_filter_allows(row[3], self.version_filter_var.get()):
-                self.tree.insert("", "end", values=row)
+            if version_filter_allows(row[3], self._version_filter_text()):
+                self.tree.add_row(row)
 
     def _refresh_scan_tree(self):
-        self.scan_tree.delete(*self.scan_tree.get_children())
+        self.scan_tree.clear_rows()
         for row in self.scan_rows:
-            if version_filter_allows(row[3], self.version_filter_var.get()):
-                self.scan_tree.insert("", "end", values=row)
+            if version_filter_allows(row[3], self._version_filter_text()):
+                self.scan_tree.add_row(row)
 
+    # ---------- search ----------
     def do_search(self):
-        q = self.query_var.get().strip()
+        q = self.query_edit.text().strip()
         full_query = f"minecraft {q}" if q else "minecraft"
 
         # MAIN THREAD: ensure key (may open a dialog)
@@ -6921,7 +7349,7 @@ class ShodanTab(ttk.Frame):
             return
 
         self.set_status(f"Searching: {full_query}")
-        self.tree.delete(*self.tree.get_children())
+        self.tree.clear_rows()
 
         def work(k=key, fq=full_query):
             try:
@@ -6946,36 +7374,42 @@ class ShodanTab(ttk.Frame):
 
                 self.after(0, insert_all)
 
-            except shodan.APIError as e:
+            except Exception as e:
+                # Preserve original invalid-key handling (shodan.APIError branch).
                 msg = str(e)
+                is_api_error = False
+                try:
+                    is_api_error = shodan is not None and isinstance(e, shodan.APIError)
+                except Exception:
+                    is_api_error = False
 
                 def report_error():
                     self.set_status(f"Search failed: {msg}")
-                    if "invalid" in msg.lower() or "unauthorized" in msg.lower():
+                    if is_api_error and (
+                        "invalid" in msg.lower() or "unauthorized" in msg.lower()
+                    ):
                         try:
                             if os.path.exists(SHODAN_KEY_PATH):
                                 os.remove(SHODAN_KEY_PATH)
                         except Exception:
                             pass
-                        messagebox.showerror(
+                        q_error(
+                            self,
                             "Shodan",
                             "The Shodan API key appears to be invalid.\n"
-                            "I removed shodan_key.txt. Search again and enter a valid key."
+                            "I removed shodan_key.txt. Search again and enter a valid key.",
                         )
 
                 self.after(0, report_error)
 
-            except Exception as e:
-                self.after(0, lambda: self.set_status(f"Search failed: {e}"))
-
         threading.Thread(target=work, daemon=True).start()
         return
 
-
+    # ---------- selection helpers ----------
     def _search_selected_ips(self):
         sel = []
-        for iid in self.tree.selection():
-            vals = self.tree.item(iid, "values")
+        for row in _selected_rows(self.tree):
+            vals = _table_row_values(self.tree, row)
             if vals:
                 sel.append(vals[0])
         return list(dict.fromkeys(sel))
@@ -6992,10 +7426,10 @@ class ShodanTab(ttk.Frame):
         return seen
 
     # ---- Scan Output helpers ----
-    def _scan_selected_rows(self):  #
+    def _scan_selected_rows(self):
         out = []
-        for iid in self.scan_tree.selection():
-            vals = self.scan_tree.item(iid, "values")
+        for row in _selected_rows(self.scan_tree):
+            vals = _table_row_values(self.scan_tree, row)
             if vals:
                 out.append(vals)
         return out
@@ -7003,17 +7437,16 @@ class ShodanTab(ttk.Frame):
     def copy_scan_selected(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            q_info(self, "Info", "Select scan output rows.")
             return
         ips = [row[0] for row in rows]
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(ips))
+        QApplication.clipboard().setText("\n".join(ips))
         self.set_status(f"Copied {len(ips)} IP(s) from scan output.")
 
-    def ignore_selected(self):  
+    def ignore_selected(self):
         sel = self._all_selected_ips()
         if not sel:
-            messagebox.showinfo("Info","Select items first.")
+            q_info(self, "Info", "Select items first.")
             return
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
         if reason is None:
@@ -7021,16 +7454,15 @@ class ShodanTab(ttk.Frame):
             return
         for ip in sel:
             add_to_ignore(ip, reason or "")
-        for iid in list(self.tree.selection()):
-            self.tree.delete(iid)
+        self.tree.remove_selected()
         self.set_status(f"Added {len(sel)} to ignore.txt")
 
-    def save_selected(self):  
+    def save_selected(self):
         sel = self._all_selected_ips()
         if not sel:
-            messagebox.showinfo("Info","Select items first.")
+            q_info(self, "Info", "Select items first.")
             return
-        reason = simpledialog.askstring("Reason","Why save? (optional)")
+        reason = q_ask_string(self, "Reason", "Why save? (optional)")
         for ip in sel:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(sel)} to saved.txt")
@@ -7038,7 +7470,7 @@ class ShodanTab(ttk.Frame):
     def add_search_selected_to_monitor(self):
         sel = self._all_selected_ips()
         if not sel:
-            messagebox.showinfo("Info","Select items first.")
+            q_info(self, "Info", "Select items first.")
             return
         added, invalid, duplicates = add_ips_to_monitor_list(sel)
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
@@ -7046,7 +7478,7 @@ class ShodanTab(ttk.Frame):
     def ignore_scan_selected_from_output(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            q_info(self, "Info", "Select scan output rows.")
             return
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
         if reason is None:
@@ -7054,16 +7486,15 @@ class ShodanTab(ttk.Frame):
             return
         for ip, *_ in rows:
             add_to_ignore(ip, reason or "")
-        for iid in list(self.scan_tree.selection()):
-            self.scan_tree.delete(iid)
+        self.scan_tree.remove_selected()
         self.set_status(f"Added {len(rows)} to ignore.txt from scan output.")
 
     def save_scan_selected_from_output(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            q_info(self, "Info", "Select scan output rows.")
             return
-        reason = simpledialog.askstring("Reason","Why save? (optional)")
+        reason = q_ask_string(self, "Reason", "Why save? (optional)")
         for ip, *_ in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt from scan output.")
@@ -7071,28 +7502,25 @@ class ShodanTab(ttk.Frame):
     def add_scan_output_selected_to_monitor(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            q_info(self, "Info", "Select scan output rows.")
             return
         ips = [row[0] for row in rows]
         added, invalid, duplicates = add_ips_to_monitor_list(ips)
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
-    def export_scan_output(self):  
+    def export_scan_output(self):
         rows = []
-        for iid in self.scan_tree.get_children():
-            vals = self.scan_tree.item(iid, "values")
+        for r in range(self.scan_tree.rowCount()):
+            vals = _table_row_values(self.scan_tree, r)
             if vals:
                 rows.append(vals)
         if not rows:
-            messagebox.showinfo("Info", "No scan output to export.")
+            q_info(self, "Info", "No scan output to export.")
             return
-        q = self.query_var.get().strip()
+        q = self.query_edit.text().strip()
         base = sanitize_query_for_filename((q if q else "minecraft") + "_scan")
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files","*.txt")],
-            title="Export Shodan Scan Output",
-            initialfile=f"{base}.txt"
+        path = q_ask_save(
+            self, "Export Shodan Scan Output", f"{base}.txt", "Text files (*.txt)"
         )
         if not path:
             return
@@ -7112,65 +7540,125 @@ class ShodanTab(ttk.Frame):
         self.set_status(f"Exported {len(rows)} scan rows to {os.path.basename(path)}")
 
     def search_players(self):
-        query_raw = self.player_search_var.get() or ""
+        # Original ShodanTab has no player-search entry; keep identical logic.
+        edit = getattr(self, "player_search_edit", None)
+        query_raw = (edit.text() if edit is not None else "") or ""
         query = query_raw.strip().lower()
         if not query:
             self.set_status("Enter a player name to search.")
             return
         matches = []
-        for iid in self.scan_tree.get_children():
-            vals = self.scan_tree.item(iid, "values")
+        for r in range(self.scan_tree.rowCount()):
+            vals = _table_row_values(self.scan_tree, r)
             if not vals:
                 continue
             players_text = vals[-1] if vals else ""
             if isinstance(players_text, str) and query in players_text.lower():
-                matches.append(iid)
-        current_sel = self.scan_tree.selection()
-        if current_sel:
-            self.scan_tree.selection_remove(current_sel)
+                matches.append(r)
+        self.scan_tree.clearSelection()
         if matches:
-            self.scan_tree.selection_set(matches)
-            self.scan_tree.focus(matches[0])
-            self.scan_tree.see(matches[0])
+            # Select all matches (ExtendedSelection)
+            for r in matches:
+                self.scan_tree.selectionModel().select(
+                    self.scan_tree.model().index(r, 0),
+                    self.scan_tree.selectionModel().Select
+                    | self.scan_tree.selectionModel().Rows,
+                )
+            self.scan_tree.setCurrentCell(matches[0], 0)
+            self.scan_tree.scrollToItem(
+                self.scan_tree.item(matches[0], 0)
+            ) if self.scan_tree.item(matches[0], 0) else None
             self.set_status(f"Found {len(matches)} match(es) for '{query_raw.strip()}'.")
         else:
             self.set_status(f"No matches for '{query_raw.strip()}'.")
 
+    # ---------- scan row map (ip -> row; Qt rows shift so also search by ip) ----------
+    def _find_scan_row(self, ip):
+        for r in range(self.scan_tree.rowCount()):
+            item = self.scan_tree.item(r, 0)
+            if item is not None and item.text() == ip:
+                return r
+        return None
+
     def _reset_scan_row_map(self):
         self._scan_row_map = {}
 
-    def _register_scan_row(self, ip, iid):
-        self._scan_row_map[ip] = iid
+    def _register_scan_row(self, ip, row):
+        self._scan_row_map[ip] = row
+
+    def _set_scan_cell(self, row, col, text):
+        from PySide6.QtWidgets import QTableWidgetItem
+
+        item = self.scan_tree.item(row, col)
+        if item is None:
+            item = QTableWidgetItem(str(text))
+            self.scan_tree.setItem(row, col, item)
+        else:
+            item.setText(str(text))
 
     def _update_scan_row_cracked(self, ip, text):
-        iid = self._scan_row_map.get(ip)
-        if not iid:
-            return
-        vals = list(self.scan_tree.item(iid, "values"))
-        if len(vals) >= 5:
-            vals[4] = text
-            self.scan_tree.item(iid, values=vals)
+        row = self._scan_row_map.get(ip)
+        if row is None or row >= self.scan_tree.rowCount():
+            row = self._find_scan_row(ip)
+            if row is None:
+                return
+            self._scan_row_map[ip] = row
+        else:
+            # Verify mapping still points at the same ip (rows shift on delete).
+            item = self.scan_tree.item(row, 0)
+            if item is None or item.text() != ip:
+                row = self._find_scan_row(ip)
+                if row is None:
+                    return
+                self._scan_row_map[ip] = row
+        vals_len = self.scan_tree.columnCount()
+        if vals_len >= 5:
+            self._set_scan_cell(row, 4, text)
 
     def _update_scan_row_whitelist(self, ip, text):
-        iid = self._scan_row_map.get(ip)
-        if not iid:
-            return
-        vals = list(self.scan_tree.item(iid, "values"))
-        if len(vals) >= 6:
-            vals[5] = text
-            self.scan_tree.item(iid, values=vals)
+        row = self._scan_row_map.get(ip)
+        if row is None or row >= self.scan_tree.rowCount():
+            row = self._find_scan_row(ip)
+            if row is None:
+                return
+            self._scan_row_map[ip] = row
+        else:
+            item = self.scan_tree.item(row, 0)
+            if item is None or item.text() != ip:
+                row = self._find_scan_row(ip)
+                if row is None:
+                    return
+                self._scan_row_map[ip] = row
+        vals_len = self.scan_tree.columnCount()
+        if vals_len >= 6:
+            self._set_scan_cell(row, 5, text)
 
     def _remove_scan_row(self, ip):
-        iid = self._scan_row_map.pop(ip, None)
-        if iid:
-            self.scan_tree.delete(iid)
+        row = self._scan_row_map.pop(ip, None)
+        if row is None or row >= self.scan_tree.rowCount():
+            row = self._find_scan_row(ip)
+            if row is None:
+                return
+        else:
+            item = self.scan_tree.item(row, 0)
+            if item is None or item.text() != ip:
+                row = self._find_scan_row(ip)
+                if row is None:
+                    return
+        self.scan_tree.removeRow(row)
+        # Rebuild map since Qt row indices shift after removal.
+        rebuilt = {}
+        for r in range(self.scan_tree.rowCount()):
+            item = self.scan_tree.item(r, 0)
+            if item is not None:
+                rebuilt[item.text()] = r
+        self._scan_row_map = rebuilt
 
     def _scan_and_show(self, items):
-        for iid in self.scan_tree.get_children():
-            self.scan_tree.delete(iid)
+        self.scan_tree.clear_rows()
         self.set_status("Preparing scan...")
-        only_cracked = self.only_cracked_var.get()
-        check_whitelist = self.check_whitelist_var.get()
+        only_cracked = self.only_cracked_cb.isChecked()
+        check_whitelist = self.check_whitelist_cb.isChecked()
         # Cracked servers need no account (offline probe, no Mojang auth).
         account = get_active_mc_account() if check_whitelist else None
         self.scan_rows = []
@@ -7192,145 +7680,202 @@ class ShodanTab(ttk.Frame):
             try:
                 def on_start(ip):
                     self._current_scan_ip = ip
-                    self.after(0, lambda ip=ip: self.set_status(f"Currently scanning: {ip} [0/{len(items)}]"))
+                    self.after(
+                        0,
+                        lambda ip=ip: self.set_status(
+                            f"Currently scanning: {ip} [0/{len(items)}]"
+                        ),
+                    )
 
                 def on_result(r, line):
                     if not r:
                         return
-                    self.scan_rows.append((
-                        r['ip'],
-                        r['motd'],
-                        f"{r['players']}/{r['max_players']}",
-                        r['version'],
-                        "Yes" if r.get('cracked') else "No",
-                        "Queued" if check_whitelist else "-",
-                        format_player_list(r.get('players_sample'))
-                    ))
+                    self.scan_rows.append(
+                        (
+                            r["ip"],
+                            r["motd"],
+                            f"{r['players']}/{r['max_players']}",
+                            r["version"],
+                            "Yes" if r.get("cracked") else "No",
+                            "Queued" if check_whitelist else "-",
+                            format_player_list(r.get("players_sample")),
+                        )
+                    )
 
-                    if self.only_players_var.get() and r.get('players', 0) <= 0:
+                    if self.only_players_cb.isChecked() and r.get("players", 0) <= 0:
                         return
                     if only_cracked and should_skip_cracked_probe(r):
                         return
-                    if not version_filter_allows(r.get("version", ""), self.version_filter_var.get()):
+                    if not version_filter_allows(
+                        r.get("version", ""), self._version_filter_text()
+                    ):
                         return
 
-                    cracked_text = "Yes" if r.get('cracked') else "No"
+                    cracked_text = "Yes" if r.get("cracked") else "No"
                     whitelist_text = "Queued" if check_whitelist else "-"
                     queue_candidate = None
                     if only_cracked:
-                        cached = get_cached_cracked_entry(r['ip'])
+                        cached = get_cached_cracked_entry(r["ip"])
                         if cached:
                             cracked_text = "Yes (cached)"
                         else:
                             cracked_text = "Queued"
                             queue_candidate = r
 
-                    active_players = format_player_list(r.get('players_sample'))
+                    active_players = format_player_list(r.get("players_sample"))
                     vals = (
-                        r['ip'],
-                        r['motd'],
+                        r["ip"],
+                        r["motd"],
                         f"{r['players']}/{r['max_players']}",
-                        r['version'],
+                        r["version"],
                         cracked_text,
                         whitelist_text,
-                        active_players
+                        active_players,
                     )
-                    def add_row(ip=r['ip'], v=vals):
-                        iid = self.scan_tree.insert("", "end", values=v)
+
+                    def add_row(ip=r["ip"], v=vals):
+                        row = self.scan_tree.add_row(v)
                         if only_cracked or check_whitelist:
-                            self._register_scan_row(ip, iid)
+                            self._register_scan_row(ip, row)
+
                     self.after(0, add_row)
 
                     if only_cracked and queue_candidate:
                         with pending_lock:
-                            ip = queue_candidate['ip']
+                            ip = queue_candidate["ip"]
                             if ip not in pending_seen:
                                 pending_seen.add(ip)
                                 pending_entries.append(queue_candidate)
                     if check_whitelist:
                         with pending_lock:
-                            ip = r['ip']
+                            ip = r["ip"]
                             if ip not in whitelist_seen:
                                 whitelist_seen.add(ip)
                                 whitelist_entries.append(r)
 
                 def on_progress(done, total):
                     ip = self._current_scan_ip or "…"
-                    self.after(0, lambda d=done, t=total, ip=ip:
-                               self.set_status(f"Currently scanning: {ip} [{d}/{t}]"))
+                    self.after(
+                        0,
+                        lambda d=done, t=total, ip=ip: self.set_status(
+                            f"Currently scanning: {ip} [{d}/{t}]"
+                        ),
+                    )
 
                 results, online_lines = scan_servers_gui(
                     items,
                     on_start=on_start,
                     on_result=on_result,
-                    on_progress=on_progress
+                    on_progress=on_progress,
                 )
-                self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
+                self.after(
+                    0,
+                    lambda: self.set_status(
+                        f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"
+                    ),
+                )
 
                 if only_cracked:
                     with pending_lock:
                         verify_entries = list(pending_entries)
+
                     def handle_update(entry, result, message, was_cached):
                         if current_job != self._cracked_job_id:
                             return
                         ip = entry.get("ip")
+
                         def ui():
                             if was_cached or result is True:
                                 label = "Yes (cached)" if was_cached else "Yes"
                                 self._update_scan_row_cracked(ip, label)
                             else:
                                 self._remove_scan_row(ip)
+
                         self.after(0, ui)
+
                     def handle_progress(done, total):
                         if current_job != self._cracked_job_id:
                             return
                         if done < total:
-                            self.after(0, lambda d=done, t=total:
-                                       self.set_status(f"Verifying cracked servers: {d}/{t}"))
+                            self.after(
+                                0,
+                                lambda d=done, t=total: self.set_status(
+                                    f"Verifying cracked servers: {d}/{t}"
+                                ),
+                            )
                         else:
                             def finish():
-                                remaining = len(self.scan_tree.get_children())
-                                self.set_status(f"Cracked verification complete. Showing {remaining} server(s).")
+                                remaining = self.scan_tree.rowCount()
+                                self.set_status(
+                                    f"Cracked verification complete. Showing {remaining} server(s)."
+                                )
+
                             self.after(0, finish)
-                    run_cracked_verifier_async(verify_entries, handle_update, progress_cb=handle_progress)
+
+                    run_cracked_verifier_async(
+                        verify_entries, handle_update, progress_cb=handle_progress
+                    )
                 if check_whitelist:
                     with pending_lock:
                         verify_whitelist = list(whitelist_entries)
+
                     def handle_whitelist_update(entry, result, message):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         ip = entry.get("ip")
+
                         def ui():
                             label = whitelist_result_label(result, message)
                             self._update_scan_row_whitelist(ip, label)
+
                         self.after(0, ui)
+
                     def handle_whitelist_progress(done, total):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         if done < total:
-                            self.after(0, lambda d=done, t=total:
-                                       self.set_status(f"Checking whitelist: {d}/{t}"))
+                            self.after(
+                                0,
+                                lambda d=done, t=total: self.set_status(
+                                    f"Checking whitelist: {d}/{t}"
+                                ),
+                            )
                         else:
-                            self.after(0, lambda:
-                                       self.set_status(f"Whitelist check complete for {total} server(s)."))
-                    run_whitelist_verifier_async(verify_whitelist, account, handle_whitelist_update, progress_cb=handle_whitelist_progress)
+                            self.after(
+                                0,
+                                lambda: self.set_status(
+                                    f"Whitelist check complete for {total} server(s)."
+                                ),
+                            )
+
+                    run_whitelist_verifier_async(
+                        verify_whitelist,
+                        account,
+                        handle_whitelist_update,
+                        progress_cb=handle_whitelist_progress,
+                    )
                 if self.scan_rows:
-                    self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
+                    self.after(
+                        0,
+                        lambda rows=list(self.scan_rows): self._update_version_filter_choices(
+                            rows
+                        ),
+                    )
             except Exception as e:
                 self.after(0, lambda: self.set_status(f"Scan failed: {e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def scan_selected(self):  
+    def scan_selected(self):
         sel = self._all_selected_ips()
         if not sel:
-            messagebox.showinfo("Info","Select items in the table.")
+            q_info(self, "Info", "Select items in the table.")
             return
         self._scan_and_show(sel)
 
-    def scan_all(self): 
+    def scan_all(self):
         if not self.results:
-            messagebox.showinfo("Info","Run a search first.")
+            q_info(self, "Info", "Run a search first.")
             return
         all_ips = [row[0] for row in self.results]
         self._scan_and_show(all_ips)
@@ -7338,23 +7883,19 @@ class ShodanTab(ttk.Frame):
     def copy_selected(self):
         sel = self._all_selected_ips()
         if not sel:
-            messagebox.showinfo("Info","Select items first.")
+            q_info(self, "Info", "Select items first.")
             return
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(sel))
+        QApplication.clipboard().setText("\n".join(sel))
         self.set_status(f"Copied {len(sel)} IP(s).")
 
-    def export_search_results(self): 
+    def export_search_results(self):
         if not self.results:
-            messagebox.showinfo("Info","No search results to export.")
+            q_info(self, "Info", "No search results to export.")
             return
-        q = self.query_var.get().strip()
+        q = self.query_edit.text().strip()
         base = sanitize_query_for_filename(q if q else "minecraft")
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files","*.txt")],
-            title="Export Shodan Search Results",
-            initialfile=f"{base}.txt"
+        path = q_ask_save(
+            self, "Export Shodan Search Results", f"{base}.txt", "Text files (*.txt)"
         )
         if not path:
             return
@@ -7367,183 +7908,210 @@ class ShodanTab(ttk.Frame):
                 f.write(format_result_line(ip, motd, online, maximum, version) + "\n")
         self.set_status(f"Exported {len(self.results)} rows to {os.path.basename(path)}")
 
-# ---- JSON Search Tab ----
-class JSONTab(ttk.Frame):  
-    def __init__(self, master):
+
+# ===== Qt port section: qt_json (PySide6, 1:1 behavior) =====
+"""PySide6 port of JSONTab (scanner.py lines 7371-8041). 1:1 logic port."""
+import os
+import threading
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+
+class JSONTab(QWidget, QtBaseMixin):
+    def __init__(self, master=None):
         super().__init__(master)
         self._in_ignore = False
         self.json_entries = []
         self.all_rows = []
         self._loaded_json_path = None
         self.scan_rows = []
-        self.version_filter_var = tk.StringVar(value="All versions")
-        self.check_whitelist_var = tk.BooleanVar(value=False)
+        self._version_filter_value = "All versions"
         self._build_ui()
         self._current_scan_ip = None
         self._scan_row_map = {}
         self._cracked_job_id = 0
         self._whitelist_job_id = 0
         self.search_rows = []  # list[tuple(ip,motd,players,version)]
-        default_path = self.file_var.get().strip()
+        default_path = self.file_entry.text().strip()
         if default_path and os.path.exists(default_path):
             self.load_json_file(default_path)
 
+    # -- after unchanged (from QtBaseMixin via QTimer.singleShot) --
+
     def _build_ui(self):
-        # Root grid: content (row 0) + footer (row 1) pinned
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        root = QVBoxLayout(self)
 
-        content = ttk.Frame(self)
-        content.grid(row=0, column=0, sticky="nsew")
+        bar = QHBoxLayout()
+        root.addLayout(bar)
 
-        bar = ttk.Frame(content)
-        bar.pack(fill="x", padx=8, pady=8)
+        self.file_entry = QLineEdit()
+        self.file_entry.setText(DEFAULT_JSONL_FILE)
+        self.file_entry.setMinimumWidth(300)
+        bar.addWidget(self.file_entry)
+        self.import_btn = QPushButton("Import .json")
+        self.import_btn.clicked.connect(self.pick_json)
+        bar.addWidget(self.import_btn)
 
-        self.file_var = tk.StringVar(value=DEFAULT_JSONL_FILE)
-        ttk.Entry(bar, textvariable=self.file_var, width=48).pack(side="left", padx=4)
-        ttk.Button(bar, text="Import .json", command=self.pick_json).pack(side="left", padx=4)
+        self.query_entry = QLineEdit()
+        self.query_entry.setMinimumWidth(300)
+        self.query_entry.returnPressed.connect(self.search)
+        bar.addWidget(self.query_entry)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self.search)
+        bar.addWidget(self.search_btn)
+        self.export_search_btn = QPushButton("Export Search…")
+        self.export_search_btn.clicked.connect(self.export_search_results)
+        bar.addWidget(self.export_search_btn)
+        bar.addWidget(QLabel("Version:"))
+        self.version_filter_combo = QComboBox()
+        self.version_filter_combo.setEditable(True)
+        self.version_filter_combo.addItem("All versions")
+        self.version_filter_combo.setCurrentText("All versions")
+        self.version_filter_combo.currentTextChanged.connect(self._on_version_filter_changed)
+        self.version_filter_combo.editTextChanged.connect(self._on_version_filter_changed)
+        bar.addWidget(self.version_filter_combo)
 
-        self.query_var = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.query_var, width=48).pack(side="left", padx=4)
-        ttk.Button(bar, text="Search", command=self.search).pack(side="left")
-        ttk.Button(bar, text="Export Search…", command=self.export_search_results).pack(side="left", padx=6)
-        ttk.Label(bar, text="Version:").pack(side="left", padx=(12, 4))
-        self.version_filter_combo = ttk.Combobox(
-            bar,
-            textvariable=self.version_filter_var,
-            values=["All versions"],
-            width=18
+        pane = QSplitter()
+        pane.setOrientation(Qt.Vertical)
+        root.addWidget(pane, 1)
+
+        mid = QWidget()
+        mid_layout = QHBoxLayout(mid)
+        mid_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.search_tree = ResultTable(("ip", "motd", "players", "version"), mid)
+        mid_layout.addWidget(self.search_tree, 1)
+        try:
+            _get_icon_manager().attach_to_tree(self.search_tree)
+        except Exception:
+            pass
+
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        self.copy_ip_btn = QPushButton("Copy IP(s)")
+        self.copy_ip_btn.clicked.connect(self.copy_ip)
+        right_layout.addWidget(self.copy_ip_btn)
+        self.add_ignore_btn = QPushButton("Add to Ignore")
+        self.add_ignore_btn.clicked.connect(self.add_ignore)
+        right_layout.addWidget(self.add_ignore_btn)
+        self.add_saved_btn = QPushButton("Add to Saved")
+        self.add_saved_btn.clicked.connect(self.add_saved)
+        right_layout.addWidget(self.add_saved_btn)
+        self.add_monitor_btn = QPushButton("Add to Monitor")
+        self.add_monitor_btn.clicked.connect(self.add_search_selected_to_monitor)
+        right_layout.addWidget(self.add_monitor_btn)
+        self.scan_selected_btn = QPushButton("Scan Selected")
+        self.scan_selected_btn.clicked.connect(self.scan_selected)
+        right_layout.addWidget(self.scan_selected_btn)
+        self.scan_all_btn = QPushButton("Scan All")
+        self.scan_all_btn.clicked.connect(self.scan_all)
+        right_layout.addWidget(self.scan_all_btn)
+        self.only_players_check = QCheckBox("Only players > 0")
+        self.only_players_check.setChecked(True)
+        right_layout.addWidget(self.only_players_check)
+        self.only_cracked_check = QCheckBox("Only cracked servers")
+        self.only_cracked_check.setChecked(False)
+        right_layout.addWidget(self.only_cracked_check)
+        self.check_whitelist_check = QCheckBox("Check whitelist")
+        self.check_whitelist_check.setChecked(False)
+        right_layout.addWidget(self.check_whitelist_check)
+        right_layout.addStretch(1)
+        mid_layout.addWidget(right)
+        pane.addWidget(mid)
+
+        out = QWidget()
+        out_layout = QVBoxLayout(out)
+        out_layout.setContentsMargins(0, 0, 0, 0)
+        out_layout.addWidget(QLabel("Scan Output (select to copy/save/ignore):"))
+        self.scan_tree = ResultTable(
+            ("ip", "motd", "players", "version", "cracked", "whitelist", "active_players"), out
         )
-        self.version_filter_combo.pack(side="left")
-        self.version_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._populate_search_tree(self.search_rows))
-        self.version_filter_combo.bind("<KeyRelease>", lambda _e: self._populate_search_tree(self.search_rows))
+        out_layout.addWidget(self.scan_tree, 1)
+        try:
+            _get_icon_manager().attach_to_tree(self.scan_tree)
+        except Exception:
+            pass
 
-        pane = tk.PanedWindow(content, orient="vertical", sashwidth=8)
-        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        pane.addWidget(out)
+        pane.setSizes([400, 300])
 
-        mid = ttk.Frame(pane)
-        pane.add(mid, minsize=260)
+        footer = QHBoxLayout()
+        root.addLayout(footer)
+        self.copy_scan_btn = QPushButton("Copy IP(s)")
+        self.copy_scan_btn.clicked.connect(self.copy_scan_selected)
+        footer.addWidget(self.copy_scan_btn)
+        self.ignore_scan_btn = QPushButton("Add to Ignore")
+        self.ignore_scan_btn.clicked.connect(self.ignore_scan_selected)
+        footer.addWidget(self.ignore_scan_btn)
+        self.save_scan_btn = QPushButton("Add to Saved")
+        self.save_scan_btn.clicked.connect(self.save_scan_selected)
+        footer.addWidget(self.save_scan_btn)
+        self.monitor_scan_btn = QPushButton("Add to Monitor")
+        self.monitor_scan_btn.clicked.connect(self.add_scan_output_selected_to_monitor)
+        footer.addWidget(self.monitor_scan_btn)
+        self.export_scan_btn = QPushButton("Export Scan…")
+        self.export_scan_btn.clicked.connect(self.export_scan_output)
+        footer.addWidget(self.export_scan_btn)
+        self.check_whitelist_btn = QPushButton("Check Whitelist")
+        self.check_whitelist_btn.clicked.connect(lambda: check_selected_whitelist(self, self.scan_tree))
+        footer.addWidget(self.check_whitelist_btn)
+        self.player_search_entry = QLineEdit()
+        self.player_search_entry.setMaximumWidth(150)
+        self.player_search_entry.returnPressed.connect(self.search_players)
+        footer.addWidget(self.player_search_entry)
+        self.find_player_btn = QPushButton("Find Player")
+        self.find_player_btn.clicked.connect(self.search_players)
+        footer.addWidget(self.find_player_btn)
 
-        # Search results Treeview with same columns
-        cols = ("ip","motd","players","version")
-        self.search_tree = ttk.Treeview(mid, columns=cols, show="headings", height=12, selectmode="extended")
-        for c in cols:
-            self.search_tree.heading(c, text=c.upper())
-            if c == "motd":
-                width = 240
-            elif c == "players":
-                width = 120
-            elif c == "version":
-                width = 120
-            else:
-                width = 170
-            self.search_tree.column(c, width=width, anchor="w")
-        self.search_tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.search_tree.yview)
-        sb.pack(side="left", fill="y")
-        self.search_tree.config(yscrollcommand=sb.set)
-        make_tree_sortable(self.search_tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key
-        })
+        self.status_label = QLabel("Ready.")
+        root.addWidget(self.status_label)
 
-        right = ttk.Frame(mid)
-        right.pack(side="right", fill="y", padx=8)
-        ttk.Button(right, text="Copy IP(s)", command=self.copy_ip).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Ignore", command=self.add_ignore).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Saved", command=self.add_saved).pack(fill="x", pady=2)
-        ttk.Button(right, text="Add to Monitor", command=self.add_search_selected_to_monitor).pack(fill="x", pady=2)
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Button(right, text="Scan Selected", command=self.scan_selected).pack(fill="x", pady=2)
-        ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
-        self.only_players_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(right, text="Only players > 0", variable=self.only_players_var).pack(anchor="w", pady=(8,0))
-        self.only_cracked_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="Only cracked servers", variable=self.only_cracked_var).pack(anchor="w")
-        ttk.Checkbutton(right, text="Check whitelist", variable=self.check_whitelist_var).pack(anchor="w")
+    def set_status(self, msg):
+        self.status_label.setText(msg)
 
-        # Scan output -> Treeview (still inside content)
-        out = ttk.Frame(pane)
-        pane.add(out, minsize=220)
-        ttk.Label(out, text="Scan Output (select to copy/save/ignore):").pack(anchor="w")
-        of = ttk.Frame(out)
-        of.pack(fill="both", expand=True)
+    def _on_version_filter_changed(self, *args):
+        self._populate_search_tree(self.search_rows)
 
-        cols2 = ("ip","motd","players","version","cracked","whitelist","active_players")
-        self.scan_tree = ttk.Treeview(of, columns=cols2, show="headings", height=8, selectmode="extended")
-        for c in cols2:
-            self.scan_tree.heading(c, text=c.upper())
-            if c in ("motd", "active_players"):
-                width = 240
-            elif c == "players":
-                width = 130
-            elif c == "version":
-                width = 130
-            elif c == "whitelist":
-                width = 220
-            elif c == "cracked":
-                width = 90
-            else:
-                width = 170
-            self.scan_tree.column(c, width=width, anchor="w")
-        self.scan_tree.pack(side="left", fill="both", expand=True)
-        osb = ttk.Scrollbar(of, orient="vertical", command=self.scan_tree.yview)
-        osb.pack(side="left", fill="y")
-        self.scan_tree.config(yscrollcommand=osb.set)
-        make_tree_sortable(self.scan_tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key,
-            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1,
-            "whitelist": lambda v: str(v).lower(),
-            "active_players": lambda v: str(v).lower()
-        })
-
-        # ------- Footer (pinned) -------
-        footer = ttk.Frame(self)
-        footer.grid(row=1, column=0, sticky="ew", padx=8, pady=(6,8))
-        footer.grid_columnconfigure(1, weight=1)
-
-        obtns = ttk.Frame(footer)
-        obtns.grid(row=0, column=0, sticky="w")
-        ttk.Button(obtns, text="Copy IP(s)", command=self.copy_scan_selected).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Add to Ignore", command=self.ignore_scan_selected).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Add to Saved", command=self.save_scan_selected).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Add to Monitor", command=self.add_scan_output_selected_to_monitor).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Export Scan…", command=self.export_scan_output).pack(side="left", padx=4)
-        ttk.Button(obtns, text="Check Whitelist", command=lambda: check_selected_whitelist(self, self.scan_tree)).pack(side="left", padx=4)
-        self.player_search_var = tk.StringVar()
-        search_entry = ttk.Entry(obtns, textvariable=self.player_search_var, width=18)
-        search_entry.pack(side="left", padx=(12,4))
-        search_entry.bind("<Return>", lambda _e: self.search_players())
-        ttk.Button(obtns, text="Find Player", command=self.search_players).pack(side="left", padx=4)
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(footer, textvariable=self.status, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12,0))
-
-        # ---------- ICONS: attach (JSON: search & output) ----------
-        _get_icon_manager().attach_to_tree(self.search_tree)
-        _get_icon_manager().attach_to_tree(self.scan_tree)
-
-    def set_status(self,msg):
-        self.status.set(msg)
+    def _version_filter_text(self):
+        return self.version_filter_combo.currentText() or "All versions"
 
     def _update_version_filter_choices(self, rows):
         choices = collect_version_options(rows)
-        current = self.version_filter_var.get() or "All versions"
-        self.version_filter_combo["values"] = choices
-        if current not in choices:
-            current = "All versions"
-        self.version_filter_var.set(current)
+        current = self._version_filter_text() or "All versions"
+        self.version_filter_combo.blockSignals(True)
+        try:
+            self.version_filter_combo.clear()
+            self.version_filter_combo.addItems(choices)
+            if current not in choices:
+                current = "All versions"
+            self.version_filter_combo.setCurrentText(current)
+        finally:
+            self.version_filter_combo.blockSignals(False)
 
     def _populate_search_tree(self, rows):
-        self.search_tree.delete(*self.search_tree.get_children())
+        self.search_tree.clear_rows()
         for ip, motd, players, version in rows:
-            if version_filter_allows(version, self.version_filter_var.get()):
-                self.search_tree.insert("", "end", values=(ip, motd, players, version))
+            if version_filter_allows(version, self._version_filter_text()):
+                self.search_tree.add_row((ip, motd, players, version))
 
     def _load_json_data(self, path):
         entries = load_json_entries(path)
@@ -7555,9 +8123,11 @@ class JSONTab(ttk.Frame):
             return
         self._populate_search_tree([])
         self.set_status("Loading JSON…")
+
         def work():
             try:
                 entries, rows = self._load_json_data(path)
+
                 def update():
                     self.json_entries = entries
                     self.all_rows = rows
@@ -7573,17 +8143,18 @@ class JSONTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def pick_json(self):
-        path = filedialog.askopenfilename(title="Pick JSON Lines", filetypes=[("JSON/JSONL","*.json *.jsonl *.*")])
+        path, _ = QFileDialog.getOpenFileName(self, "Pick JSON Lines", "", "JSON/JSONL (*.json *.jsonl *.*)")
         if path:
-            self.file_var.set(path)
+            self.file_entry.setText(path)
             self.load_json_file(path)
 
     def search(self):
-        file_path = self.file_var.get().strip()
-        query = self.query_var.get().strip()
+        file_path = self.file_entry.text().strip()
+        query = self.query_entry.text().strip()
         status_msg = "Searching..." if query else "Loading data..."
         self.set_status(status_msg)
         self._populate_search_tree([])
+
         def work():
             try:
                 if not self.json_entries or self._loaded_json_path != file_path:
@@ -7607,6 +8178,7 @@ class JSONTab(ttk.Frame):
                         rows.append((ip, motd, players, version))
                         seen.add(ip)
                     result_message = f"{len(rows)} result(s)."
+
                 def update():
                     self.search_rows = list(rows)
                     self.scan_rows = []
@@ -7622,13 +8194,8 @@ class JSONTab(ttk.Frame):
                 self.after(0, lambda: self.set_status(f"Search failed: {e}"))
         threading.Thread(target=work, daemon=True).start()
 
-    def _search_selected_rows(self):  #
-        out = []
-        for iid in self.search_tree.selection():
-            vals = self.search_tree.item(iid, "values")
-            if vals:
-                out.append(vals)
-        return out
+    def _search_selected_rows(self):
+        return [tuple(r) for r in self.search_tree.selected_rows()]
 
     def _search_selected_ips(self):
         return [row[0] for row in self._search_selected_rows() if row]
@@ -7647,10 +8214,9 @@ class JSONTab(ttk.Frame):
     def copy_ip(self):
         ips = self._all_selected_ips()
         if not ips:
-            messagebox.showinfo("Info","Select items first.")
+            QMessageBox.information(self, "Info", "Select items first.")
             return
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(ips))
+        QApplication.clipboard().setText("\n".join(ips))
         self.set_status(f"Copied {len(ips)} IP(s).")
 
     def add_ignore(self):
@@ -7658,7 +8224,7 @@ class JSONTab(ttk.Frame):
             return
         rows = self._search_selected_rows()
         if not rows:
-            messagebox.showinfo("Info","Select items first.")
+            QMessageBox.information(self, "Info", "Select items first.")
             return
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
         if reason is None:
@@ -7668,9 +8234,7 @@ class JSONTab(ttk.Frame):
         try:
             for (ip, *_rest) in rows:
                 add_to_ignore(ip, reason or "")
-            # remove from tree
-            for iid in list(self.search_tree.selection()):
-                self.search_tree.delete(iid)
+            self.search_tree.remove_selected()
             self.set_status(f"Added {len(rows)} to ignore.txt")
         finally:
             self._in_ignore = False
@@ -7678,9 +8242,11 @@ class JSONTab(ttk.Frame):
     def add_saved(self):
         rows = self._search_selected_rows()
         if not rows:
-            messagebox.showinfo("Info","Select items first.")
+            QMessageBox.information(self, "Info", "Select items first.")
             return
-        reason = simpledialog.askstring("Reason","Why save? (optional)")
+        reason, ok = QInputDialog.getText(self, "Reason", "Why save? (optional)")
+        if not ok:
+            reason = ""
         for (ip, *_rest) in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt")
@@ -7688,7 +8254,7 @@ class JSONTab(ttk.Frame):
     def add_search_selected_to_monitor(self):
         ips = self._all_selected_ips()
         if not ips:
-            messagebox.showinfo("Info","Select items first.")
+            QMessageBox.information(self, "Info", "Select items first.")
             return
         added, invalid, duplicates = add_ips_to_monitor_list(ips)
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
@@ -7696,7 +8262,7 @@ class JSONTab(ttk.Frame):
     def add_search_selected_to_monitor(self):
         rows = self._search_selected_rows()
         if not rows:
-            messagebox.showinfo("Info","Select items first.")
+            QMessageBox.information(self, "Info", "Select items first.")
             return
         ips = [row[0] for row in rows]
         added, invalid, duplicates = add_ips_to_monitor_list(ips)
@@ -7704,38 +8270,23 @@ class JSONTab(ttk.Frame):
 
     # ---- JSON scan-output helpers ----
     def _scan_selected_rows(self):
-        out = []
-        for iid in self.scan_tree.selection():
-            vals = self.scan_tree.item(iid, "values")
-            if vals:
-                out.append(vals)
-        return out
+        return [tuple(r) for r in self.scan_tree.selected_rows()]
 
     def search_players(self):
-        query_raw = self.player_search_var.get() or ""
+        query_raw = self.player_search_entry.text() or ""
         query = query_raw.strip().lower()
         if not query:
             self.set_status("Enter a player name to search.")
             return
-        matches = []
-        for iid in self.scan_tree.get_children():
-            vals = self.scan_tree.item(iid, "values")
-            if not vals:
-                continue
-            players_text = vals[-1] if vals else ""
-            if isinstance(players_text, str) and query in players_text.lower():
-                matches.append(iid)
-        current_sel = self.scan_tree.selection()
-        if current_sel:
-            self.scan_tree.selection_remove(current_sel)
+        matches = self.scan_tree.find_rows_containing(len(self.scan_tree._columns) - 1, query)
+        self.scan_tree.clearSelection()
         if matches:
-            self.scan_tree.selection_set(matches)
-            self.scan_tree.focus(matches[0])
-            self.scan_tree.see(matches[0])
+            self.scan_tree.select_rows(matches)
+            self.scan_tree.setCurrentCell(matches[0], 0)
+            self.scan_tree.scrollToItem(self.scan_tree.item(matches[0], 0))
             self.set_status(f"Found {len(matches)} match(es) for '{query_raw.strip()}'.")
         else:
             self.set_status(f"No matches for '{query_raw.strip()}'.")
-
     def _reset_scan_row_map(self):
         self._scan_row_map = {}
 
@@ -7744,33 +8295,48 @@ class JSONTab(ttk.Frame):
 
     def _update_scan_row_cracked(self, ip, text):
         iid = self._scan_row_map.get(ip)
-        if not iid:
+        if iid is None:
             return
-        vals = list(self.scan_tree.item(iid, "values"))
+        vals = list(self.scan_tree.row_values(iid))
         if len(vals) >= 5:
-            vals[4] = text
-            self.scan_tree.item(iid, values=vals)
+            self.scan_tree.set_cell(iid, 4, text)
 
     def _update_scan_row_whitelist(self, ip, text):
         iid = self._scan_row_map.get(ip)
-        if not iid:
+        if iid is None:
             return
-        vals = list(self.scan_tree.item(iid, "values"))
+        vals = list(self.scan_tree.row_values(iid))
         if len(vals) >= 6:
-            vals[5] = text
-            self.scan_tree.item(iid, values=vals)
+            self.scan_tree.set_cell(iid, 5, text)
 
     def _remove_scan_row(self, ip):
         iid = self._scan_row_map.pop(ip, None)
-        if iid:
-            self.scan_tree.delete(iid)
+        if iid is not None:
+            try:
+                self.scan_tree.remove_rows([iid])
+            except Exception:
+                pass
+            # Rebuild map since row indices shifted
+            self._rebuild_scan_row_map()
+
+    def _rebuild_scan_row_map(self):
+        new_map = {}
+        for r in range(self.scan_tree.rowCount()):
+            vals = self.scan_tree.row_values(r)
+            if vals:
+                new_map[vals[0]] = r
+        # Keep only previously tracked IPs
+        self._scan_row_map = {ip: new_map[ip] for ip in list(self._scan_row_map) if ip in new_map}
+        # Also include any rows (harmless superset for updates)
+        for ip, r in new_map.items():
+            if ip not in self._scan_row_map:
+                self._scan_row_map[ip] = r
 
     def _scan_and_show(self, items):
-        for iid in self.scan_tree.get_children():
-            self.scan_tree.delete(iid)
+        self.scan_tree.clear_rows()
         self.set_status("Preparing scan...")
-        only_cracked = self.only_cracked_var.get()
-        check_whitelist = self.check_whitelist_var.get()
+        only_cracked = self.only_cracked_check.isChecked()
+        check_whitelist = self.check_whitelist_check.isChecked()
         # Cracked servers need no account (offline probe, no Mojang auth).
         account = get_active_mc_account() if check_whitelist else None
         self.scan_rows = []
@@ -7791,6 +8357,7 @@ class JSONTab(ttk.Frame):
         def work():
             try:
                 total = len(items)
+
                 def on_start(ip):
                     self._current_scan_ip = ip
                     self.after(0, lambda ip=ip: self.set_status(f"Currently scanning: {ip} [0/{total}]"))
@@ -7808,11 +8375,11 @@ class JSONTab(ttk.Frame):
                         format_player_list(r.get('players_sample'))
                     ))
 
-                    if self.only_players_var.get() and r.get('players', 0) <= 0:
+                    if self.only_players_check.isChecked() and r.get('players', 0) <= 0:
                         return
                     if only_cracked and should_skip_cracked_probe(r):
                         return
-                    if not version_filter_allows(r.get("version", ""), self.version_filter_var.get()):
+                    if not version_filter_allows(r.get("version", ""), self._version_filter_text()):
                         return
 
                     cracked_text = "Yes" if r.get('cracked') else "No"
@@ -7836,8 +8403,9 @@ class JSONTab(ttk.Frame):
                         whitelist_text,
                         active_players
                     )
+
                     def add_row(ip=r['ip'], v=vals):
-                        iid = self.scan_tree.insert("", "end", values=v)
+                        iid = self.scan_tree.add_row(v)
                         if only_cracked or check_whitelist:
                             self._register_scan_row(ip, iid)
                     self.after(0, add_row)
@@ -7867,14 +8435,15 @@ class JSONTab(ttk.Frame):
                     on_progress=on_progress
                 )
                 self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
-
                 if only_cracked:
                     with pending_lock:
                         verify_entries = list(pending_entries)
+
                     def handle_update(entry, result, message, was_cached):
                         if current_job != self._cracked_job_id:
                             return
                         ip = entry.get("ip")
+
                         def ui():
                             if was_cached or result is True:
                                 label = "Yes (cached)" if was_cached else "Yes"
@@ -7882,6 +8451,7 @@ class JSONTab(ttk.Frame):
                             else:
                                 self._remove_scan_row(ip)
                         self.after(0, ui)
+
                     def handle_progress(done, total):
                         if current_job != self._cracked_job_id:
                             return
@@ -7890,21 +8460,24 @@ class JSONTab(ttk.Frame):
                                        self.set_status(f"Verifying cracked servers: {d}/{t}"))
                         else:
                             def finish():
-                                remaining = len(self.scan_tree.get_children())
+                                remaining = self.scan_tree.rowCount()
                                 self.set_status(f"Cracked verification complete. Showing {remaining} server(s).")
                             self.after(0, finish)
                     run_cracked_verifier_async(verify_entries, handle_update, progress_cb=handle_progress)
                 if check_whitelist:
                     with pending_lock:
                         verify_whitelist = list(whitelist_entries)
+
                     def handle_whitelist_update(entry, result, message):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         ip = entry.get("ip")
+
                         def ui():
                             label = whitelist_result_label(result, message)
                             self._update_scan_row_whitelist(ip, label)
                         self.after(0, ui)
+
                     def handle_whitelist_progress(done, total):
                         if whitelist_job != self._whitelist_job_id:
                             return
@@ -7925,13 +8498,13 @@ class JSONTab(ttk.Frame):
     def scan_selected(self):
         ips = self._all_selected_ips()
         if not ips:
-            messagebox.showinfo("Info","Select items first.")
+            QMessageBox.information(self, "Info", "Select items first.")
             return
         self._scan_and_show(ips)
 
     def scan_all(self):
         if not self.search_rows:
-            messagebox.showinfo("Info","Run a search first.")
+            QMessageBox.information(self, "Info", "Run a search first.")
             return
         ips = [row[0] for row in self.search_rows]
         self._scan_and_show(ips)
@@ -7939,17 +8512,16 @@ class JSONTab(ttk.Frame):
     def copy_scan_selected(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            QMessageBox.information(self, "Info", "Select scan output rows.")
             return
         ips = [row[0] for row in rows]
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(ips))
+        QApplication.clipboard().setText("\n".join(ips))
         self.set_status(f"Copied {len(ips)} IP(s) from scan output.")
 
     def ignore_scan_selected(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            QMessageBox.information(self, "Info", "Select scan output rows.")
             return
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
         if reason is None:
@@ -7957,16 +8529,17 @@ class JSONTab(ttk.Frame):
             return
         for (ip, *_rest) in rows:
             add_to_ignore(ip, reason or "")
-        for iid in list(self.scan_tree.selection()):
-            self.scan_tree.delete(iid)
+        self.scan_tree.remove_selected()
         self.set_status(f"Added {len(rows)} to ignore.txt from scan output.")
 
     def save_scan_selected(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            QMessageBox.information(self, "Info", "Select scan output rows.")
             return
-        reason = simpledialog.askstring("Reason", "Why save? (optional)")
+        reason, ok = QInputDialog.getText(self, "Reason", "Why save? (optional)")
+        if not ok:
+            reason = ""
         for (ip, *_rest) in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt from scan output.")
@@ -7974,51 +8547,41 @@ class JSONTab(ttk.Frame):
     def add_scan_output_selected_to_monitor(self):
         rows = self._scan_selected_rows()
         if not rows:
-            messagebox.showinfo("Info", "Select scan output rows.")
+            QMessageBox.information(self, "Info", "Select scan output rows.")
             return
         ips = [row[0] for row in rows]
         added, invalid, duplicates = add_ips_to_monitor_list(ips)
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
-    def export_search_results(self):  #
+    def export_search_results(self):
         if not self.search_rows:
-            messagebox.showinfo("Info","No search results to export.")
+            QMessageBox.information(self, "Info", "No search results to export.")
             return
-        q = self.query_var.get().strip()
+        q = self.query_entry.text().strip()
         base = sanitize_query_for_filename(q if q else "json_search")
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files","*.txt")],
-            title="Export JSON Search Results",
-            initialfile=f"{base}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export JSON Search Results", f"{base}.txt", "Text files (*.txt)"
         )
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
             for (ip, motd, players, version) in self.search_rows:
-                online, maximum = ("N","A")
+                online, maximum = ("N", "A")
                 if "/" in players:
-                    parts = players.split("/",1)
+                    parts = players.split("/", 1)
                     online, maximum = parts[0], parts[1]
                 f.write(format_result_line(ip, motd, online, maximum, version) + "\n")
         self.set_status(f"Exported {len(self.search_rows)} rows to {os.path.basename(path)}")
 
-    def export_scan_output(self):  
-        rows = []
-        for iid in self.scan_tree.get_children():
-            vals = self.scan_tree.item(iid, "values")
-            if vals:
-                rows.append(vals)
+    def export_scan_output(self):
+        rows = self.scan_tree.get_all_rows()
         if not rows:
-            messagebox.showinfo("Info","No scan output to export.")
+            QMessageBox.information(self, "Info", "No scan output to export.")
             return
-        q = self.query_var.get().strip()
+        q = self.query_entry.text().strip()
         base = sanitize_query_for_filename((q if q else "json_search") + "_scan")
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files","*.txt")],
-            title="Export JSON Scan Output",
-            initialfile=f"{base}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export JSON Scan Output", f"{base}.txt", "Text files (*.txt)"
         )
         if not path:
             return
@@ -8031,106 +8594,167 @@ class JSONTab(ttk.Frame):
                 players = row[2] if len(row) > 2 else "N/A"
                 version = row[3] if len(row) > 3 else "N/A"
                 if "/" in str(players):
-                    online, maximum = str(players).split("/",1)
+                    online, maximum = str(players).split("/", 1)
                 else:
-                    online, maximum = "N","A"
+                    online, maximum = "N", "A"
                 f.write(format_result_line(ip, motd, online, maximum, version) + "\n")
         self.set_status(f"Exported {len(rows)} scan rows to {os.path.basename(path)}")
 
-# ---- Export Tab ----
-class ExportTab(ttk.Frame):  #
-    def __init__(self, master):
-        super().__init__(master)
+
+# ===== Qt port section: qt_rest (PySide6, 1:1 behavior) =====
+"""PySide6 port of ExportTab (scanner.py:8041-8094),
+_ReasonFileTab/SavedTab/IgnoreTab (8095-8228), IpLogTab (8229-8321),
+UserLogTab (8322-8482) and FullAppGUI (5696-5734). 1:1 logic, Qt widgets only.
+
+Backend symbols (reference as-is, provided by scanner.py):
+    import_file_to_servers_dat, BACKUP_PATH, SERVERS_DAT_PATH,
+    load_reason_file, save_reason_file, SAVED_FILE, IGNORE_FILE,
+    refresh_ignore_set, is_valid_ip_port, get_ip_only,
+    get_active_mc_account, whitelist_result_label,
+    run_whitelist_verifier_async, load_ips_rows, save_ips_rows,
+    GLOBAL_IP_LOG, sanitize_motd, make_tree_sortable,
+    _ip_key, _players_key, _version_key, USER_LOG_MANAGER
+"""
+
+import os
+import shutil
+import threading
+import time
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+
+
+class ExportTab(QWidget, QtBaseMixin):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self._build_ui()
 
     def _build_ui(self):
-        box = ttk.Frame(self)
-        box.pack(fill="x", padx=8, pady=8)
+        root = QVBoxLayout(self)
 
-        self.file_var = tk.StringVar()
-        ttk.Entry(box, textvariable=self.file_var, width=60).pack(side="left", padx=4)
-        ttk.Button(box, text="Pick .txt", command=self.pick_txt).pack(side="left", padx=4)
+        box = QHBoxLayout()
+        root.addLayout(box)
+        self.file_edit = QLineEdit()
+        box.addWidget(self.file_edit, 1)
+        btn_pick = QPushButton("Pick .txt")
+        btn_pick.clicked.connect(self.pick_txt)
+        box.addWidget(btn_pick)
 
-        self.backup_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(self, text="Backup servers.dat if no backup exists", variable=self.backup_var).pack(anchor="w", padx=8)
+        self.backup_check = QCheckBox("Backup servers.dat if no backup exists")
+        self.backup_check.setChecked(True)
+        root.addWidget(self.backup_check)
 
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=8, pady=8)
-        ttk.Button(btns, text="Export to servers.dat", command=self.do_import).pack(side="left", padx=4)
-        ttk.Button(btns, text="Restore Backup", command=self.restore_backup).pack(side="left", padx=4)
+        btns = QHBoxLayout()
+        root.addLayout(btns)
+        btn_export = QPushButton("Export to servers.dat")
+        btn_export.clicked.connect(self.do_import)
+        btns.addWidget(btn_export)
+        btn_restore = QPushButton("Restore Backup")
+        btn_restore.clicked.connect(self.restore_backup)
+        btns.addWidget(btn_restore)
+        btns.addStretch(1)
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status).pack(fill="x", padx=8, pady=8)
-
-    def set_status(self,msg):
-        self.status.set(msg)
+        self.status_label = QLabel("Ready.")
+        root.addWidget(self.status_label)
+        root.addStretch(1)
 
     def pick_txt(self):
-        path = filedialog.askopenfilename(title="Pick .txt source", filetypes=[("Text files","*.txt")])
+        path = q_ask_open(
+            self,
+            "Pick .txt source",
+            "Text files (*.txt);;All files (*.*)",
+        )
         if path:
-            self.file_var.set(path)
+            self.file_edit.setText(path)
 
     def do_import(self):
-        path = self.file_var.get().strip()
+        path = self.file_edit.text().strip()
         if not path:
-            messagebox.showinfo("Info","Pick a .txt first.")
+            q_info(self, "Info", "Pick a .txt first.")
             return
+
         def work():
-            ok, msg = import_file_to_servers_dat(path, do_backup=self.backup_var.get())
+            ok, msg = import_file_to_servers_dat(path, do_backup=self.backup_check.isChecked())
             self.set_status(msg if ok else f"Failed: {msg}")
+
         threading.Thread(target=work, daemon=True).start()
         self.set_status("Importing...")
 
     def restore_backup(self):
         try:
             if not os.path.exists(BACKUP_PATH):
-                messagebox.showinfo("Info","No backup found.")
+                q_info(self, "Info", "No backup found.")
                 return
             shutil.copyfile(BACKUP_PATH, SERVERS_DAT_PATH)
             self.set_status("Backup restored.")
         except Exception as e:
             self.set_status(f"Restore failed: {e}")
 
+
 # ---- Saved / Ignore (Reason file) Tab ----
-class _ReasonFileTab(ttk.Frame):
-    def __init__(self, master, file_path, tab_name):
-        super().__init__(master)
+class ReasonFileTab(QWidget, QtBaseMixin):
+    def __init__(self, parent=None, file_path="", tab_name=""):
+        super().__init__(parent)
         self.file_path = file_path
         self.tab_name = tab_name
         self.rows = []  # list[(ip, reason)]
+        self._scan_status_label = None
         self._build_ui()
         self._load()
 
     def _build_ui(self):
-        bar = ttk.Frame(self); bar.pack(fill="x", padx=8, pady=8)
-        ttk.Button(bar, text="Add", command=self._add).pack(side="left", padx=2)
-        ttk.Button(bar, text="Edit", command=self._edit).pack(side="left", padx=2)
-        ttk.Button(bar, text="Remove", command=self._remove).pack(side="left", padx=2)
-        ttk.Button(bar, text="Copy IP(s)", command=self._copy).pack(side="left", padx=8)
-        ttk.Button(bar, text="Reload", command=self._load).pack(side="left", padx=8)
-        ttk.Button(bar, text="Save", command=self._save).pack(side="left", padx=2)
-        if self.tab_name == "Ignore":
-            ttk.Button(bar, text="Scan Entire List for Whitelist", command=self._scan_whitelist).pack(side="left", padx=12)
+        root = QVBoxLayout(self)
 
-        mid = ttk.Frame(self); mid.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        bar = QHBoxLayout()
+        root.addLayout(bar)
+        btn_add = QPushButton("Add")
+        btn_add.clicked.connect(self._add)
+        bar.addWidget(btn_add)
+        btn_edit = QPushButton("Edit")
+        btn_edit.clicked.connect(self._edit)
+        bar.addWidget(btn_edit)
+        btn_remove = QPushButton("Remove")
+        btn_remove.clicked.connect(self._remove)
+        bar.addWidget(btn_remove)
+        btn_copy = QPushButton("Copy IP(s)")
+        btn_copy.clicked.connect(self._copy)
+        bar.addWidget(btn_copy)
+        btn_reload = QPushButton("Reload")
+        btn_reload.clicked.connect(self._load)
+        bar.addWidget(btn_reload)
+        btn_save = QPushButton("Save")
+        btn_save.clicked.connect(self._save)
+        bar.addWidget(btn_save)
+        if self.tab_name == "Ignore":
+            btn_scan = QPushButton("Scan Entire List for Whitelist")
+            btn_scan.clicked.connect(self._scan_whitelist)
+            bar.addWidget(btn_scan)
+        bar.addStretch(1)
+
         cols = ("ip", "reason", "whitelist") if self.tab_name == "Ignore" else ("ip", "reason")
         self._columns = cols
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=16, selectmode="extended")
-        for c in cols:
-            self.tree.heading(c, text=c.upper())
-            width = 240 if c == "ip" else (240 if c == "whitelist" else 600)
-            self.tree.column(c, width=width, anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        sb.pack(side="left", fill="y")
-        self.tree.config(yscrollcommand=sb.set)
+        self.tree = ResultTable()
+        self.tree.set_columns(cols)
+        root.addWidget(self.tree, 1)
 
         # enable sorting
         make_tree_sortable(self.tree, {
             "ip": _ip_key,
-            "reason": lambda v: str(v).lower()
+            "reason": lambda v: str(v).lower(),
         })
-
 
     def _load(self):
         self.rows = load_reason_file(self.file_path)
@@ -8151,7 +8775,7 @@ class _ReasonFileTab(ttk.Frame):
         # refresh in-memory ignore set if needed
         if self.file_path == IGNORE_FILE:
             refresh_ignore_set()
-        messagebox.showinfo(self.tab_name, "Saved.")
+        q_info(self, self.tab_name, "Saved.")
 
     def _scan_whitelist(self):
         # Cracked servers need no account; online-mode hits report missing auth.
@@ -8163,8 +8787,8 @@ class _ReasonFileTab(ttk.Frame):
                 entries.append({"ip": values[0]})
                 self.tree.set(iid, "whitelist", "Queued")
         if not entries:
-            self.status = tk.StringVar(value="")
             return
+
         def update(entry, result, message):
             ip = entry.get("ip")
             label = whitelist_result_label(result, message)
@@ -8173,35 +8797,43 @@ class _ReasonFileTab(ttk.Frame):
                 if values and values[0] == ip:
                     self.after(0, lambda i=iid, v=label: self.tree.set(i, "whitelist", v))
                     break
+
         def progress(done, total):
             self.after(0, lambda d=done, t=total: self._set_scan_status(f"Whitelist scan: {d}/{t}"))
+
         self._set_scan_status(f"Whitelist scan queued: {len(entries)} server(s)")
         run_whitelist_verifier_async(entries, account, update, progress_cb=progress)
 
     def _set_scan_status(self, text):
-        if hasattr(self, "_scan_status_label"):
-            self._scan_status_label.configure(text=text)
+        if self._scan_status_label is not None:
+            self._scan_status_label.setText(text)
         else:
-            self._scan_status_label = ttk.Label(self, text=text, anchor="w")
-            self._scan_status_label.pack(fill="x", padx=8, pady=(0, 8))
+            self._scan_status_label = QLabel(text)
+            self.layout().addWidget(self._scan_status_label)
 
     def _selected_iids(self):
         return list(self.tree.selection())
 
     def _add(self):
-        ip = simpledialog.askstring(self.tab_name, "IP:PORT")
-        if not ip or not is_valid_ip_port(ip): return
-        reason = simpledialog.askstring(self.tab_name, "Reason (optional)") or ""
-        self.tree.insert("", "end", values=(get_ip_only(ip), reason))
+        ip = q_ask_string(self, self.tab_name, "IP:PORT")
+        if not ip or not is_valid_ip_port(ip):
+            return
+        reason = q_ask_string(self, self.tab_name, "Reason (optional)") or ""
+        if self.tab_name == "Ignore":
+            self.tree.insert("", "end", values=(get_ip_only(ip), reason, "-"))
+        else:
+            self.tree.insert("", "end", values=(get_ip_only(ip), reason))
 
     def _edit(self):
         iids = self._selected_iids()
-        if not iids: return
+        if not iids:
+            return
         values = self.tree.item(iids[0], "values")
         ip, reason = values[:2]
-        new_ip = simpledialog.askstring(self.tab_name, "IP:PORT", initialvalue=ip) or ip
-        if not is_valid_ip_port(get_ip_only(new_ip)): return
-        new_reason = simpledialog.askstring(self.tab_name, "Reason", initialvalue=reason) or ""
+        new_ip = q_ask_string(self, self.tab_name, "IP:PORT", initial=ip) or ip
+        if not is_valid_ip_port(get_ip_only(new_ip)):
+            return
+        new_reason = q_ask_string(self, self.tab_name, "Reason", initial=reason) or ""
         values = (get_ip_only(new_ip), new_reason, values[2]) if self.tab_name == "Ignore" else (get_ip_only(new_ip), new_reason)
         self.tree.item(iids[0], values=values)
 
@@ -8213,60 +8845,70 @@ class _ReasonFileTab(ttk.Frame):
         ips = []
         for iid in self._selected_iids():
             v = self.tree.item(iid, "values")
-            if v: ips.append(v[0])
-        if not ips: return
-        self.clipboard_clear(); self.clipboard_append("\n".join(ips))
+            if v:
+                ips.append(v[0])
+        if not ips:
+            return
+        QApplication.clipboard().setText("\n".join(ips))
 
-class SavedTab(_ReasonFileTab):
-    def __init__(self, master):
-        super().__init__(master, SAVED_FILE, "Saved")
 
-class IgnoreTab(_ReasonFileTab):
-    def __init__(self, master):
-        super().__init__(master, IGNORE_FILE, "Ignore")
+_ReasonFileTab = ReasonFileTab
+
+
+class SavedTab(ReasonFileTab):
+    def __init__(self, parent=None):
+        super().__init__(parent, SAVED_FILE, "Saved")
+
+
+class IgnoreTab(ReasonFileTab):
+    def __init__(self, parent=None):
+        super().__init__(parent, IGNORE_FILE, "Ignore")
+
 
 # ---- IP Log (ips.txt) Tab ----
-class IpLogTab(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
+class IpLogTab(QWidget, QtBaseMixin):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.rows = []  # list[(ip,motd,players,version)]
         self._build_ui()
         self._load()
 
     def _build_ui(self):
-        bar = ttk.Frame(self); bar.pack(fill="x", padx=8, pady=8)
-        ttk.Button(bar, text="Add", command=self._add).pack(side="left", padx=2)
-        ttk.Button(bar, text="Edit", command=self._edit).pack(side="left", padx=2)
-        ttk.Button(bar, text="Remove", command=self._remove).pack(side="left", padx=2)
-        ttk.Button(bar, text="Copy IP(s)", command=self._copy).pack(side="left", padx=8)
-        ttk.Button(bar, text="Reload", command=self._load).pack(side="left", padx=8)
-        ttk.Button(bar, text="Save", command=self._save).pack(side="left", padx=2)
+        root = QVBoxLayout(self)
 
-        mid = ttk.Frame(self); mid.pack(fill="both", expand=True, padx=8, pady=(0,8))
-        cols = ("ip","motd","players","version")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=16, selectmode="extended")
-        for c in cols:
-            self.tree.heading(c, text=c.upper())
-            if c == "motd":
-                width = 240
-            elif c == "players":
-                width = 120
-            elif c == "version":
-                width = 120
-            else:
-                width = 170
-            self.tree.column(c, width=width, anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        sb.pack(side="left", fill="y")
-        self.tree.config(yscrollcommand=sb.set)
+        bar = QHBoxLayout()
+        root.addLayout(bar)
+        btn_add = QPushButton("Add")
+        btn_add.clicked.connect(self._add)
+        bar.addWidget(btn_add)
+        btn_edit = QPushButton("Edit")
+        btn_edit.clicked.connect(self._edit)
+        bar.addWidget(btn_edit)
+        btn_remove = QPushButton("Remove")
+        btn_remove.clicked.connect(self._remove)
+        bar.addWidget(btn_remove)
+        btn_copy = QPushButton("Copy IP(s)")
+        btn_copy.clicked.connect(self._copy)
+        bar.addWidget(btn_copy)
+        btn_reload = QPushButton("Reload")
+        btn_reload.clicked.connect(self._load)
+        bar.addWidget(btn_reload)
+        btn_save = QPushButton("Save")
+        btn_save.clicked.connect(self._save)
+        bar.addWidget(btn_save)
+        bar.addStretch(1)
+
+        cols = ("ip", "motd", "players", "version")
+        self.tree = ResultTable()
+        self.tree.set_columns(cols)
+        root.addWidget(self.tree, 1)
 
         # enable sorting
         make_tree_sortable(self.tree, {
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
             "players": _players_key,
-            "version": _version_key
+            "version": _version_key,
         })
 
     def _load(self):
@@ -8282,28 +8924,31 @@ class IpLogTab(ttk.Frame):
             if vals and is_valid_ip_port(vals[0]):
                 rows.append(vals)
         save_ips_rows(rows, GLOBAL_IP_LOG)
-        messagebox.showinfo("IP Log", "Saved.")
+        q_info(self, "IP Log", "Saved.")
 
     def _selected_iids(self):
         return list(self.tree.selection())
 
     def _add(self):
-        ip = simpledialog.askstring("IP Log", "IP:PORT")
-        if not ip or not is_valid_ip_port(ip): return
-        motd = simpledialog.askstring("IP Log", "MOTD (optional)") or ""
-        players = simpledialog.askstring("IP Log", "Players (e.g. 0/20 or N/A)", initialvalue="N/A") or "N/A"
-        version = simpledialog.askstring("IP Log", "Version (optional)") or "N/A"
+        ip = q_ask_string(self, "IP Log", "IP:PORT")
+        if not ip or not is_valid_ip_port(ip):
+            return
+        motd = q_ask_string(self, "IP Log", "MOTD (optional)") or ""
+        players = q_ask_string(self, "IP Log", "Players (e.g. 0/20 or N/A)", initial="N/A") or "N/A"
+        version = q_ask_string(self, "IP Log", "Version (optional)") or "N/A"
         self.tree.insert("", "end", values=(get_ip_only(ip), motd, players, version))
 
     def _edit(self):
         iids = self._selected_iids()
-        if not iids: return
+        if not iids:
+            return
         ip, motd, players, version = self.tree.item(iids[0], "values")
-        new_ip = simpledialog.askstring("IP Log", "IP:PORT", initialvalue=ip) or ip
-        if not is_valid_ip_port(get_ip_only(new_ip)): return
-        motd = simpledialog.askstring("IP Log", "MOTD", initialvalue=motd) or ""
-        players = simpledialog.askstring("IP Log", "Players", initialvalue=players) or players
-        version = simpledialog.askstring("IP Log", "Version", initialvalue=version) or version
+        new_ip = q_ask_string(self, "IP Log", "IP:PORT", initial=ip) or ip
+        if not is_valid_ip_port(get_ip_only(new_ip)):
+            return
+        motd = q_ask_string(self, "IP Log", "MOTD", initial=motd) or ""
+        players = q_ask_string(self, "IP Log", "Players", initial=players) or players
+        version = q_ask_string(self, "IP Log", "Version", initial=version) or version
         self.tree.item(iids[0], values=(get_ip_only(new_ip), motd, players, version))
 
     def _remove(self):
@@ -8314,59 +8959,62 @@ class IpLogTab(ttk.Frame):
         ips = []
         for iid in self._selected_iids():
             v = self.tree.item(iid, "values")
-            if v: ips.append(v[0])
-        if not ips: return
-        self.clipboard_clear(); self.clipboard_append("\n".join(ips))
+            if v:
+                ips.append(v[0])
+        if not ips:
+            return
+        QApplication.clipboard().setText("\n".join(ips))
 
 
-class UserLogTab(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
+class UserLogTab(QWidget, QtBaseMixin):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self._manager = None
         self._refresh_pending = False
         self._cached_entries = []
         self._build_ui()
 
     def _build_ui(self):
-        bar = ttk.Frame(self); bar.pack(fill="x", padx=8, pady=8)
-        ttk.Button(bar, text="Copy Player(s)", command=self.copy_players).pack(side="left", padx=2)
-        ttk.Button(bar, text="Copy IP(s)", command=self.copy_ips).pack(side="left", padx=2)
-        ttk.Button(bar, text="Export Log…", command=self.export_log).pack(side="left", padx=8)
-        self.user_search_var = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.user_search_var, width=20).pack(side="left", padx=(4,4))
-        ttk.Button(bar, text="Search Player", command=self.search_player_log).pack(side="left", padx=4)
-        ttk.Button(bar, text="Clear Search", command=self.clear_player_log_search).pack(side="left", padx=4)
+        root = QVBoxLayout(self)
 
-        mid = ttk.Frame(self); mid.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        bar = QHBoxLayout()
+        root.addLayout(bar)
+        btn_copy_players = QPushButton("Copy Player(s)")
+        btn_copy_players.clicked.connect(self.copy_players)
+        bar.addWidget(btn_copy_players)
+        btn_copy_ips = QPushButton("Copy IP(s)")
+        btn_copy_ips.clicked.connect(self.copy_ips)
+        bar.addWidget(btn_copy_ips)
+        btn_export = QPushButton("Export Log…")
+        btn_export.clicked.connect(self.export_log)
+        bar.addWidget(btn_export)
+        self.user_search_edit = QLineEdit()
+        self.user_search_edit.setFixedWidth(160)
+        bar.addWidget(self.user_search_edit)
+        btn_search = QPushButton("Search Player")
+        btn_search.clicked.connect(self.search_player_log)
+        bar.addWidget(btn_search)
+        btn_clear = QPushButton("Clear Search")
+        btn_clear.clicked.connect(self.clear_player_log_search)
+        bar.addWidget(btn_clear)
+        bar.addStretch(1)
+
         cols = ("player", "ip", "motd", "last_seen")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=18, selectmode="extended")
-        for c in cols:
-            self.tree.heading(c, text=c.upper())
-            if c == "motd":
-                width = 360
-            elif c == "ip":
-                width = 170
-            elif c == "last_seen":
-                width = 170
-            else:
-                width = 200
-            self.tree.column(c, width=width, anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        sb.pack(side="left", fill="y")
-        self.tree.config(yscrollcommand=sb.set)
+        self.tree = ResultTable()
+        self.tree.set_columns(cols)
+        root.addWidget(self.tree, 1)
 
         make_tree_sortable(self.tree, {
             "player": lambda v: str(v).lower(),
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
-            "last_seen": lambda v: str(v)
+            "last_seen": lambda v: str(v),
         })
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0,8))
+        self.status_label = QLabel("Ready.")
+        root.addWidget(self.status_label)
 
-    def bind_manager(self, manager: UserLogManager):
+    def bind_manager(self, manager):
         self._manager = manager
 
     def request_refresh(self, initial=False):
@@ -8388,7 +9036,7 @@ class UserLogTab(ttk.Frame):
         entries.sort(key=lambda e: e["last_seen"], reverse=True)
         self._cached_entries = list(entries)
         self._populate_user_tree(entries)
-        self.status.set(f"Tracking {len(entries)} player(s).")
+        self.set_status(f"Tracking {len(entries)} player(s).")
         self._refresh_pending = False
 
     def _populate_user_tree(self, entries):
@@ -8401,12 +9049,12 @@ class UserLogTab(ttk.Frame):
                     entry["player"],
                     entry["ip"],
                     entry["motd"],
-                    self._format_last_seen(entry["last_seen"])
-                )
+                    self._format_last_seen(entry["last_seen"]),
+                ),
             )
 
     def search_player_log(self):
-        query = (self.user_search_var.get() or "").strip().lower()
+        query = (self.user_search_edit.text() or "").strip().lower()
         if not query:
             self.set_status("Enter a player name to search.")
             return
@@ -8415,10 +9063,10 @@ class UserLogTab(ttk.Frame):
             if query in (entry.get("player") or "").lower()
         ]
         self._populate_user_tree(matches)
-        self.set_status(f"{len(matches)} match(es) for '{self.user_search_var.get().strip()}'.")
+        self.set_status(f"{len(matches)} match(es) for '{self.user_search_edit.text().strip()}'.")
 
     def clear_player_log_search(self):
-        self.user_search_var.set("")
+        self.user_search_edit.setText("")
         self._populate_user_tree(self._cached_entries)
         self.set_status(f"Tracking {len(self._cached_entries)} player(s).")
 
@@ -8439,31 +9087,30 @@ class UserLogTab(ttk.Frame):
     def copy_players(self):
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("User Log", "Select one or more rows.")
+            q_info(self, "User Log", "Select one or more rows.")
             return
         players = [row[0] for row in rows]
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(players))
-        self.status.set(f"Copied {len(players)} player(s).")
+        QApplication.clipboard().setText("\n".join(players))
+        self.set_status(f"Copied {len(players)} player(s).")
 
     def copy_ips(self):
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("User Log", "Select one or more rows.")
+            q_info(self, "User Log", "Select one or more rows.")
             return
         ips = [row[1] for row in rows]
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(ips))
-        self.status.set(f"Copied {len(ips)} IP(s).")
+        QApplication.clipboard().setText("\n".join(ips))
+        self.set_status(f"Copied {len(ips)} IP(s).")
 
     def export_log(self):
         if not self._cached_entries:
-            messagebox.showinfo("User Log", "Nothing to export yet.")
+            q_info(self, "User Log", "Nothing to export yet.")
             return
-        path = filedialog.asksaveasfilename(
-            title="Export User Log",
-            defaultextension=".txt",
-            filetypes=[("Text files","*.txt")]
+        path = q_ask_save(
+            self,
+            "Export User Log",
+            "Text files (*.txt);;All files (*.*)",
+            default_suffix=".txt",
         )
         if not path:
             return
@@ -8473,18 +9120,64 @@ class UserLogTab(ttk.Frame):
                     ts = self._format_last_seen(entry["last_seen"])
                     motd = sanitize_motd(entry["motd"])
                     f.write(f"{entry['player']} | {entry['ip']} | Last Seen: {ts} | MOTD: {motd}\n")
-            self.status.set(f"Exported {len(self._cached_entries)} player(s) to {os.path.basename(path)}.")
+            self.set_status(f"Exported {len(self._cached_entries)} player(s) to {os.path.basename(path)}.")
         except Exception as e:
-            self.status.set(f"Export failed: {e}")
-            messagebox.showerror("User Log", f"Export failed: {e}")
+            self.set_status(f"Export failed: {e}")
+            q_error(self, "User Log", f"Export failed: {e}")
 
 
+class FullAppGUI(QMainWindow):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Minecraft Server Scanner — GUI")
+        self.resize(1100, 760)
+        self.create_widgets()
 
+    def create_widgets(self):
+        nb = QTabWidget(self)
+        self.setCentralWidget(nb)
+        self.nb = nb
+
+        # Tabs
+        self.shodan_tab = ShodanTab(nb)
+        self.network_tab = NetworkScanTab(nb)
+        self.json_tab = JSONTab(nb)
+        self.servers_tab = ServersTab(nb)
+        self.import_tab = ExportTab(nb)
+        self.saved_tab = SavedTab(nb)
+        self.ignore_tab = IgnoreTab(nb)
+        self.iplog_tab = IpLogTab(nb)
+        self.user_log_tab = UserLogTab(nb)
+        self.account_tab = AccountTab(nb)
+        self.monitor_tab = ServerMonitorTab(nb)
+        self.proxy_tab = ProxyTab(nb)
+
+        nb.addTab(self.shodan_tab, "Shodan")
+        nb.addTab(self.network_tab, "Network Scan")
+        nb.addTab(self.json_tab, "JSON Search")
+        nb.addTab(self.servers_tab, "Servers")
+        nb.addTab(self.import_tab, "Export To MC")
+        nb.addTab(self.saved_tab, "Saved List")
+        nb.addTab(self.ignore_tab, "Ignore List")
+        nb.addTab(self.iplog_tab, "IP Log")
+        nb.addTab(self.user_log_tab, "User Log")
+        nb.addTab(self.account_tab, "Accounts")
+        nb.addTab(self.proxy_tab, "Proxies")
+        nb.addTab(self.monitor_tab, "Server Monitor")
+
+        USER_LOG_MANAGER.attach_tab(self.user_log_tab)
+
+# ==================== GUI entry ====================
 def main():  #gone but not forgotten
-    pass
+    import sys
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = FullAppGUI()
+    win.show()
+    try:
+        app.exec()
+    except Exception:
+        pass
 
-# ==================== GUI Entry ====================
 
 if __name__ == "__main__":  #
-    app = FullAppGUI()
-    app.mainloop()
+    main()
