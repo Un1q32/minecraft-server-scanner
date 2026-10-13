@@ -11,6 +11,11 @@ cracked_scan.log
 whitelist_scan.log
 mc_accounts.json
 proxies.json
+dist_config.json
+dist_server.db
+dist_server.crt
+dist_server.key
+dist_token.txt
 
 # generic byproducts
 *.log

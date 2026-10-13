@@ -9126,6 +9126,548 @@ class UserLogTab(QWidget, QtBaseMixin):
             q_error(self, "User Log", f"Export failed: {e}")
 
 
+# ==================== DISTRIBUTED SCANNING (multi-network, concurrent jobs) ====================
+
+try:
+    from dist_client import DistAgent, DistError
+    from dist_common import DEFAULT_PORT as DIST_DEFAULT_PORT
+    _DIST_AVAILABLE = True
+    _DIST_IMPORT_ERROR = ""
+except Exception as _dist_import_err:  # pragma: no cover
+    DistAgent = None
+
+    class DistError(Exception):
+        pass
+
+    DIST_DEFAULT_PORT = 8443
+    _DIST_AVAILABLE = False
+    _DIST_IMPORT_ERROR = str(_dist_import_err)
+
+
+class DistTab(QtBaseMixin, QWidget):
+    """Shared-database + multi-client scanning through the control server.
+
+    - Connect to one control server (single port-forward, TLS + token).
+    - Start distributed scans: targets are chunked by the server and worked
+      concurrently by every idle registered client (many networks at once).
+    - Multiple jobs run concurrently; live results stream back per job.
+    - Push local ips.txt finds to / pull the shared server database.
+    - Toggle "Act as worker" to donate this machine to others' scans.
+    Note: distributed chunks use the status handshake only (plus the
+    built-in offline-UUID heuristic). Login-probe whitelist/cracked checks
+    stay local actions.
+    """
+
+    PEER_COLS = ("name", "network", "worker", "load", "seen")
+    JOB_COLS = ("job", "total", "done", "status", "mine")
+    RES_COLS = ("job", "ip", "motd", "players", "version", "cracked")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.agent = None
+        self.jobs = {}          # job_id -> dict(total, done, status, mine)
+        self._job_rows = {}     # job_id -> iid in jobs table
+        self._pending_ips = {}  # ip -> line, flushed to ips.txt periodically
+        self._build_ui()
+
+    # ---------------- UI ----------------
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+
+        # Connection row.
+        conn = QWidget(self)
+        cl = QHBoxLayout(conn)
+        cl.setContentsMargins(8, 8, 8, 4)
+        cl.addWidget(QLabel("Server:", conn))
+        self.host_edit = QLineEdit(conn)
+        self.host_edit.setPlaceholderText("control.example.com")
+        self.host_edit.setMaximumWidth(200)
+        cl.addWidget(self.host_edit)
+        cl.addWidget(QLabel("Port:", conn))
+        self.port_edit = QLineEdit(conn)
+        self.port_edit.setMaximumWidth(70)
+        self.port_edit.setText(str(DIST_DEFAULT_PORT))
+        cl.addWidget(self.port_edit)
+        self.tls_check = QCheckBox("TLS", conn)
+        self.tls_check.setChecked(True)
+        cl.addWidget(self.tls_check)
+        cl.addWidget(QLabel("Token:", conn))
+        self.token_edit = QLineEdit(conn)
+        self.token_edit.setEchoMode(QLineEdit.Password)
+        self.token_edit.setMinimumWidth(140)
+        cl.addWidget(self.token_edit, 1)
+        cl.addWidget(QLabel("Name:", conn))
+        self.name_edit = QLineEdit(conn)
+        self.name_edit.setMaximumWidth(130)
+        cl.addWidget(self.name_edit)
+        cl.addWidget(QLabel("Network:", conn))
+        self.net_edit = QLineEdit(conn)
+        self.net_edit.setPlaceholderText("home / vps-eu / ...")
+        self.net_edit.setMaximumWidth(110)
+        cl.addWidget(self.net_edit)
+        self.connect_btn = QPushButton("Connect", conn)
+        self.connect_btn.clicked.connect(self.connect)
+        cl.addWidget(self.connect_btn)
+        self.disconnect_btn = QPushButton("Disconnect", conn)
+        self.disconnect_btn.clicked.connect(self.disconnect)
+        cl.addWidget(self.disconnect_btn)
+        root.addWidget(conn)
+
+        # Worker row.
+        work = QWidget(self)
+        wl = QHBoxLayout(work)
+        wl.setContentsMargins(8, 0, 8, 4)
+        self.worker_check = QCheckBox("Act as worker (scan chunks for others)", work)
+        self.worker_check.setChecked(True)
+        wl.addWidget(self.worker_check)
+        wl.addWidget(QLabel("Chunk slots:", work))
+        self.slots_spin = QSpinBox(work)
+        self.slots_spin.setRange(1, 32)
+        self.slots_spin.setValue(2)
+        wl.addWidget(self.slots_spin)
+        self.apply_worker_btn = QPushButton("Apply", work)
+        self.apply_worker_btn.clicked.connect(self.apply_worker)
+        wl.addWidget(self.apply_worker_btn)
+        self.db_stats_label = QLabel("shared DB: n/a", work)
+        wl.addWidget(self.db_stats_label, 1)
+        self.push_btn = QPushButton("Push ips.txt", work)
+        self.push_btn.clicked.connect(self.db_push_local)
+        wl.addWidget(self.push_btn)
+        self.pull_btn = QPushButton("Pull shared DB", work)
+        self.pull_btn.clicked.connect(self.db_pull_shared)
+        wl.addWidget(self.pull_btn)
+        root.addWidget(work)
+
+        # Peers + jobs side by side.
+        mid = QWidget(self)
+        ml = QHBoxLayout(mid)
+        ml.setContentsMargins(8, 0, 8, 4)
+        left = QWidget(mid)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 4, 0)
+        peer_bar = QWidget(left)
+        pl = QHBoxLayout(peer_bar)
+        pl.setContentsMargins(0, 0, 0, 4)
+        pl.addWidget(QLabel("Registered clients:", peer_bar))
+        self.peers_refresh_btn = QPushButton("Refresh", peer_bar)
+        self.peers_refresh_btn.clicked.connect(self.refresh_peers)
+        pl.addWidget(self.peers_refresh_btn)
+        pl.addStretch(1)
+        ll.addWidget(peer_bar)
+        self.peers_table = ResultTable(left)
+        self.peers_table.set_columns(self.PEER_COLS)
+        ll.addWidget(self.peers_table, 1)
+        ml.addWidget(left, 1)
+
+        right = QWidget(mid)
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 0, 0, 0)
+        rl.addWidget(QLabel("Scan targets (same syntax as Network Scan):", right))
+        self.targets_text = QPlainTextEdit(right)
+        self.targets_text.setMaximumHeight(70)
+        rl.addWidget(self.targets_text)
+        opts = QWidget(right)
+        ol = QHBoxLayout(opts)
+        ol.setContentsMargins(0, 4, 0, 4)
+        ol.addWidget(QLabel("Ports:", opts))
+        self.ports_edit = QLineEdit(opts)
+        self.ports_edit.setText(NETWORK_SCAN_DEFAULT_PORTS)
+        self.ports_edit.setMaximumWidth(120)
+        ol.addWidget(self.ports_edit)
+        ol.addWidget(QLabel("Max hosts:", opts))
+        self.max_hosts_edit = QLineEdit(opts)
+        self.max_hosts_edit.setText(str(NETWORK_SCAN_MAX_HOSTS))
+        self.max_hosts_edit.setMaximumWidth(80)
+        ol.addWidget(self.max_hosts_edit)
+        ol.addWidget(QLabel("Chunk:", opts))
+        self.chunk_spin = QSpinBox(opts)
+        self.chunk_spin.setRange(16, 5000)
+        self.chunk_spin.setValue(256)
+        ol.addWidget(self.chunk_spin)
+        self.start_btn = QPushButton("Start distributed scan", opts)
+        self.start_btn.clicked.connect(self.start_dist_scan)
+        ol.addWidget(self.start_btn)
+        self.cancel_btn = QPushButton("Cancel job", opts)
+        self.cancel_btn.clicked.connect(self.cancel_selected_job)
+        ol.addWidget(self.cancel_btn)
+        ol.addStretch(1)
+        rl.addWidget(opts)
+        rl.addWidget(QLabel("Jobs (concurrent):", right))
+        self.jobs_table = ResultTable(right)
+        self.jobs_table.set_columns(self.JOB_COLS)
+        rl.addWidget(self.jobs_table, 1)
+        ml.addWidget(right, 2)
+        root.addWidget(mid, 1)
+
+        # Results.
+        root.addWidget(QLabel("Distributed results (all jobs):", self))
+        self.results_table = ResultTable(self)
+        self.results_table.set_columns(self.RES_COLS)
+        root.addWidget(self.results_table, 2)
+
+        self.status_label = QLabel("Not connected.", self)
+        root.addWidget(self.status_label)
+
+        if _DIST_AVAILABLE:
+            try:
+                from dist_common import load_config as _load_cfg
+                cfg = _load_cfg()
+                self.host_edit.setText(str(cfg.get("server_host") or ""))
+                self.port_edit.setText(str(cfg.get("server_port") or DIST_DEFAULT_PORT))
+                self.tls_check.setChecked(bool(cfg.get("use_tls", True)))
+                self.token_edit.setText(str(cfg.get("token") or ""))
+                self.name_edit.setText(str(cfg.get("client_name") or ""))
+                self.net_edit.setText(str(cfg.get("network_label") or ""))
+                self.worker_check.setChecked(bool(cfg.get("worker_enabled", True)))
+                self.slots_spin.setValue(int(cfg.get("worker_slots", 2) or 2))
+                self.chunk_spin.setValue(int(cfg.get("chunk_size", 256) or 256))
+            except Exception:
+                pass
+        else:
+            self.set_status(f"dist modules unavailable: {_DIST_IMPORT_ERROR}")
+            self.start_btn.setEnabled(False)
+            self.connect_btn.setEnabled(False)
+
+    # ---------------- agent plumbing ----------------
+
+    def _ensure_agent(self):
+        if self.agent is None:
+            if not _DIST_AVAILABLE:
+                raise DistError(f"dist modules unavailable: {_DIST_IMPORT_ERROR}")
+            self.agent = DistAgent(ping_fn=ping_server)
+            self.agent.on_status = lambda c, m: self.after(0, lambda: self._on_status(c, m))
+            self.agent.on_peers = lambda peers: self.after(0, lambda: self._on_peers(peers))
+            self.agent.on_jobs = lambda jobs: self.after(0, lambda: self._on_jobs(jobs))
+            self.agent.on_job_result = (
+                lambda jid, seq, res: self.after(0, lambda: self._on_job_result(jid, seq, res)))
+            self.agent.on_job_update = (
+                lambda jid, prog: self.after(0, lambda: self._on_job_update(jid, prog)))
+        return self.agent
+
+    def _save_ui_to_config(self):
+        try:
+            agent = self._ensure_agent()
+        except DistError:
+            return
+        try:
+            port = int(self.port_edit.text().strip() or DIST_DEFAULT_PORT)
+        except ValueError:
+            port = DIST_DEFAULT_PORT
+        agent.update_config(
+            server_host=self.host_edit.text().strip() or "127.0.0.1",
+            server_port=port,
+            use_tls=self.tls_check.isChecked(),
+            token=self.token_edit.text().strip(),
+            client_name=self.name_edit.text().strip(),
+            network_label=self.net_edit.text().strip(),
+            worker_enabled=self.worker_check.isChecked(),
+            worker_slots=self.slots_spin.value(),
+            chunk_size=self.chunk_spin.value(),
+        )
+
+    def connect(self):
+        try:
+            self._save_ui_to_config()
+            agent = self._ensure_agent()
+        except DistError as exc:
+            self.set_status(f"Connect failed: {exc}")
+            return
+        self.set_status("Connecting...")
+        threading.Thread(target=self._connect_work, daemon=True).start()
+
+    def _connect_work(self):
+        try:
+            self.agent.connect()
+            self.after(0, self.refresh_peers)
+            self.after(0, self._refresh_db_stats)
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Connect failed: {e}"))
+
+    def disconnect(self):
+        try:
+            if self.agent is not None:
+                self.agent.disconnect()
+        except Exception:
+            pass
+        self.set_status("Disconnected.")
+
+    def apply_worker(self):
+        try:
+            self._save_ui_to_config()
+            agent = self._ensure_agent()
+        except DistError as exc:
+            self.set_status(f"Worker update failed: {exc}")
+            return
+        if agent.connected:
+            threading.Thread(target=self._apply_worker_work, daemon=True).start()
+        else:
+            self.set_status("Worker settings saved (connect to apply live).")
+
+    def _apply_worker_work(self):
+        try:
+            self.agent.set_worker(self.worker_check.isChecked(), self.slots_spin.value())
+            self.after(0, lambda: self.set_status("Worker settings applied."))
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Worker update failed: {e}"))
+
+    # ---------------- incoming events (GUI thread) ----------------
+
+    def _on_status(self, connected, message):
+        self.set_status(message)
+        try:
+            self.connect_btn.setEnabled(not connected)
+        except Exception:
+            pass
+
+    def _on_peers(self, peers):
+        try:
+            self.peers_table.delete(*self.peers_table.get_children(""))
+            for p in peers or []:
+                busy = p.get("busy", 0)
+                slots = p.get("slots", 1) or 1
+                try:
+                    seen = time.strftime("%H:%M:%S", time.localtime(float(p.get("last_seen", 0))))
+                except Exception:
+                    seen = "-"
+                mark = " (you)" if p.get("self") else ""
+                self.peers_table.insert("", "end", values=(
+                    str(p.get("name", "")) + mark,
+                    str(p.get("network", "") or "-"),
+                    "yes" if p.get("worker") else "no",
+                    f"{busy}/{slots}",
+                    seen,
+                ))
+        except Exception:
+            pass
+
+    def _on_jobs(self, jobs):
+        try:
+            for j in jobs or []:
+                self._track_job(j.get("job_id"), j, mine=bool(j.get("mine")))
+        except Exception:
+            pass
+
+    def _track_job(self, job_id, progress, mine=True):
+        if not job_id:
+            return
+        info = self.jobs.get(job_id) or {}
+        info.update({
+            "total": progress.get("total", info.get("total", 0)),
+            "done": progress.get("done", info.get("done", 0)),
+            "status": progress.get("status", info.get("status", "active")),
+            "mine": mine if "mine" not in info else info["mine"],
+        })
+        if "mine" not in self.jobs.get(job_id, {}):
+            info["mine"] = mine
+        self.jobs[job_id] = info
+        try:
+            iid = self._job_rows.get(job_id)
+            vals = (job_id[:8], str(info["total"]), str(info["done"]),
+                    str(info["status"]), "yes" if info["mine"] else "no")
+            if iid:
+                self.jobs_table.item(iid, values=vals)
+            else:
+                self._job_rows[job_id] = self.jobs_table.insert("", "end", values=vals)
+        except Exception:
+            pass
+
+    def _on_job_update(self, job_id, progress):
+        self._track_job(job_id, progress or {})
+        try:
+            if self._pending_ips:
+                pending, self._pending_ips = self._pending_ips, {}
+                merge_global_ip_log(pending)
+        except Exception:
+            pass
+
+    def _on_job_result(self, job_id, seq, result):
+        if not isinstance(result, dict) or not result.get("ip"):
+            return
+        try:
+            USER_LOG_MANAGER.update_from_result(result)
+        except Exception:
+            pass
+        try:
+            line = (f"{result.get('ip')} | MOTD: {result.get('motd', '')} | Players: "
+                    f"{result.get('players', 0)}/{result.get('max_players', 0)} | "
+                    f"Version: {result.get('version', '')}")
+            self._pending_ips[result["ip"]] = line
+        except Exception:
+            pass
+        try:
+            self.results_table.insert("", "end", values=(
+                str(job_id or "")[:8],
+                str(result.get("ip", "")),
+                sanitize_motd(result.get("motd", "")),
+                f"{result.get('players', 0)}/{result.get('max_players', 0)}",
+                sanitize_motd(result.get("version", "")),
+                "Yes" if result.get("cracked") else "No",
+            ))
+        except Exception:
+            pass
+
+    # ---------------- actions ----------------
+
+    def refresh_peers(self):
+        if self.agent is None or not self.agent.connected:
+            self.set_status("Not connected.")
+            return
+        threading.Thread(target=self._refresh_peers_work, daemon=True).start()
+
+    def _refresh_peers_work(self):
+        try:
+            peers = self.agent.list_peers()
+            self.after(0, lambda: self._on_peers(peers))
+            jobs = self.agent.list_jobs()
+            self.after(0, lambda: self._on_jobs(jobs))
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Refresh failed: {e}"))
+
+    def start_dist_scan(self):
+        if self.agent is None or not self.agent.connected:
+            q_info(self, "Distributed", "Connect to the control server first.")
+            return
+        targets_raw = self.targets_text.toPlainText()
+        if not targets_raw.strip():
+            q_info(self, "Distributed", "Enter scan targets first.")
+            return
+        try:
+            ports = parse_ports(self.ports_edit.text())
+        except Exception:
+            ports = parse_ports(NETWORK_SCAN_DEFAULT_PORTS)
+        try:
+            max_hosts = max(1, int(self.max_hosts_edit.text().strip() or NETWORK_SCAN_MAX_HOSTS))
+        except ValueError:
+            max_hosts = NETWORK_SCAN_MAX_HOSTS
+        chunk_size = self.chunk_spin.value()
+        self._save_ui_to_config()
+        self.set_status("Expanding targets...")
+        threading.Thread(
+            target=self._start_scan_work,
+            args=(targets_raw, ports, max_hosts, chunk_size),
+            daemon=True,
+        ).start()
+
+    def _start_scan_work(self, targets_raw, ports, max_hosts, chunk_size):
+        try:
+            targets = expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Target expansion failed: {e}"))
+            return
+        if not targets:
+            self.after(0, lambda: self.set_status("No valid targets to scan."))
+            return
+        try:
+            info = self.agent.submit_job(targets, options={}, chunk_size=chunk_size)
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Job submit failed: {e}"))
+            return
+        job_id = info.get("job_id")
+        self.after(0, lambda: self._track_job(
+            job_id, {"total": info.get("total", 0), "done": 0, "status": "active"}, mine=True))
+        self.after(0, lambda: self.set_status(
+            f"Job {str(job_id)[:8]}: {info.get('total', 0)} targets in "
+            f"{info.get('chunks', 0)} chunks (workers pick them up live)."))
+
+    def cancel_selected_job(self):
+        sel = []
+        try:
+            for iid in self.jobs_table.selection():
+                vals = self.jobs_table.item(iid, "values")
+                if vals:
+                    sel.append(vals[0])
+        except Exception:
+            pass
+        if not sel:
+            q_info(self, "Distributed", "Select a job first.")
+            return
+        prefix = sel[0]
+        job_id = next((jid for jid in self.jobs if jid.startswith(prefix)), None)
+        if job_id is None:
+            return
+        threading.Thread(target=self._cancel_work, args=(job_id,), daemon=True).start()
+
+    def _cancel_work(self, job_id):
+        try:
+            self.agent.cancel_job(job_id)
+            self.after(0, lambda: self._track_job(job_id, {"status": "canceled"}))
+            self.after(0, lambda: self.set_status(f"Job {job_id[:8]} canceled."))
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Cancel failed: {e}"))
+
+    def db_push_local(self):
+        if self.agent is None or not self.agent.connected:
+            q_info(self, "Distributed", "Connect to the control server first.")
+            return
+        threading.Thread(target=self._push_work, daemon=True).start()
+
+    def _push_work(self):
+        try:
+            rows = []
+            if os.path.exists(GLOBAL_IP_LOG):
+                with open(GLOBAL_IP_LOG, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        ip, motd, players, version = parse_formatted_line(line)
+                        if not is_valid_ip_port(get_ip_only(ip)):
+                            continue
+                        online, maxp = 0, 0
+                        try:
+                            parts = str(players).split("/", 1)
+                            online, maxp = int(parts[0]), int(parts[1])
+                        except Exception:
+                            pass
+                        rows.append({"ip": get_ip_only(ip), "motd": motd,
+                                     "version": version, "players": online,
+                                     "max_players": maxp, "cracked": False})
+            res = self.agent.db_push(rows)
+            self.after(0, lambda: self.set_status(
+                f"Pushed {res.get('queued', 0)} servers to shared DB."))
+            self.after(0, self._refresh_db_stats)
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Push failed: {e}"))
+
+    def db_pull_shared(self):
+        if self.agent is None or not self.agent.connected:
+            q_info(self, "Distributed", "Connect to the control server first.")
+            return
+        threading.Thread(target=self._pull_work, daemon=True).start()
+
+    def _pull_work(self):
+        try:
+            rows = self.agent.db_pull(since=0, limit=20000)
+            merged = {}
+            for r in rows:
+                ip = r.get("ip", "")
+                if not is_valid_ip_port(get_ip_only(ip)) or is_ignored(ip):
+                    continue
+                merged[ip] = format_result_line(
+                    ip, r.get("motd", ""), r.get("players", 0),
+                    r.get("max_players", 0), r.get("version", ""))
+            merge_global_ip_log(merged)
+            self.after(0, lambda: self.set_status(
+                f"Pulled {len(merged)} servers from shared DB into ips.txt."))
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self.set_status(f"Pull failed: {e}"))
+
+    def _refresh_db_stats(self):
+        if self.agent is None or not self.agent.connected:
+            return
+        threading.Thread(target=self._stats_work, daemon=True).start()
+
+    def _stats_work(self):
+        try:
+            s = self.agent.db_stats()
+            self.after(0, lambda: self.db_stats_label.setText(
+                f"shared DB: {s.get('servers', 0)} servers / "
+                f"{s.get('players_online', 0)} players online"))
+        except Exception:
+            pass
+
+
 class FullAppGUI(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -9151,6 +9693,7 @@ class FullAppGUI(QMainWindow):
         self.account_tab = AccountTab(nb)
         self.monitor_tab = ServerMonitorTab(nb)
         self.proxy_tab = ProxyTab(nb)
+        self.dist_tab = DistTab(nb)
 
         nb.addTab(self.shodan_tab, "Shodan")
         nb.addTab(self.network_tab, "Network Scan")
@@ -9164,6 +9707,7 @@ class FullAppGUI(QMainWindow):
         nb.addTab(self.account_tab, "Accounts")
         nb.addTab(self.proxy_tab, "Proxies")
         nb.addTab(self.monitor_tab, "Server Monitor")
+        nb.addTab(self.dist_tab, "Distributed")
 
         USER_LOG_MANAGER.attach_tab(self.user_log_tab)
 

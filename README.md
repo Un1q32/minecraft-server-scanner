@@ -96,6 +96,34 @@ Network Scan results remain in the scan result table unless they are explicitly 
 - Records online status, MOTD, version, player counts, and player names.
 - Stores monitor state in server_monitor_log.json.
 
+### Distributed scanning (multi-network, concurrent jobs, shared database)
+
+Many clients on different networks can scan together through one control
+server that is also the shared database:
+
+- One service, one port: `python dist_server.py --port 8443 --token <secret>`
+  (first run generates a token, a self-signed TLS certificate, and
+  `dist_server.db`). Forward that single TCP port on your router/firewall —
+  no reverse proxy, domain, or CA setup needed.
+- Security: TLS with certificate pinning (clients trust-on-first-use the
+  printed fingerprint, then refuse changed certs), bearer-token auth on every
+  connection, optional `--allow 203.0.113.0/24` IP allowlisting. Plaintext
+  `--no-tls` mode exists only for trusted-LAN testing.
+- Speed: persistent connections, batched result streaming, and a single-writer
+  SQLite database in WAL mode (thousands of results/sec, zero DB admin).
+- In the app, open the Distributed tab, enter host/port/token, and Connect.
+  Any client can start a distributed scan: targets expand locally, the server
+  splits them into chunks, and every idle registered client with "Act as
+  worker" enabled scans chunks concurrently from its own network — results
+  stream back live per job, and multiple jobs from multiple people run at the
+  same time with fair round-robin chunk assignment. Dead workers are detected
+  by heartbeat/lease timeouts and their chunks are requeued automatically.
+- Shared DB: "Push ips.txt" uploads local finds; "Pull shared DB" merges
+  everyone's finds into ips.txt; the stats label shows global totals.
+- Distributed chunks use the status handshake only (including the built-in
+  offline-UUID cracked heuristic). Login-probe whitelist/cracked checks stay
+  local actions, and masscan stays a local Network Scan backend.
+
 ### Minecraft server-list export
 
 - Imports a text server list into %APPDATA%\.minecraft\servers.dat.
@@ -116,6 +144,7 @@ Network Scan results remain in the scan result table unless they are explicitly 
 - Ignore: manages ignored servers and scans the complete list for whitelist status.
 - IP Log: manages the global ips.txt server log.
 - Player Log: searches and exports discovered player records.
+- Distributed: multi-network concurrent scans plus the shared server database.
 
 ## Requirements
 
