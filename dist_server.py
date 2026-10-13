@@ -55,6 +55,7 @@ from dist_common import (
     new_token,
     normalize_result_for_wire,
     piece_target_count,
+    range_host_count,
     spec_excludes,
     spec_host_count,
     split_spec,
@@ -206,15 +207,19 @@ class Database:
 # ==================== jobs & clients ====================
 
 class Chunk:
-    __slots__ = ("chunk_id", "kind", "targets", "subnet", "ports", "exclude",
+    __slots__ = ("chunk_id", "kind", "targets", "subnet", "range", "ports", "exclude",
                  "state", "worker", "lease_expires", "done_count")
 
-    def __init__(self, chunk_id, kind="list", targets=None, subnet="", ports=None,
-                 exclude=None):
+    def __init__(self, chunk_id, kind="list", targets=None, subnet="", range="",
+                 ports=None, exclude=None):
         self.chunk_id = chunk_id
-        self.kind = kind  # "list" (explicit ip:port targets) | "spec" (subnet+ports)
+        # "list" (explicit ip:port targets) | "spec" (subnet+ports) |
+        # "range" (start-end+ports). One typed block is always exactly one
+        # chunk and runs on exactly one worker — never subdivided.
+        self.kind = kind
         self.targets = targets or []
         self.subnet = subnet or ""
+        self.range = range or ""
         self.ports = list(ports or [])
         self.exclude = list(exclude or [])
         self.state = "pending"  # pending | leased | done
@@ -225,6 +230,8 @@ class Chunk:
     def size(self):
         if self.kind == "spec":
             return piece_target_count(self.subnet, self.exclude, len(self.ports))
+        if self.kind == "range":
+            return range_host_count(self.range) * max(1, len(self.ports))
         return len(self.targets)
 
 
@@ -404,7 +411,8 @@ class DistServer:
             msg = {"type": "assign", "job_id": job.job_id,
                    "chunk_id": chunk.chunk_id, "kind": chunk.kind,
                    "targets": chunk.targets if chunk.kind == "list" else [],
-                   "subnet": chunk.subnet, "ports": chunk.ports,
+                   "subnet": chunk.subnet, "range": chunk.range,
+                   "ports": chunk.ports,
                    "exclude": chunk.exclude,
                    "options": {k: v for k, v in (job.options or {}).items()
                                if k != "ignore"}}
@@ -664,27 +672,49 @@ class DistServer:
                 for spec in specs[:SPEC_UPLOAD_BATCH * 2]:
                     if not isinstance(spec, dict):
                         continue
-                    subnet = str(spec.get("subnet") or "").strip()
                     try:
                         ports = sorted({int(p) for p in (spec.get("ports") or [])
                                         if 1 <= int(p) <= 65535})
                     except Exception:
                         continue
-                    if not subnet or not ports or len(ports) > 64:
+                    if not ports or len(ports) > 64:
                         continue
                     import ipaddress as _ip
-                    try:
-                        net = _ip.ip_network(subnet, strict=False)
-                        if net.version != 4:
+                    entry = None
+                    if spec.get("subnet"):
+                        subnet = str(spec.get("subnet") or "").strip()
+                        try:
+                            net = _ip.ip_network(subnet, strict=False)
+                            if net.version != 4:
+                                continue
+                            subnet = str(net)
+                        except Exception:
                             continue
-                        subnet = str(net)
-                    except Exception:
+                        key = ("s", subnet, tuple(ports))
+                        if key in job.seen:
+                            continue
+                        job.seen.add(key)
+                        entry = {"subnet": subnet, "ports": ports}
+                    elif spec.get("range"):
+                        rng = str(spec.get("range") or "").strip()
+                        try:
+                            left, right = rng.split("-", 1)
+                            start = _ip.ip_address(left.strip())
+                            end = _ip.ip_address(right.strip())
+                            if start.version != 4 or end.version != 4 \
+                                    or int(end) < int(start):
+                                continue
+                            rng = f"{start}-{end}"
+                        except Exception:
+                            continue
+                        key = ("r", rng, tuple(ports))
+                        if key in job.seen:
+                            continue
+                        job.seen.add(key)
+                        entry = {"range": rng, "ports": ports}
+                    else:
                         continue
-                    key = (subnet, tuple(ports))
-                    if key in job.seen:
-                        continue
-                    job.seen.add(key)
-                    job.spec_list.append({"subnet": subnet, "ports": ports})
+                    job.spec_list.append(entry)
                     added += 1
                 nspecs = len(job.spec_list)
             self._reply(client.conn, msg_id, True,
@@ -703,53 +733,46 @@ class DistServer:
                 if job.status != "loading":
                     self._reply(client.conn, msg_id, False, error="job already committed")
                     return
-                try:
-                    hosts_per_chunk = max(64, min(int(getattr(
-                        job, "chunk_hosts", DEFAULT_SPEC_HOSTS)), 65536))
-                except Exception:
-                    hosts_per_chunk = DEFAULT_SPEC_HOSTS
-                # Legacy explicit targets: fixed-size list chunks.
+                # One typed block = exactly one chunk on exactly one worker.
+                # Blocks are never subdivided; the worker enumerates its block
+                # locally in bounded batches.
                 list_chunks = split_targets(
                     job.target_list, getattr(job, "list_chunk", DEFAULT_CHUNK_SIZE))
-                # Prefix specs: split into sub-prefix chunks. Auto-coarsen if
-                # the scan is so big the chunk count would explode.
-                spec_pieces = []  # [(subnet, ports, exclude)]
+                blocks = list(job.spec_list)
+                if len(list_chunks) + len(blocks) > MAX_CHUNKS_PER_JOB:
+                    self._reply(client.conn, msg_id, False, error=(
+                        f"too many blocks ({len(list_chunks) + len(blocks)} > "
+                        f"{MAX_CHUNKS_PER_JOB}); use bigger CIDRs, not pasted lists"))
+                    try:
+                        del self.jobs[job.job_id]
+                    except KeyError:
+                        pass
+                    return
                 spec_total = 0
-                for spec in job.spec_list:
-                    excl = spec_excludes(spec["subnet"])
-                    for sub in split_spec(spec["subnet"], hosts_per_chunk):
-                        n = piece_target_count(sub, excl, len(spec["ports"]))
-                        spec_total += n
-                        if spec_total > MAX_SPEC_TARGETS:
-                            break
-                        spec_pieces.append((sub, spec["ports"], excl))
+                for spec in blocks:
+                    if "subnet" in spec:
+                        spec_total += piece_target_count(
+                            spec["subnet"], spec_excludes(spec["subnet"]),
+                            len(spec["ports"]))
+                    else:
+                        spec_total += (range_host_count(spec.get("range", ""))
+                                       * max(1, len(spec["ports"])))
                     if spec_total > MAX_SPEC_TARGETS:
                         break
-                while len(list_chunks) + len(spec_pieces) > MAX_CHUNKS_PER_JOB \
-                        and hosts_per_chunk < 65536 * 16:
-                    hosts_per_chunk *= 4
-                    spec_pieces = []
-                    spec_total = 0
-                    for spec in job.spec_list:
-                        excl = spec_excludes(spec["subnet"])
-                        for sub in split_spec(spec["subnet"], hosts_per_chunk):
-                            n = piece_target_count(sub, excl, len(spec["ports"]))
-                            spec_total += n
-                            if spec_total > MAX_SPEC_TARGETS:
-                                break
-                            spec_pieces.append((sub, spec["ports"], excl))
-                        if spec_total > MAX_SPEC_TARGETS:
-                            break
+                if spec_total > MAX_SPEC_TARGETS:
+                    self._reply(client.conn, msg_id, False, error=(
+                        f"scan too big (>{MAX_SPEC_TARGETS} host:ports); "
+                        f"narrow the range"))
+                    try:
+                        del self.jobs[job.job_id]
+                    except KeyError:
+                        pass
+                    return
                 job.target_list = []
                 job.spec_list = []
                 job.seen = set()
-                if not list_chunks and not spec_pieces:
-                    if spec_total > MAX_SPEC_TARGETS:
-                        self._reply(client.conn, msg_id, False, error=(
-                            f"scan too big (>{MAX_SPEC_TARGETS} host:ports); "
-                            f"narrow the range"))
-                    else:
-                        self._reply(client.conn, msg_id, False, error="no valid targets")
+                if not list_chunks and not blocks:
+                    self._reply(client.conn, msg_id, False, error="no valid targets")
                     try:
                         del self.jobs[job.job_id]
                     except KeyError:
@@ -760,16 +783,21 @@ class DistServer:
                     job.chunks.append(Chunk(f"{job.job_id}:{idx}", kind="list",
                                             targets=c))
                     idx += 1
-                for sub, ports, excl in spec_pieces:
-                    job.chunks.append(Chunk(f"{job.job_id}:{idx}", kind="spec",
-                                            subnet=sub, ports=ports, exclude=excl))
+                for spec in blocks:
+                    if "subnet" in spec:
+                        job.chunks.append(Chunk(
+                            f"{job.job_id}:{idx}", kind="spec",
+                            subnet=spec["subnet"], ports=spec["ports"],
+                            exclude=spec_excludes(spec["subnet"])))
+                    else:
+                        job.chunks.append(Chunk(
+                            f"{job.job_id}:{idx}", kind="range",
+                            range=spec["range"], ports=spec["ports"]))
                     idx += 1
-                job.total = (sum(len(c) for c in list_chunks)
-                             + sum(piece_target_count(s, e, len(p))
-                                   for s, p, e in spec_pieces))
+                job.total = (sum(len(c) for c in list_chunks) + spec_total)
                 job.status = "active"
             self.log(f"job {job.job_id} from {client.name}: {job.total} targets, "
-                     f"{len(job.chunks)} chunks ({hosts_per_chunk} hosts/chunk)")
+                     f"{len(job.chunks)} chunks (1 block = 1 chunk)")
             self._reply(client.conn, msg_id, True,
                         {"job_id": job.job_id, "total": job.total,
                          "chunks": len(job.chunks)})

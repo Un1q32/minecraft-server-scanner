@@ -29,7 +29,7 @@ try:
     from PySide6.QtCore import Qt, QTimer, QThread
     from PySide6.QtGui import QIcon, QPixmap, QImage, QColor
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
+        QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QGridLayout,
         QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
         QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSplitter,
         QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -1375,11 +1375,19 @@ def parse_description(desc):
             return sanitize_motd(''.join([x.get('text', '') for x in desc['extra']]))
     return ''
 
-def ping_server(entry, proxy=None):
+def ping_server(entry, proxy=None, timeout=None):
+    if timeout is None:
+        timeout = TIMEOUT
+    try:
+        timeout = float(timeout)
+    except Exception:
+        timeout = TIMEOUT
+    if not (timeout > 0):
+        timeout = TIMEOUT
     try:
         host, port = split_host_port(entry)
-        with open_connection(host, port, proxy=proxy, timeout=TIMEOUT) as sock:
-            sock.settimeout(TIMEOUT)
+        with open_connection(host, port, proxy=proxy, timeout=timeout) as sock:
+            sock.settimeout(timeout)
 
             handshake = (
                 varint_encode(0x00) +
@@ -9149,13 +9157,15 @@ except Exception as _dist_import_err:  # pragma: no cover
 
 
 def build_dist_job_specs(target_text, ports):
-    """Compile GUI target text into prefix specs for distributed scans.
+    """Compile GUI target text for distributed scans.
 
-    Returns (specs, skipped) where specs = [{"subnet": "10.0.0.0/8",
-    "ports": [...]}]. CIDRs pass through, start-end ranges are summarized to
-    minimal covering subnets, ASNs resolve to their prefixes, and single IPs
-    (or explicit ip:port entries) become /32s — so even a /8 uploads as a
-    few hundred bytes and workers enumerate locally.
+    Returns (blocks, explicit, skipped):
+      blocks   = [{"subnet": "10.0.0.0/8", "ports": [...]} |
+                  {"range": "192.0.2.1-192.0.2.20", "ports": [...]}]
+                 One typed block (CIDR, start-end range, ASN prefix) stays
+                 whole: one block = one chunk on one worker, never divided.
+      explicit = ["1.2.3.4:25565", ...] bare IPs / off-port entries, uploaded
+                 as plain target lists (grouped server-side, not per-IP jobs).
     """
     try:
         plist = [int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535]
@@ -9166,10 +9176,19 @@ def build_dist_job_specs(target_text, ports):
     try:
         masscan_targets, direct_targets = build_masscan_inputs(target_text, plist)
     except Exception:
-        return [], 1
-    specs = []
-    seen = set()
+        return [], [], 1
+    blocks = []
+    explicit = []
+    seen_block = set()
+    seen_ip = set()
     skipped = 0
+
+    def add_block(key, entry):
+        if key in seen_block:
+            return True
+        seen_block.add(key)
+        blocks.append(entry)
+        return True
 
     def add_spec(subnet, ports_list):
         try:
@@ -9185,37 +9204,66 @@ def build_dist_job_specs(target_text, ports):
             return False
         if not ports_n or len(ports_n) > 64:
             return False
-        key = (subnet_n, tuple(ports_n))
-        if key in seen:
+        return add_block(("s", subnet_n, tuple(ports_n)),
+                         {"subnet": subnet_n, "ports": ports_n})
+
+    def add_range(spec, ports_list):
+        try:
+            left, right = spec.split("-", 1)
+            start = ipaddress.ip_address(left.strip())
+            end = ipaddress.ip_address(right.strip())
+            if start.version != 4 or end.version != 4 or int(end) < int(start):
+                return False
+            rng = f"{start}-{end}"
+        except Exception:
+            return False
+        try:
+            ports_n = sorted({int(p) for p in ports_list if 1 <= int(p) <= 65535})
+        except Exception:
+            return False
+        if not ports_n or len(ports_n) > 64:
+            return False
+        return add_block(("r", rng, tuple(ports_n)),
+                         {"range": rng, "ports": ports_n})
+
+    def add_explicit(ip_port):
+        try:
+            host, port = split_host_port(ip_port)
+            ipaddress.ip_address(host)
+            if not (1 <= int(port) <= 65535):
+                return False
+            key = f"{host}:{int(port)}"
+        except Exception:
+            return False
+        if key in seen_ip:
             return True
-        seen.add(key)
-        specs.append({"subnet": subnet_n, "ports": ports_n})
+        seen_ip.add(key)
+        explicit.append(key)
         return True
 
     for spec in masscan_targets:
         ok = False
         try:
-            if "/" in spec:
-                ok = add_spec(spec, plist)
-            elif "-" in spec:
+            ipaddress.ip_address(spec)
+            ok = True  # bare IP (no mask): explicit per-port entries
+            for p in plist:
+                ok = add_explicit(f"{spec}:{p}") and ok
+        except ValueError:
+            try:
+                if "/" in spec:
+                    ok = add_spec(spec, plist)
+                elif "-" in spec:
+                    ok = add_range(spec, plist)
+            except Exception:
                 ok = False
-                for cidr in _summarize_range_spec(spec):
-                    ok = add_spec(cidr, plist) or ok
-            else:
-                ok = add_spec(f"{spec}/32", plist)
         except Exception:
             ok = False
         if not ok:
             skipped += 1
     for ip_port in direct_targets:
-        try:
-            host, port = split_host_port(ip_port)
-            ok = add_spec(f"{host}/32", [port])
-        except Exception:
-            ok = False
-        if not ok:
+        if not add_explicit(ip_port):
             skipped += 1
-    return specs, skipped
+    return blocks, explicit, skipped
 
 
 class DistTab(QtBaseMixin, QWidget):
@@ -9349,12 +9397,13 @@ class DistTab(QtBaseMixin, QWidget):
         self.ports_edit.setText(NETWORK_SCAN_DEFAULT_PORTS)
         self.ports_edit.setMaximumWidth(120)
         ol.addWidget(self.ports_edit)
-        ol.addWidget(QLabel("Hosts/chunk:", opts))
-        self.chunk_spin = QSpinBox(opts)
-        self.chunk_spin.setRange(64, 65536)
-        self.chunk_spin.setValue(4096)
-        self.chunk_spin.setToolTip("Sub-prefix chunk size: a /8 becomes ~4096 /20 chunks at 4096.")
-        ol.addWidget(self.chunk_spin)
+        ol.addWidget(QLabel("Timeout (s):", opts))
+        self.timeout_spin = QDoubleSpinBox(opts)
+        self.timeout_spin.setRange(1.0, 10.0)
+        self.timeout_spin.setSingleStep(0.5)
+        self.timeout_spin.setValue(3.0)
+        self.timeout_spin.setToolTip("Per-target handshake timeout for workers. Lower = faster over dead space, may miss slow servers.")
+        ol.addWidget(self.timeout_spin)
         self.start_btn = QPushButton("Start distributed scan", opts)
         self.start_btn.clicked.connect(self.start_dist_scan)
         ol.addWidget(self.start_btn)
@@ -9391,11 +9440,6 @@ class DistTab(QtBaseMixin, QWidget):
                 self.net_edit.setText(str(cfg.get("network_label") or ""))
                 self.worker_check.setChecked(bool(cfg.get("worker_enabled", True)))
                 self.slots_spin.setValue(int(cfg.get("worker_slots", 2) or 2))
-                try:
-                    self.chunk_spin.setValue(int(cfg.get("chunk_hosts",
-                        cfg.get("chunk_size", 4096)) or 4096))
-                except Exception:
-                    pass
             except Exception:
                 pass
         else:
@@ -9437,7 +9481,6 @@ class DistTab(QtBaseMixin, QWidget):
             network_label=self.net_edit.text().strip(),
             worker_enabled=self.worker_check.isChecked(),
             worker_slots=self.slots_spin.value(),
-            chunk_hosts=self.chunk_spin.value(),
         )
 
     def connect(self):
@@ -9610,25 +9653,25 @@ class DistTab(QtBaseMixin, QWidget):
             ports = parse_ports(self.ports_edit.text())
         except Exception:
             ports = parse_ports(NETWORK_SCAN_DEFAULT_PORTS)
-        chunk_hosts = self.chunk_spin.value()
+        timeout_s = float(self.timeout_spin.value())
         self._save_ui_to_config()
         self.set_status("Resolving targets...")
         threading.Thread(
             target=self._start_scan_work,
-            args=(targets_raw, ports, chunk_hosts),
+            args=(targets_raw, ports, timeout_s),
             daemon=True,
         ).start()
 
-    def _start_scan_work(self, targets_raw, ports, chunk_hosts):
-        # Prefix path: compile to subnet specs (instant even for a /8) and
-        # upload those; the server splits them into sub-prefix chunks and
-        # workers enumerate locally. No per-IP upload ever happens here.
+    def _start_scan_work(self, targets_raw, ports, timeout_s):
+        # One typed block = one chunk on one worker. Blocks upload as tiny
+        # subnet/range specs; bare IPs upload as explicit target lists.
+        # Workers enumerate locally — no per-IP upload ever happens here.
         try:
-            specs, skipped = build_dist_job_specs(targets_raw, ports)
+            blocks, explicit, skipped = build_dist_job_specs(targets_raw, ports)
         except Exception as exc:
             self.after(0, lambda e=str(exc): self.set_status(f"Target parsing failed: {e}"))
             return
-        if not specs:
+        if not blocks and not explicit:
             self.after(0, lambda: self.set_status("No valid targets to scan."))
             return
         try:
@@ -9638,9 +9681,10 @@ class DistTab(QtBaseMixin, QWidget):
         try:
             def _up(d, t):
                 self.after(0, lambda dd=d, tt=t: self.set_status(
-                    f"Uploading scan: {dd}/{tt} subnets..."))
-            info = self.agent.submit_spec_job(specs, ignore=ignore, options={},
-                                              chunk_hosts=chunk_hosts,
+                    f"Uploading scan: {dd}/{tt}..."))
+            info = self.agent.submit_spec_job(blocks, targets=explicit,
+                                              ignore=ignore,
+                                              options={"timeout_s": timeout_s},
                                               progress_cb=_up)
         except Exception as exc:
             self.after(0, lambda e=str(exc): self.set_status(f"Job submit failed: {e}"))

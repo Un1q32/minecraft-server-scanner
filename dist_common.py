@@ -28,7 +28,7 @@ DEFAULT_PORT = 8443
 DEFAULT_CHUNK_SIZE = 256      # legacy per-target-list chunks
 DEFAULT_SPEC_HOSTS = 4096     # hosts per spec chunk (e.g. a /20)
 MAX_TARGETS_PER_JOB = 200000  # legacy explicit-target uploads
-MAX_SPEC_TARGETS = 64000000   # total hosts x ports for prefix-spec jobs
+MAX_SPEC_TARGETS = 8589934592  # 2**33: a /0 on one port is allowed, anything huger is an accident
 MAX_CHUNKS_PER_JOB = 100000   # auto-coarsen beyond this
 UPLOAD_BATCH = 10000  # targets per job_add frame (far under the framing cap)
 SPEC_UPLOAD_BATCH = 2000  # specs per job_add_specs frame (specs are tiny)
@@ -313,6 +313,172 @@ def summarize_range_spec(spec):
         return []
 
 
+def split_range_spec(spec, max_hosts):
+    """Split a 'start-end' range into sub-ranges of at most max_hosts
+    addresses each. Returns ['a-b', ...] in order."""
+    import ipaddress as _ip
+    try:
+        max_hosts = max(1, int(max_hosts))
+    except Exception:
+        max_hosts = DEFAULT_SPEC_HOSTS
+    try:
+        left, right = spec.split("-", 1)
+        start = int(_ip.ip_address(left.strip()))
+        end = int(_ip.ip_address(right.strip()))
+    except Exception:
+        return []
+    if end < start:
+        return []
+    out = []
+    cur = start
+    while cur <= end:
+        nxt = min(cur + max_hosts - 1, end)
+        out.append(f"{_ip.ip_address(cur)}-{_ip.ip_address(nxt)}")
+        cur = nxt + 1
+    return out
+
+
+def range_host_count(spec):
+    """Address count (inclusive) of a 'start-end' range string."""
+    import ipaddress as _ip
+    try:
+        left, right = spec.split("-", 1)
+        start = int(_ip.ip_address(left.strip()))
+        end = int(_ip.ip_address(right.strip()))
+        return max(0, end - start + 1)
+    except Exception:
+        return 0
+
+
+def enumerate_range_targets(spec, ports):
+    """Yield 'ip:port' for every address in a 'start-end' range (inclusive)."""
+    import ipaddress as _ip
+    try:
+        left, right = spec.split("-", 1)
+        start = int(_ip.ip_address(left.strip()))
+        end = int(_ip.ip_address(right.strip()))
+    except Exception:
+        return
+    try:
+        plist = [int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535]
+    except Exception:
+        return
+    if not plist or end < start:
+        return
+    for v in range(start, end + 1):
+        h = str(_ip.ip_address(v))
+        for p in plist:
+            yield f"{h}:{p}"
+
+
+class MasscanError(Exception):
+    pass
+
+
+def find_masscan():
+    import shutil as _shutil
+    try:
+        return _shutil.which("masscan")
+    except Exception:
+        return None
+
+
+def parse_masscan_json_output(raw):
+    """Parse masscan -oJ text into ['ip:port', ...] (open ports only)."""
+    found = []
+    seen = set()
+    for line in (raw or "").splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line in ("[", "]") or line.startswith("#"):
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        ip = entry.get("ip")
+        if not ip:
+            continue
+        for p in entry.get("ports") or []:
+            try:
+                port = int((p or {}).get("port", 0))
+                status = str((p or {}).get("status", "open")).lower()
+            except Exception:
+                continue
+            if 1 <= port <= 65535 and status == "open":
+                key = f"{ip}:{port}"
+                if key not in seen:
+                    seen.add(key)
+                    found.append(key)
+    return found
+
+
+def _masscan_looks_like_privilege_failure(text):
+    low = (text or "").lower()
+    return any(m in low for m in (
+        "permission", "must be root", "need root", "root priv",
+        "raw socket", "raw-socket", "cap_net_raw", "operation not permitted",
+        "admin", "access denied",
+    ))
+
+
+def masscan_sweep(targets, ports, rate=10000, wait=2, timeout=None, exe=None):
+    """Batch SYN sweep of big ranges. targets = [subnet|cidr|start-end|ip].
+    Returns ['ip:port', ...] open hosts. Raises MasscanError when masscan is
+    missing or every attempt fails (caller falls back to handshake sweep).
+
+    Tries privileged mode first, then --unprivileged (no root needed).
+    Never uses sudo: headless workers can't answer a password prompt.
+    """
+    import subprocess as _sp
+    exe = exe or find_masscan()
+    if not exe:
+        raise MasscanError("masscan not found")
+    try:
+        plist = sorted({int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535})
+    except Exception:
+        raise MasscanError("no valid ports")
+    if not plist or not targets:
+        raise MasscanError("nothing to sweep")
+    try:
+        rate = max(100, min(int(rate or 10000), 1000000))
+    except Exception:
+        rate = 10000
+    try:
+        wait = max(0, min(int(wait if wait is not None else 2), 60))
+    except Exception:
+        wait = 2
+    port_spec = ",".join(str(p) for p in plist)
+    base = [exe] + [str(t) for t in targets] + [
+        "-p", port_spec, "--open",
+        "--rate", str(rate), "--wait", str(wait),
+        "-oJ", "-",
+    ]
+    if timeout is None:
+        timeout = 300
+    last_err = "unknown failure"
+    for variant in (base, base + ["--unprivileged"]):
+        try:
+            proc = _sp.run(variant, capture_output=True, text=True,
+                           timeout=timeout)
+        except FileNotFoundError:
+            raise MasscanError("masscan not found")
+        except _sp.TimeoutExpired:
+            last_err = "masscan timed out"
+            continue
+        except Exception as exc:
+            last_err = str(exc)[:200]
+            continue
+        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if proc.returncode == 0:
+            return parse_masscan_json_output(proc.stdout or "")
+        last_err = (proc.stderr or proc.stdout or f"exit {proc.returncode}")[:300]
+        if "--unprivileged" in variant or not _masscan_looks_like_privilege_failure(out):
+            break
+    raise MasscanError(last_err)
+
+
 # ---------------- chunking ----------------
 
 def split_targets(targets, chunk_size=DEFAULT_CHUNK_SIZE):
@@ -348,9 +514,8 @@ DEFAULT_CONFIG = {
     "server_fingerprint": "",
     "worker_enabled": True,
     "worker_slots": 2,
-    "chunk_workers": 100,
+    "chunk_workers": 200,
     "chunk_size": DEFAULT_CHUNK_SIZE,
-    "chunk_hosts": DEFAULT_SPEC_HOSTS,
 }
 
 

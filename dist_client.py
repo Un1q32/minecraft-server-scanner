@@ -53,7 +53,7 @@ class DistAgent:
         self._job_ignores = {}  # job_id -> set of ignored ip:port (cached)
         self._worker_slots = 2
         self._worker_enabled = True
-        self._chunk_workers = 100
+        self._chunk_workers = 200
         self.client_id = uuid.uuid4().hex
         # Callbacks (background threads): set by UI.
         self.on_status = None    # (connected: bool, message: str)
@@ -138,9 +138,9 @@ class DistAgent:
         self._worker_enabled = bool(self.cfg.get("worker_enabled", True))
         self._worker_slots = max(1, min(int(self.cfg.get("worker_slots", 2) or 2), 32))
         try:
-            self._chunk_workers = max(1, min(int(self.cfg.get("chunk_workers", 100) or 100), 500))
+            self._chunk_workers = max(1, min(int(self.cfg.get("chunk_workers", 200) or 200), 500))
         except Exception:
-            self._chunk_workers = 100
+            self._chunk_workers = 200
         try:
             # The connect-time timeout was only for the handshake; the reader
             # thread needs a blocking socket or it dies on the first quiet
@@ -342,48 +342,56 @@ class DistAgent:
                     pass
         return self._request({"type": "job_commit", "job_id": job_id}, timeout=60)
 
-    def submit_spec_job(self, specs, ignore=None, options=None, chunk_hosts=None,
+    def submit_spec_job(self, specs, targets=None, ignore=None, options=None,
                         progress_cb=None):
-        """Prefix-based job: specs = [{"subnet": "10.0.0.0/8", "ports": [...]},
-        ...]. Stays tiny on the wire no matter how big the range; workers
-        enumerate locally. ignore = owner's ignore set (filtered by workers).
+        """Block-based job: specs = [{"subnet": ...} | {"range": ...}, ...]
+        (one block = one chunk on one worker) plus optional explicit
+        ["ip:port", ...] targets (grouped server-side). Uploads stay tiny no
+        matter how big the blocks; workers enumerate locally.
         Returns {job_id, total, chunks}."""
-        from dist_common import SPEC_UPLOAD_BATCH
-        specs = [s for s in (specs or []) if isinstance(s, dict) and s.get("subnet")]
-        if not specs:
-            raise DistError("no valid subnets")
+        from dist_common import SPEC_UPLOAD_BATCH, UPLOAD_BATCH
+        specs = [s for s in (specs or []) if isinstance(s, dict)
+                 and (s.get("subnet") or s.get("range"))]
+        targets = [str(t or "").strip() for t in (targets or [])
+                   if str(t or "").strip()]
+        if not specs and not targets:
+            raise DistError("no valid subnets or targets")
         options = dict(options or {})
         if ignore:
             options["ignore"] = [str(t or "").strip() for t in ignore
                                  if str(t or "").strip()][:200000]
-        data = self._request({
-            "type": "job_begin",
-            "options": options,
-            "chunk_size": chunk_hosts or self.cfg.get("chunk_hosts", 4096),
-        }, timeout=60)
+        data = self._request({"type": "job_begin", "options": options},
+                             timeout=60)
         job_id = data.get("job_id")
         if not job_id:
             raise DistError("server refused job")
-        total = len(specs)
-        done = 0
-        while done < total:
-            part = specs[done:done + SPEC_UPLOAD_BATCH]
-            try:
-                self._request({"type": "job_add_specs", "job_id": job_id,
-                               "specs": part}, timeout=120)
-            except Exception as exc:
-                try:
-                    self._request({"type": "job_cancel", "job_id": job_id},
-                                  timeout=15)
-                except Exception:
-                    pass
-                raise DistError(f"spec upload failed at {done}/{total}: {exc}")
-            done += len(part)
+        total_units = len(specs) + (len(targets) + UPLOAD_BATCH - 1) // UPLOAD_BATCH
+        done_units = 0
+
+        def _prog():
             if progress_cb:
                 try:
-                    progress_cb(done, total)
+                    progress_cb(done_units, total_units)
                 except Exception:
                     pass
+
+        try:
+            for i in range(0, len(specs), SPEC_UPLOAD_BATCH):
+                self._request({"type": "job_add_specs", "job_id": job_id,
+                               "specs": specs[i:i + SPEC_UPLOAD_BATCH]}, timeout=120)
+                done_units += 1
+                _prog()
+            for i in range(0, len(targets), UPLOAD_BATCH):
+                self._request({"type": "job_add", "job_id": job_id,
+                               "targets": targets[i:i + UPLOAD_BATCH]}, timeout=120)
+                done_units += 1
+                _prog()
+        except Exception as exc:
+            try:
+                self._request({"type": "job_cancel", "job_id": job_id}, timeout=15)
+            except Exception:
+                pass
+            raise DistError(f"upload failed: {exc}")
         return self._request({"type": "job_commit", "job_id": job_id}, timeout=120)
 
     def cancel_job(self, job_id):
@@ -442,19 +450,13 @@ class DistAgent:
                 return
             self._active_chunks[chunk_id] = True
         try:
-            if kind == "spec":
-                from dist_common import enumerate_piece_targets
-                subnet = str(msg.get("subnet") or "")
-                ports = msg.get("ports") or [25565]
-                exclude = msg.get("exclude") or []
-                ignore = self._job_ignore(job_id)
-                self._execute_targets(
-                    job_id, chunk_id,
-                    enumerate_piece_targets(subnet, ports, exclude),
-                    skip=lambda t: t in ignore)
+            opts = msg.get("options") or {}
+            if kind in ("spec", "range"):
+                self._execute_block(job_id, chunk_id, kind, msg, opts)
             else:
                 targets = msg.get("targets") or []
-                self._execute_targets(job_id, chunk_id, list(targets))
+                self._execute_targets(job_id, chunk_id, list(targets),
+                                      timeout_s=opts.get("timeout_s"))
         finally:
             with self._assign_lock:
                 self._active_chunks.pop(chunk_id, None)
@@ -464,6 +466,130 @@ class DistAgent:
                     cb(job_id, chunk_id, 0)
                 except Exception:
                     pass
+
+    # Worker-internal piece size for masscan batching + progress on huge
+    # blocks. Invisible to the user: one typed block is still one chunk on
+    # one worker; pieces only bound masscan runtimes and memory.
+    BLOCK_PIECE_HOSTS = 65536
+    BLOCK_STREAM_BATCH = 20000
+
+    def _execute_block(self, job_id, chunk_id, kind, msg, opts):
+        """Scan one whole block: masscan SYN sweep per piece when available
+        (fast), else streaming handshake sweep. Handshake only ever touches
+        open ports found by masscan, or every host as fallback."""
+        from dist_common import (
+            enumerate_piece_targets, enumerate_range_targets,
+            masscan_sweep, MasscanError, split_range_spec, split_spec,
+        )
+        ports = msg.get("ports") or [25565]
+        try:
+            ports = sorted({int(p) for p in ports if 1 <= int(p) <= 65535}) or [25565]
+        except Exception:
+            ports = [25565]
+        ignore = self._job_ignore(job_id)
+        excl = set(str(x) for x in (msg.get("exclude") or []))
+        timeout_s = opts.get("timeout_s")
+        try:
+            rate = max(100, min(int((opts.get("masscan_rate") or 10000)), 1000000))
+        except Exception:
+            rate = 10000
+        try:
+            wait = max(0, min(int(opts.get("masscan_wait", 2)), 60))
+        except Exception:
+            wait = 2
+        if kind == "spec":
+            subnet = str(msg.get("subnet") or "")
+            pieces = [("spec", p) for p in split_spec(subnet, self.BLOCK_PIECE_HOSTS)]
+            if not pieces:
+                pieces = [("spec", subnet)]
+        else:
+            rng = str(msg.get("range") or "")
+            pieces = [("range", p) for p in split_range_spec(rng, self.BLOCK_PIECE_HOSTS)]
+            if not pieces:
+                pieces = [("range", rng)]
+        for pkind, piece in pieces:
+            if pkind == "spec":
+                sweep_targets = [piece]
+                def _enumerate():
+                    return enumerate_piece_targets(piece, ports, excl)
+                # masscan sweeps the whole piece; filter its hits afterwards
+                skip_excl = excl
+            else:
+                sweep_targets = [piece]
+                def _enumerate(p=piece):
+                    return enumerate_range_targets(p, ports)
+                skip_excl = set()
+            opens = self._masscan_piece(sweep_targets, ports, rate, wait)
+            piece_n = self._piece_size(pkind, piece, ports, skip_excl)
+            if opens is not None:
+                # SYN sweep done: handshake the opens, count the swept-dead
+                # remainder as done so progress stays exact.
+                wanted = [o for o in opens
+                          if o not in skip_excl and o not in ignore]
+                if wanted:
+                    self._execute_targets(job_id, chunk_id, wanted,
+                                          timeout_s=timeout_s)
+                rest = piece_n - len(wanted)
+                if rest > 0:
+                    self._report_done(job_id, chunk_id, rest)
+            else:
+                # No masscan: streaming handshake sweep in bounded batches so
+                # a /8 never materializes millions of strings at once.
+                batch = []
+                for t in _enumerate():
+                    batch.append(t)
+                    if len(batch) >= self.BLOCK_STREAM_BATCH:
+                        self._execute_targets(
+                            job_id, chunk_id, batch,
+                            skip=ignore.__contains__, timeout_s=timeout_s)
+                        batch = []
+                if batch:
+                    self._execute_targets(
+                        job_id, chunk_id, batch,
+                        skip=ignore.__contains__, timeout_s=timeout_s)
+                else:
+                    self._report_done(job_id, chunk_id, 0)
+
+    @staticmethod
+    def _piece_size(pkind, piece, ports, exclude):
+        from dist_common import piece_target_count, range_host_count
+        if pkind == "spec":
+            return piece_target_count(piece, exclude, len(ports))
+        return range_host_count(piece) * max(1, len(ports))
+
+    def _report_done(self, job_id, chunk_id, n):
+        # Progress-only batch (no hits): keeps done counting when a piece
+        # needed zero handshakes.
+        if n <= 0:
+            return
+        try:
+            self._request({
+                "type": "result_batch", "job_id": job_id,
+                "chunk_id": chunk_id, "results": [], "done_targets": int(n),
+            }, timeout=60)
+        except Exception:
+            pass
+
+    def _masscan_piece(self, sweep_targets, ports, rate, wait):
+        """masscan SYN sweep of one piece. Returns [ip:port] or None when
+        masscan is unavailable/fails (caller falls back to handshakes)."""
+        from dist_common import MasscanError, masscan_sweep
+        try:
+            hosts = 0
+            for t in sweep_targets:
+                if "-" in t and "/" not in t and ":" not in t:
+                    from dist_common import range_host_count
+                    hosts += range_host_count(t)
+                else:
+                    from dist_common import spec_host_count
+                    hosts += spec_host_count(t)
+            timeout = max(120, hosts * max(1, len(ports)) / max(1, rate) + wait + 120)
+            return masscan_sweep(sweep_targets, ports, rate=rate, wait=wait,
+                                 timeout=timeout)
+        except MasscanError:
+            return None
+        except Exception:
+            return None
 
     def _job_ignore(self, job_id):
         # Fetch + cache the owner's ignore set once per job (never inside
@@ -490,8 +616,32 @@ class DistAgent:
     def _execute_chunk(self, job_id, chunk_id, targets):
         self._execute_targets(job_id, chunk_id, list(targets or []))
 
-    def _execute_targets(self, job_id, chunk_id, targets, skip=None):
+    def _execute_targets(self, job_id, chunk_id, targets, skip=None,
+                         timeout_s=None, connect_timeout_s=None):
+        try:
+            timeout_s = float(timeout_s) if timeout_s else None
+        except Exception:
+            timeout_s = None
+        try:
+            connect_timeout_s = float(connect_timeout_s) if connect_timeout_s else 1.5
+        except Exception:
+            connect_timeout_s = 1.5
+        connect_timeout_s = min(10.0, max(0.3, connect_timeout_s))
+        # Probe once per chunk whether the injected ping_fn accepts a
+        # timeout kwarg (scanner.ping_server does; test fakes may not).
         ping = self.ping_fn
+        use_timeout = False
+        if timeout_s:
+            try:
+                import inspect as _inspect
+                use_timeout = "timeout" in _inspect.signature(ping).parameters
+            except Exception:
+                use_timeout = False
+
+        def _ping(target):
+            if use_timeout:
+                return ping(target, timeout=timeout_s)
+            return ping(target)
         try:
             total = len(targets)
         except TypeError:
@@ -510,7 +660,7 @@ class DistAgent:
                 n_done = done
             delta = n_done - flush.sent
             if not batch and not final:
-                if not progress_only or delta < 500:
+                if not progress_only or delta < 100:
                     return
             if delta <= 0 and not batch and not final:
                 return
@@ -539,7 +689,7 @@ class DistAgent:
                     r = None
                     skipped = True
                 else:
-                    r = ping(target)
+                    r = _ping(target)
                     skipped = False
             except Exception:
                 r = None
@@ -550,7 +700,7 @@ class DistAgent:
                     hits.append(r)
                 need_flush = (len(hits) >= 50
                               or (time.time() - last_flush[0]) > 2.0
-                              or (skipped and done - flush.sent >= 500))
+                              or (skipped and done - flush.sent >= 100))
             if need_flush:
                 last_flush[0] = time.time()
                 flush(progress_only=skipped and not hits)
