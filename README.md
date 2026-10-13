@@ -112,12 +112,17 @@ server that is also the shared database:
 - Speed: persistent connections, batched result streaming, and a single-writer
   SQLite database in WAL mode (thousands of results/sec, zero DB admin).
 - In the app, open the Distributed tab, enter host/port/token, and Connect.
-  Any client can start a distributed scan: targets expand locally, the server
-  splits them into chunks, and every idle registered client with "Act as
-  worker" enabled scans chunks concurrently from its own network — results
-  stream back live per job, and multiple jobs from multiple people run at the
-  same time with fair round-robin chunk assignment. Dead workers are detected
-  by heartbeat/lease timeouts and their chunks are requeued automatically.
+  Any client can start a distributed scan: target text (same syntax as Network
+  Scan) compiles to compact subnet specs — a /8 uploads as a few hundred
+  bytes, never as millions of IPs. The server splits each spec into
+  sub-prefix chunks (Hosts/chunk, default 4096: a /8 becomes ~4096 /20s) and
+  every idle registered client with "Act as worker" enabled picks chunks up
+  and enumerates them locally from its own network — results stream back live
+  per job, and multiple jobs from multiple people run at the same time with
+  fair round-robin chunk assignment. Your ignore list travels with the job and
+  is filtered by workers. Dead workers are detected by heartbeat/lease
+  timeouts and their chunks are requeued automatically. Scans far larger than
+  the old per-IP upload cap are fine (a /8 commits in well under a second).
 - Shared DB: "Push ips.txt" uploads local finds; "Pull shared DB" merges
   everyone's finds into ips.txt; the stats label shows global totals.
 - Distributed chunks use the status handshake only (including the built-in

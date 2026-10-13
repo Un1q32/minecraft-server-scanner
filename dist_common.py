@@ -25,7 +25,13 @@ import threading
 
 PROTOCOL_VERSION = 1
 DEFAULT_PORT = 8443
-DEFAULT_CHUNK_SIZE = 256
+DEFAULT_CHUNK_SIZE = 256      # legacy per-target-list chunks
+DEFAULT_SPEC_HOSTS = 4096     # hosts per spec chunk (e.g. a /20)
+MAX_TARGETS_PER_JOB = 200000  # legacy explicit-target uploads
+MAX_SPEC_TARGETS = 64000000   # total hosts x ports for prefix-spec jobs
+MAX_CHUNKS_PER_JOB = 100000   # auto-coarsen beyond this
+UPLOAD_BATCH = 10000  # targets per job_add frame (far under the framing cap)
+SPEC_UPLOAD_BATCH = 2000  # specs per job_add_specs frame (specs are tiny)
 MAX_FRAME_BYTES = 32 * 1024 * 1024
 CONFIG_FILE = "dist_config.json"
 
@@ -163,6 +169,150 @@ def make_client_context():
     return ctx
 
 
+# ---------------- prefix specs ----------------
+# A spec is {"subnet": "10.0.0.0/12", "ports": [25565]}. Owners upload specs
+# (tiny even for a /8); the server splits them into sub-prefix chunks and
+# workers enumerate locally. Nobody ever ships millions of ip:port strings.
+
+def spec_host_count(subnet):
+    """Usable host addresses in an IPv4 subnet string, matching
+    enumerate_spec_targets exactly (/31 yields both addresses per RFC 3021,
+    /32 yields one, otherwise hosts() excludes network/broadcast)."""
+    import ipaddress as _ip
+    try:
+        net = _ip.ip_network(subnet, strict=False)
+        if net.version != 4:
+            return 0
+        if net.prefixlen == 32:
+            return 1
+        if net.prefixlen == 31:
+            return 2
+        return max(0, net.num_addresses - 2)
+    except Exception:
+        return 0
+
+
+def split_spec(subnet, max_hosts):
+    """Split an IPv4 subnet into sub-prefixes of at most max_hosts usable
+    addresses each. Returns [subnet_str, ...] in network order."""
+    import ipaddress as _ip
+    import math as _math
+    try:
+        max_hosts = max(1, int(max_hosts))
+    except Exception:
+        max_hosts = DEFAULT_SPEC_HOSTS
+    try:
+        net = _ip.ip_network(subnet, strict=False)
+    except Exception:
+        return []
+    if net.version != 4:
+        return []
+    if spec_host_count(str(net)) <= max_hosts:
+        return [str(net)]
+    # Largest new prefixlen whose subnets still fit: usable = 2^n - 2 <= max.
+    bits = max(1, int(_math.floor(_math.log2(max_hosts + 2))))
+    new_pl = 32 - bits
+    if new_pl <= net.prefixlen:
+        new_pl = net.prefixlen + 1
+    new_pl = min(32, new_pl)
+    try:
+        parts = [str(s) for s in net.subnets(new_prefix=new_pl)]
+    except Exception:
+        return [str(net)]
+    # Guard against rounding slip: recurse on any oversize piece.
+    out = []
+    for p in parts:
+        if spec_host_count(p) > max_hosts and new_pl < 32:
+            out.extend(split_spec(p, max_hosts))
+        else:
+            out.append(p)
+    return out
+
+
+def spec_excludes(subnet):
+    """Addresses a worker must skip when enumerating pieces of this spec:
+    the original network/broadcast (matching hosts() semantics). Empty for
+    /31 and /32 specs."""
+    import ipaddress as _ip
+    try:
+        net = _ip.ip_network(subnet, strict=False)
+        if net.version != 4 or net.prefixlen >= 31:
+            return []
+        return [str(net.network_address), str(net.broadcast_address)]
+    except Exception:
+        return []
+
+
+def piece_target_count(piece_subnet, exclude, nports):
+    """Count of ip:port targets in a piece, honoring exclusions. Arithmetic
+    (no per-address iteration) so /8-scale commits stay fast."""
+    import ipaddress as _ip
+    try:
+        net = _ip.ip_network(piece_subnet, strict=False)
+        if net.version != 4:
+            return 0
+        n = net.num_addresses
+        if exclude:
+            try:
+                first = int(net.network_address)
+                last = int(net.broadcast_address)
+                for x in exclude:
+                    try:
+                        v = int(_ip.ip_address(str(x)))
+                    except Exception:
+                        continue
+                    if first <= v <= last:
+                        n -= 1
+            except Exception:
+                pass
+        return max(0, n) * max(1, int(nports or 1))
+    except Exception:
+        return 0
+
+
+def enumerate_piece_targets(piece_subnet, ports, exclude=None):
+    """Yield 'ip:port' for every address in the piece except exclusions."""
+    import ipaddress as _ip
+    try:
+        net = _ip.ip_network(piece_subnet, strict=False)
+    except Exception:
+        return
+    if net.version != 4:
+        return
+    try:
+        plist = [int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535]
+    except Exception:
+        return
+    if not plist:
+        return
+    excl = {str(x) for x in (exclude or [])}
+    for addr in net:
+        h = str(addr)
+        if h in excl:
+            continue
+        for p in plist:
+            yield f"{h}:{p}"
+
+
+def enumerate_spec_targets(subnet, ports):
+    """Yield 'ip:port' strings for a whole spec (no splitting)."""
+    return enumerate_piece_targets(subnet, ports, spec_excludes(subnet))
+
+
+def summarize_range_spec(spec):
+    """'start-end' string -> [cidr, ...] minimal covering subnets."""
+    import ipaddress as _ip
+    try:
+        left, right = spec.split("-", 1)
+        start = _ip.ip_address(left.strip())
+        end = _ip.ip_address(right.strip())
+        if start.version != 4 or end.version != 4 or int(end) < int(start):
+            return []
+        return [str(n) for n in _ip.summarize_address_range(start, end)]
+    except Exception:
+        return []
+
+
 # ---------------- chunking ----------------
 
 def split_targets(targets, chunk_size=DEFAULT_CHUNK_SIZE):
@@ -200,6 +350,7 @@ DEFAULT_CONFIG = {
     "worker_slots": 2,
     "chunk_workers": 100,
     "chunk_size": DEFAULT_CHUNK_SIZE,
+    "chunk_hosts": DEFAULT_SPEC_HOSTS,
 }
 
 

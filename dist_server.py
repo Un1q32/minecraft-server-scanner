@@ -40,13 +40,24 @@ import uuid
 from dist_common import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_PORT,
+    DEFAULT_SPEC_HOSTS,
+    MAX_CHUNKS_PER_JOB,
+    MAX_SPEC_TARGETS,
+    MAX_TARGETS_PER_JOB,
     NDJsonConnection,
+    SPEC_UPLOAD_BATCH,
+    UPLOAD_BATCH,
     cert_fingerprint,
     denormalize_result_from_wire,
+    enumerate_spec_targets,
     generate_self_signed_cert,
     make_server_context,
     new_token,
     normalize_result_for_wire,
+    piece_target_count,
+    spec_excludes,
+    spec_host_count,
+    split_spec,
     split_targets,
 )
 
@@ -54,9 +65,10 @@ PROTOCOL_VERSION = 1
 LEASE_SECONDS = 300
 HEARTBEAT_TIMEOUT = 90
 SCHEDULER_TICK = 1.0
-MAX_TARGETS_PER_JOB = 200000
+# MAX_TARGETS_PER_JOB comes from dist_common (shared with the client).
 JOB_RESULT_BUFFER_CAP = 5000
 DB_BATCH_SIZE = 500
+LOADING_TIMEOUT = 900  # drop abandoned streamed uploads (begin without commit)
 
 
 # ==================== database ====================
@@ -194,16 +206,26 @@ class Database:
 # ==================== jobs & clients ====================
 
 class Chunk:
-    __slots__ = ("chunk_id", "targets", "state", "worker", "lease_expires",
-                 "done_count")
+    __slots__ = ("chunk_id", "kind", "targets", "subnet", "ports", "exclude",
+                 "state", "worker", "lease_expires", "done_count")
 
-    def __init__(self, chunk_id, targets):
+    def __init__(self, chunk_id, kind="list", targets=None, subnet="", ports=None,
+                 exclude=None):
         self.chunk_id = chunk_id
-        self.targets = targets
+        self.kind = kind  # "list" (explicit ip:port targets) | "spec" (subnet+ports)
+        self.targets = targets or []
+        self.subnet = subnet or ""
+        self.ports = list(ports or [])
+        self.exclude = list(exclude or [])
         self.state = "pending"  # pending | leased | done
         self.worker = None
         self.lease_expires = 0.0
         self.done_count = 0
+
+    def size(self):
+        if self.kind == "spec":
+            return piece_target_count(self.subnet, self.exclude, len(self.ports))
+        return len(self.targets)
 
 
 class Job:
@@ -212,12 +234,17 @@ class Job:
         self.owner_id = owner_id
         self.total = total
         self.done = 0
-        self.status = "active"  # active | done | canceled
+        self.status = "active"  # active | loading | done | canceled
         self.options = options or {}
         self.chunks = []
         self.created = time.time()
         self.seq = 0
         self.buffer = []  # [(seq, result)] capped, for catch-up pulls
+        # Staging area for streamed uploads (job_begin/job_add/job_commit).
+        self.target_list = []
+        self.seen = set()
+        # Prefix specs: [{"subnet": "10.0.0.0/12", "ports": [25565]}].
+        self.spec_list = []
 
     def progress(self):
         return {"job_id": self.job_id, "total": self.total, "done": self.done,
@@ -281,6 +308,7 @@ class DistServer:
             try:
                 self._reap_dead_clients()
                 self._expire_leases()
+                self._reap_stale_loading()
                 self._assign_pending()
             except Exception as exc:
                 self.log(f"scheduler error: {exc}")
@@ -328,6 +356,16 @@ class DistServer:
                         ch.worker = None
                         ch.lease_expires = 0.0
 
+    def _reap_stale_loading(self):
+        now = time.time()
+        with self.lock:
+            stale = [jid for jid, j in self.jobs.items()
+                     if j.status == "loading" and now - j.created > LOADING_TIMEOUT]
+            for jid in stale:
+                del self.jobs[jid]
+        for jid in stale:
+            self.log(f"job {jid} dropped (upload never committed)")
+
     def _assign_pending(self):
         with self.lock:
             workers = [c for c in self.clients.values() if c.free_slots() > 0]
@@ -364,8 +402,12 @@ class DistServer:
                     self._rr += 1
         for worker, job, chunk in assignments:
             msg = {"type": "assign", "job_id": job.job_id,
-                   "chunk_id": chunk.chunk_id, "targets": chunk.targets,
-                   "options": job.options}
+                   "chunk_id": chunk.chunk_id, "kind": chunk.kind,
+                   "targets": chunk.targets if chunk.kind == "list" else [],
+                   "subnet": chunk.subnet, "ports": chunk.ports,
+                   "exclude": chunk.exclude,
+                   "options": {k: v for k, v in (job.options or {}).items()
+                               if k != "ignore"}}
             try:
                 worker.conn.send(msg)
             except Exception:
@@ -540,6 +582,214 @@ class DistServer:
             self._reply(client.conn, msg_id, True, {"jobs": jobs})
             return
 
+        if mtype == "job_begin":
+            # Start a streamed upload: client follows with job_add and/or
+            # job_add_specs batches, then job_commit. Prefix specs keep even
+            # /8-scale scans to kilobyte frames. chunk_size = hosts per
+            # spec chunk (legacy list chunks stay fixed-size).
+            options = msg.get("options") if isinstance(msg.get("options"), dict) else {}
+            try:
+                ignore = options.get("ignore")
+                if isinstance(ignore, list) and len(ignore) > 200000:
+                    options = dict(options)
+                    options["ignore"] = ignore[:200000]
+            except Exception:
+                pass
+            try:
+                req_chunk = int(msg.get("chunk_size", DEFAULT_SPEC_HOSTS))
+            except Exception:
+                req_chunk = DEFAULT_SPEC_HOSTS
+            job_id = uuid.uuid4().hex[:12]
+            job = Job(job_id, client.client_id, 0, options)
+            job.status = "loading"
+            # Spec chunks: hosts per sub-prefix. Legacy list chunks keep the
+            # classic fixed-size semantics.
+            job.chunk_hosts = max(64, min(req_chunk, 65536))
+            job.list_chunk = max(16, min(req_chunk, 5000))
+            with self.lock:
+                self.jobs[job_id] = job
+            self._reply(client.conn, msg_id, True, {"job_id": job_id})
+            return
+
+        if mtype == "job_add":
+            job = self.jobs.get(msg.get("job_id"))
+            if job is None:
+                self._reply(client.conn, msg_id, False, error="unknown job")
+                return
+            if job.owner_id != client.client_id:
+                self._reply(client.conn, msg_id, False, error="not job owner")
+                return
+            if job.status != "loading":
+                self._reply(client.conn, msg_id, False, error="job already committed")
+                return
+            targets = msg.get("targets")
+            if not isinstance(targets, list):
+                self._reply(client.conn, msg_id, False, error="bad payload")
+                return
+            added = 0
+            with self.lock:
+                for t in targets:
+                    t = str(t or "").strip()
+                    if not t or t in job.seen:
+                        continue
+                    if len(job.target_list) >= MAX_TARGETS_PER_JOB:
+                        break
+                    job.seen.add(t)
+                    job.target_list.append(t)
+                    added += 1
+                job.total = len(job.target_list)
+                total = job.total
+            capped = total >= MAX_TARGETS_PER_JOB
+            self._reply(client.conn, msg_id, True,
+                        {"added": added, "total": total, "capped": capped})
+            return
+
+        if mtype == "job_add_specs":
+            job = self.jobs.get(msg.get("job_id"))
+            if job is None:
+                self._reply(client.conn, msg_id, False, error="unknown job")
+                return
+            if job.owner_id != client.client_id:
+                self._reply(client.conn, msg_id, False, error="not job owner")
+                return
+            if job.status != "loading":
+                self._reply(client.conn, msg_id, False, error="job already committed")
+                return
+            specs = msg.get("specs")
+            if not isinstance(specs, list):
+                self._reply(client.conn, msg_id, False, error="bad payload")
+                return
+            added = 0
+            with self.lock:
+                for spec in specs[:SPEC_UPLOAD_BATCH * 2]:
+                    if not isinstance(spec, dict):
+                        continue
+                    subnet = str(spec.get("subnet") or "").strip()
+                    try:
+                        ports = sorted({int(p) for p in (spec.get("ports") or [])
+                                        if 1 <= int(p) <= 65535})
+                    except Exception:
+                        continue
+                    if not subnet or not ports or len(ports) > 64:
+                        continue
+                    import ipaddress as _ip
+                    try:
+                        net = _ip.ip_network(subnet, strict=False)
+                        if net.version != 4:
+                            continue
+                        subnet = str(net)
+                    except Exception:
+                        continue
+                    key = (subnet, tuple(ports))
+                    if key in job.seen:
+                        continue
+                    job.seen.add(key)
+                    job.spec_list.append({"subnet": subnet, "ports": ports})
+                    added += 1
+                nspecs = len(job.spec_list)
+            self._reply(client.conn, msg_id, True,
+                        {"added": added, "specs": nspecs})
+            return
+
+        if mtype == "job_commit":
+            job = self.jobs.get(msg.get("job_id"))
+            if job is None:
+                self._reply(client.conn, msg_id, False, error="unknown job")
+                return
+            if job.owner_id != client.client_id:
+                self._reply(client.conn, msg_id, False, error="not job owner")
+                return
+            with self.lock:
+                if job.status != "loading":
+                    self._reply(client.conn, msg_id, False, error="job already committed")
+                    return
+                try:
+                    hosts_per_chunk = max(64, min(int(getattr(
+                        job, "chunk_hosts", DEFAULT_SPEC_HOSTS)), 65536))
+                except Exception:
+                    hosts_per_chunk = DEFAULT_SPEC_HOSTS
+                # Legacy explicit targets: fixed-size list chunks.
+                list_chunks = split_targets(
+                    job.target_list, getattr(job, "list_chunk", DEFAULT_CHUNK_SIZE))
+                # Prefix specs: split into sub-prefix chunks. Auto-coarsen if
+                # the scan is so big the chunk count would explode.
+                spec_pieces = []  # [(subnet, ports, exclude)]
+                spec_total = 0
+                for spec in job.spec_list:
+                    excl = spec_excludes(spec["subnet"])
+                    for sub in split_spec(spec["subnet"], hosts_per_chunk):
+                        n = piece_target_count(sub, excl, len(spec["ports"]))
+                        spec_total += n
+                        if spec_total > MAX_SPEC_TARGETS:
+                            break
+                        spec_pieces.append((sub, spec["ports"], excl))
+                    if spec_total > MAX_SPEC_TARGETS:
+                        break
+                while len(list_chunks) + len(spec_pieces) > MAX_CHUNKS_PER_JOB \
+                        and hosts_per_chunk < 65536 * 16:
+                    hosts_per_chunk *= 4
+                    spec_pieces = []
+                    spec_total = 0
+                    for spec in job.spec_list:
+                        excl = spec_excludes(spec["subnet"])
+                        for sub in split_spec(spec["subnet"], hosts_per_chunk):
+                            n = piece_target_count(sub, excl, len(spec["ports"]))
+                            spec_total += n
+                            if spec_total > MAX_SPEC_TARGETS:
+                                break
+                            spec_pieces.append((sub, spec["ports"], excl))
+                        if spec_total > MAX_SPEC_TARGETS:
+                            break
+                job.target_list = []
+                job.spec_list = []
+                job.seen = set()
+                if not list_chunks and not spec_pieces:
+                    if spec_total > MAX_SPEC_TARGETS:
+                        self._reply(client.conn, msg_id, False, error=(
+                            f"scan too big (>{MAX_SPEC_TARGETS} host:ports); "
+                            f"narrow the range"))
+                    else:
+                        self._reply(client.conn, msg_id, False, error="no valid targets")
+                    try:
+                        del self.jobs[job.job_id]
+                    except KeyError:
+                        pass
+                    return
+                idx = 0
+                for c in list_chunks:
+                    job.chunks.append(Chunk(f"{job.job_id}:{idx}", kind="list",
+                                            targets=c))
+                    idx += 1
+                for sub, ports, excl in spec_pieces:
+                    job.chunks.append(Chunk(f"{job.job_id}:{idx}", kind="spec",
+                                            subnet=sub, ports=ports, exclude=excl))
+                    idx += 1
+                job.total = (sum(len(c) for c in list_chunks)
+                             + sum(piece_target_count(s, e, len(p))
+                                   for s, p, e in spec_pieces))
+                job.status = "active"
+            self.log(f"job {job.job_id} from {client.name}: {job.total} targets, "
+                     f"{len(job.chunks)} chunks ({hosts_per_chunk} hosts/chunk)")
+            self._reply(client.conn, msg_id, True,
+                        {"job_id": job.job_id, "total": job.total,
+                         "chunks": len(job.chunks)})
+            return
+
+        if mtype == "job_ignorelist":
+            # Workers fetch the owner's ignore set once per job instead of
+            # receiving it inside every chunk assign.
+            job = self.jobs.get(msg.get("job_id"))
+            if job is None:
+                self._reply(client.conn, msg_id, False, error="unknown job")
+                return
+            ignore = []
+            try:
+                ignore = list((job.options or {}).get("ignore") or [])
+            except Exception:
+                pass
+            self._reply(client.conn, msg_id, True, {"ignore": ignore[:200000]})
+            return
+
         if mtype == "job_create":
             targets = msg.get("targets") or []
             if not isinstance(targets, list) or not targets:
@@ -561,7 +811,7 @@ class DistServer:
             job_id = uuid.uuid4().hex[:12]
             job = Job(job_id, client.client_id, sum(len(c) for c in chunks), options)
             for i, c in enumerate(chunks):
-                job.chunks.append(Chunk(f"{job_id}:{i}", c))
+                job.chunks.append(Chunk(f"{job_id}:{i}", kind="list", targets=c))
             with self.lock:
                 self.jobs[job_id] = job
             self.log(f"job {job_id} from {client.name}: {job.total} targets, "
@@ -697,7 +947,7 @@ class DistServer:
             if chunk is not None and chunk.state == "leased" and chunk.worker == client.client_id:
                 # done_targets is incremental per batch; accumulate it.
                 chunk.done_count += max(0, done_targets)
-                if chunk.done_count >= len(chunk.targets):
+                if chunk.done_count >= chunk.size():
                     chunk.state = "done"
                     chunk.worker = None
                     with client.lock:

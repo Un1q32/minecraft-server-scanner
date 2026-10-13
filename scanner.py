@@ -9131,6 +9131,7 @@ class UserLogTab(QWidget, QtBaseMixin):
 try:
     from dist_client import DistAgent, DistError
     from dist_common import DEFAULT_PORT as DIST_DEFAULT_PORT
+    from dist_common import summarize_range_spec as _summarize_range_spec
     _DIST_AVAILABLE = True
     _DIST_IMPORT_ERROR = ""
 except Exception as _dist_import_err:  # pragma: no cover
@@ -9139,9 +9140,82 @@ except Exception as _dist_import_err:  # pragma: no cover
     class DistError(Exception):
         pass
 
+    def _summarize_range_spec(spec):
+        return []
+
     DIST_DEFAULT_PORT = 8443
     _DIST_AVAILABLE = False
     _DIST_IMPORT_ERROR = str(_dist_import_err)
+
+
+def build_dist_job_specs(target_text, ports):
+    """Compile GUI target text into prefix specs for distributed scans.
+
+    Returns (specs, skipped) where specs = [{"subnet": "10.0.0.0/8",
+    "ports": [...]}]. CIDRs pass through, start-end ranges are summarized to
+    minimal covering subnets, ASNs resolve to their prefixes, and single IPs
+    (or explicit ip:port entries) become /32s — so even a /8 uploads as a
+    few hundred bytes and workers enumerate locally.
+    """
+    try:
+        plist = [int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535]
+    except Exception:
+        plist = [25565]
+    if not plist:
+        plist = [25565]
+    try:
+        masscan_targets, direct_targets = build_masscan_inputs(target_text, plist)
+    except Exception:
+        return [], 1
+    specs = []
+    seen = set()
+    skipped = 0
+
+    def add_spec(subnet, ports_list):
+        try:
+            net = ipaddress.ip_network(subnet, strict=False)
+            if net.version != 4:
+                return False
+            subnet_n = str(net)
+        except Exception:
+            return False
+        try:
+            ports_n = sorted({int(p) for p in ports_list if 1 <= int(p) <= 65535})
+        except Exception:
+            return False
+        if not ports_n or len(ports_n) > 64:
+            return False
+        key = (subnet_n, tuple(ports_n))
+        if key in seen:
+            return True
+        seen.add(key)
+        specs.append({"subnet": subnet_n, "ports": ports_n})
+        return True
+
+    for spec in masscan_targets:
+        ok = False
+        try:
+            if "/" in spec:
+                ok = add_spec(spec, plist)
+            elif "-" in spec:
+                ok = False
+                for cidr in _summarize_range_spec(spec):
+                    ok = add_spec(cidr, plist) or ok
+            else:
+                ok = add_spec(f"{spec}/32", plist)
+        except Exception:
+            ok = False
+        if not ok:
+            skipped += 1
+    for ip_port in direct_targets:
+        try:
+            host, port = split_host_port(ip_port)
+            ok = add_spec(f"{host}/32", [port])
+        except Exception:
+            ok = False
+        if not ok:
+            skipped += 1
+    return specs, skipped
 
 
 class DistTab(QtBaseMixin, QWidget):
@@ -9275,15 +9349,11 @@ class DistTab(QtBaseMixin, QWidget):
         self.ports_edit.setText(NETWORK_SCAN_DEFAULT_PORTS)
         self.ports_edit.setMaximumWidth(120)
         ol.addWidget(self.ports_edit)
-        ol.addWidget(QLabel("Max hosts:", opts))
-        self.max_hosts_edit = QLineEdit(opts)
-        self.max_hosts_edit.setText(str(NETWORK_SCAN_MAX_HOSTS))
-        self.max_hosts_edit.setMaximumWidth(80)
-        ol.addWidget(self.max_hosts_edit)
-        ol.addWidget(QLabel("Chunk:", opts))
+        ol.addWidget(QLabel("Hosts/chunk:", opts))
         self.chunk_spin = QSpinBox(opts)
-        self.chunk_spin.setRange(16, 5000)
-        self.chunk_spin.setValue(256)
+        self.chunk_spin.setRange(64, 65536)
+        self.chunk_spin.setValue(4096)
+        self.chunk_spin.setToolTip("Sub-prefix chunk size: a /8 becomes ~4096 /20 chunks at 4096.")
         ol.addWidget(self.chunk_spin)
         self.start_btn = QPushButton("Start distributed scan", opts)
         self.start_btn.clicked.connect(self.start_dist_scan)
@@ -9321,7 +9391,11 @@ class DistTab(QtBaseMixin, QWidget):
                 self.net_edit.setText(str(cfg.get("network_label") or ""))
                 self.worker_check.setChecked(bool(cfg.get("worker_enabled", True)))
                 self.slots_spin.setValue(int(cfg.get("worker_slots", 2) or 2))
-                self.chunk_spin.setValue(int(cfg.get("chunk_size", 256) or 256))
+                try:
+                    self.chunk_spin.setValue(int(cfg.get("chunk_hosts",
+                        cfg.get("chunk_size", 4096)) or 4096))
+                except Exception:
+                    pass
             except Exception:
                 pass
         else:
@@ -9363,7 +9437,7 @@ class DistTab(QtBaseMixin, QWidget):
             network_label=self.net_edit.text().strip(),
             worker_enabled=self.worker_check.isChecked(),
             worker_slots=self.slots_spin.value(),
-            chunk_size=self.chunk_spin.value(),
+            chunk_hosts=self.chunk_spin.value(),
         )
 
     def connect(self):
@@ -9536,30 +9610,38 @@ class DistTab(QtBaseMixin, QWidget):
             ports = parse_ports(self.ports_edit.text())
         except Exception:
             ports = parse_ports(NETWORK_SCAN_DEFAULT_PORTS)
-        try:
-            max_hosts = max(1, int(self.max_hosts_edit.text().strip() or NETWORK_SCAN_MAX_HOSTS))
-        except ValueError:
-            max_hosts = NETWORK_SCAN_MAX_HOSTS
-        chunk_size = self.chunk_spin.value()
+        chunk_hosts = self.chunk_spin.value()
         self._save_ui_to_config()
-        self.set_status("Expanding targets...")
+        self.set_status("Resolving targets...")
         threading.Thread(
             target=self._start_scan_work,
-            args=(targets_raw, ports, max_hosts, chunk_size),
+            args=(targets_raw, ports, chunk_hosts),
             daemon=True,
         ).start()
 
-    def _start_scan_work(self, targets_raw, ports, max_hosts, chunk_size):
+    def _start_scan_work(self, targets_raw, ports, chunk_hosts):
+        # Prefix path: compile to subnet specs (instant even for a /8) and
+        # upload those; the server splits them into sub-prefix chunks and
+        # workers enumerate locally. No per-IP upload ever happens here.
         try:
-            targets = expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
+            specs, skipped = build_dist_job_specs(targets_raw, ports)
         except Exception as exc:
-            self.after(0, lambda e=str(exc): self.set_status(f"Target expansion failed: {e}"))
+            self.after(0, lambda e=str(exc): self.set_status(f"Target parsing failed: {e}"))
             return
-        if not targets:
+        if not specs:
             self.after(0, lambda: self.set_status("No valid targets to scan."))
             return
         try:
-            info = self.agent.submit_job(targets, options={}, chunk_size=chunk_size)
+            ignore = sorted(load_ignore_set())
+        except Exception:
+            ignore = []
+        try:
+            def _up(d, t):
+                self.after(0, lambda dd=d, tt=t: self.set_status(
+                    f"Uploading scan: {dd}/{tt} subnets..."))
+            info = self.agent.submit_spec_job(specs, ignore=ignore, options={},
+                                              chunk_hosts=chunk_hosts,
+                                              progress_cb=_up)
         except Exception as exc:
             self.after(0, lambda e=str(exc): self.set_status(f"Job submit failed: {e}"))
             return

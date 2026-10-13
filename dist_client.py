@@ -50,6 +50,7 @@ class DistAgent:
         self._pending_lock = threading.Lock()
         self._assign_lock = threading.Lock()
         self._active_chunks = {}  # chunk_id -> True (slot accounting)
+        self._job_ignores = {}  # job_id -> set of ignored ip:port (cached)
         self._worker_slots = 2
         self._worker_enabled = True
         self._chunk_workers = 100
@@ -298,14 +299,92 @@ class DistAgent:
 
     # ---------- owner API ----------
 
-    def submit_job(self, targets, options=None, chunk_size=None):
+    def submit_job(self, targets, options=None, chunk_size=None, progress_cb=None):
+        """Upload targets in small batches (begin/add/commit) so even /8-scale
+        scans stay far under the wire frame cap, then activate the job.
+        Returns {job_id, total, chunks} like the single-shot variant."""
+        from dist_common import MAX_TARGETS_PER_JOB, UPLOAD_BATCH
+        targets = [str(t or "").strip() for t in (targets or []) if str(t or "").strip()]
+        if not targets:
+            raise DistError("no targets")
+        if len(targets) > MAX_TARGETS_PER_JOB:
+            raise DistError(
+                f"too many targets ({len(targets)} > {MAX_TARGETS_PER_JOB}); "
+                f"lower Max hosts")
         data = self._request({
-            "type": "job_create",
-            "targets": list(targets or []),
+            "type": "job_begin",
             "options": options or {},
             "chunk_size": chunk_size or self.cfg.get("chunk_size", 256),
         }, timeout=60)
-        return data  # {job_id, total, chunks}
+        job_id = data.get("job_id")
+        if not job_id:
+            raise DistError("server refused job")
+        batch = UPLOAD_BATCH
+        total = len(targets)
+        done = 0
+        while done < total:
+            part = targets[done:done + batch]
+            try:
+                self._request({"type": "job_add", "job_id": job_id,
+                               "targets": part}, timeout=120)
+            except Exception as exc:
+                try:
+                    self._request({"type": "job_cancel", "job_id": job_id},
+                                  timeout=15)
+                except Exception:
+                    pass
+                raise DistError(f"target upload failed at {done}/{total}: {exc}")
+            done += len(part)
+            if progress_cb:
+                try:
+                    progress_cb(done, total)
+                except Exception:
+                    pass
+        return self._request({"type": "job_commit", "job_id": job_id}, timeout=60)
+
+    def submit_spec_job(self, specs, ignore=None, options=None, chunk_hosts=None,
+                        progress_cb=None):
+        """Prefix-based job: specs = [{"subnet": "10.0.0.0/8", "ports": [...]},
+        ...]. Stays tiny on the wire no matter how big the range; workers
+        enumerate locally. ignore = owner's ignore set (filtered by workers).
+        Returns {job_id, total, chunks}."""
+        from dist_common import SPEC_UPLOAD_BATCH
+        specs = [s for s in (specs or []) if isinstance(s, dict) and s.get("subnet")]
+        if not specs:
+            raise DistError("no valid subnets")
+        options = dict(options or {})
+        if ignore:
+            options["ignore"] = [str(t or "").strip() for t in ignore
+                                 if str(t or "").strip()][:200000]
+        data = self._request({
+            "type": "job_begin",
+            "options": options,
+            "chunk_size": chunk_hosts or self.cfg.get("chunk_hosts", 4096),
+        }, timeout=60)
+        job_id = data.get("job_id")
+        if not job_id:
+            raise DistError("server refused job")
+        total = len(specs)
+        done = 0
+        while done < total:
+            part = specs[done:done + SPEC_UPLOAD_BATCH]
+            try:
+                self._request({"type": "job_add_specs", "job_id": job_id,
+                               "specs": part}, timeout=120)
+            except Exception as exc:
+                try:
+                    self._request({"type": "job_cancel", "job_id": job_id},
+                                  timeout=15)
+                except Exception:
+                    pass
+                raise DistError(f"spec upload failed at {done}/{total}: {exc}")
+            done += len(part)
+            if progress_cb:
+                try:
+                    progress_cb(done, total)
+                except Exception:
+                    pass
+        return self._request({"type": "job_commit", "job_id": job_id}, timeout=120)
 
     def cancel_job(self, job_id):
         return self._request({"type": "job_cancel", "job_id": job_id})
@@ -353,7 +432,7 @@ class DistAgent:
     def _run_chunk(self, msg):
         job_id = msg.get("job_id")
         chunk_id = msg.get("chunk_id")
-        targets = msg.get("targets") or []
+        kind = msg.get("kind") or ("spec" if msg.get("subnet") else "list")
         if not self._worker_enabled or self.ping_fn is None:
             return
         if not self._slot_acquire():
@@ -363,7 +442,19 @@ class DistAgent:
                 return
             self._active_chunks[chunk_id] = True
         try:
-            self._execute_chunk(job_id, chunk_id, targets)
+            if kind == "spec":
+                from dist_common import enumerate_piece_targets
+                subnet = str(msg.get("subnet") or "")
+                ports = msg.get("ports") or [25565]
+                exclude = msg.get("exclude") or []
+                ignore = self._job_ignore(job_id)
+                self._execute_targets(
+                    job_id, chunk_id,
+                    enumerate_piece_targets(subnet, ports, exclude),
+                    skip=lambda t: t in ignore)
+            else:
+                targets = msg.get("targets") or []
+                self._execute_targets(job_id, chunk_id, list(targets))
         finally:
             with self._assign_lock:
                 self._active_chunks.pop(chunk_id, None)
@@ -374,30 +465,62 @@ class DistAgent:
                 except Exception:
                     pass
 
+    def _job_ignore(self, job_id):
+        # Fetch + cache the owner's ignore set once per job (never inside
+        # every chunk assign: it can be thousands of entries).
+        with self._assign_lock:
+            if job_id in self._job_ignores:
+                return self._job_ignores[job_id]
+        ignore = set()
+        try:
+            data = self._request({"type": "job_ignorelist", "job_id": job_id},
+                                 timeout=30)
+            for t in (data.get("ignore") or [])[:200000]:
+                t = str(t or "").strip()
+                if t:
+                    ignore.add(t)
+        except Exception:
+            pass
+        with self._assign_lock:
+            if len(self._job_ignores) > 64:
+                self._job_ignores.pop(next(iter(self._job_ignores)), None)
+            self._job_ignores[job_id] = ignore
+        return ignore
+
     def _execute_chunk(self, job_id, chunk_id, targets):
+        self._execute_targets(job_id, chunk_id, list(targets or []))
+
+    def _execute_targets(self, job_id, chunk_id, targets, skip=None):
         ping = self.ping_fn
-        workers = max(1, min(self._chunk_workers, max(1, len(targets))))
+        try:
+            total = len(targets)
+        except TypeError:
+            targets = list(targets)
+            total = len(targets)
+        workers = max(1, min(self._chunk_workers, max(1, total)))
         hits = []
         done = 0
         lock = threading.Lock()
         last_flush = [time.time()]
 
-        def flush(final=False):
+        def flush(final=False, progress_only=False):
             with lock:
                 batch = hits[:]
                 del hits[:]
                 n_done = done
+            delta = n_done - flush.sent
             if not batch and not final:
+                if not progress_only or delta < 500:
+                    return
+            if delta <= 0 and not batch and not final:
                 return
             try:
                 # done_targets is incremental per batch.
-                with lock:
-                    pass
                 self._request({
                     "type": "result_batch", "job_id": job_id,
                     "chunk_id": chunk_id,
                     "results": [normalize_result_for_wire(r) for r in batch],
-                    "done_targets": n_done - flush.sent,
+                    "done_targets": max(0, delta),
                 }, timeout=60)
                 flush.sent = n_done
             except Exception:
@@ -412,17 +535,25 @@ class DistAgent:
         def one(target):
             nonlocal done
             try:
-                r = ping(target)
+                if skip is not None and skip(target):
+                    r = None
+                    skipped = True
+                else:
+                    r = ping(target)
+                    skipped = False
             except Exception:
                 r = None
+                skipped = False
             with lock:
                 done += 1
                 if r:
                     hits.append(r)
-                need_flush = len(hits) >= 50 or (time.time() - last_flush[0]) > 2.0
+                need_flush = (len(hits) >= 50
+                              or (time.time() - last_flush[0]) > 2.0
+                              or (skipped and done - flush.sent >= 500))
             if need_flush:
                 last_flush[0] = time.time()
-                flush()
+                flush(progress_only=skipped and not hits)
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             list(ex.map(one, targets))
