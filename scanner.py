@@ -68,7 +68,6 @@ except Exception:
 init(autoreset=True)
 
 SHODAN_KEY_PATH = os.path.join(os.getcwd(), "shodan_key.txt")
-GLOBAL_IP_LOG = "ips.txt"
 SERVERS_DB_FILE = "servers.db"
 TIMEOUT = 3
 PROTOCOL_VERSION = 772
@@ -260,78 +259,6 @@ def init_server_db():
             con.commit()
         finally:
             con.close()
-    _migrate_ips_txt_to_db()
-
-
-def _migrate_ips_txt_to_db():
-    """One-time import of legacy ips.txt rows so history is not lost."""
-    import sqlite3
-    try:
-        with _SERVER_DB_LOCK:
-            con = _server_db_connect()
-            try:
-                cur = con.execute("SELECT COUNT(*) FROM servers")
-                if (cur.fetchone() or [0])[0] > 0:
-                    return
-            finally:
-                con.close()
-    except Exception:
-        return
-    if not os.path.exists(GLOBAL_IP_LOG):
-        return
-    try:
-        mtime = os.path.getmtime(GLOBAL_IP_LOG)
-    except Exception:
-        mtime = time.time()
-    rows = []
-    try:
-        with open(GLOBAL_IP_LOG, "r", encoding="utf-8") as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    ip, motd, players, version = parse_formatted_line(ln)
-                    ip = get_ip_only(ip)
-                    if not is_valid_ip_port(ip):
-                        continue
-                    online, maximum = 0, 0
-                    if "/" in str(players):
-                        try:
-                            o, m = str(players).split("/", 1)
-                            online, maximum = int(o), int(m)
-                        except Exception:
-                            pass
-                    rows.append((ip, sanitize_motd(motd), online, maximum,
-                                 sanitize_motd(version), mtime, mtime))
-                except Exception:
-                    continue
-    except Exception:
-        return
-    if not rows:
-        return
-    try:
-        with _SERVER_DB_LOCK:
-            con = _server_db_connect()
-            try:
-                for ip, motd, online, maximum, version, first_seen, last_seen in rows:
-                    try:
-                        host, port = split_host_port(ip)
-                    except Exception:
-                        host, port = ip, 25565
-                    con.execute(
-                        "INSERT OR IGNORE INTO servers"
-                        " (ip_port, host, port, motd, players_online, max_players,"
-                        "  version, first_seen, last_seen, times_seen, last_source)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'ips.txt')",
-                        (ip, host, port, motd, online, maximum, version,
-                         first_seen, last_seen),
-                    )
-                con.commit()
-            finally:
-                con.close()
-    except Exception:
-        pass
 
 
 def record_server_result(result, source="scan"):
@@ -523,8 +450,8 @@ def format_db_timestamp(ts):
 
 
 def _ensure_server_db():
-    # Idempotent table creation without the ips.txt migration (safe to call
-    # at any point, including before later-defined helpers exist).
+    # Idempotent table creation (safe to call at any point, including
+    # before later-defined helpers exist).
     try:
         with _SERVER_DB_LOCK:
             con = _server_db_connect()
@@ -1539,7 +1466,6 @@ def parse_version(data_string):
     return match.group(1).strip() if match else "N/A"
 
 def save_shodan_results(servers, filepath):
-    ip_set = set()
     skipped_ignored = 0
     with open(filepath, "w", encoding="utf-8") as f:
         for server in servers:
@@ -1555,30 +1481,11 @@ def save_shodan_results(servers, filepath):
             if is_ignored(ip_port):
                 skipped_ignored += 1
                 continue
-            ip_set.add(ip_port)
             line = f"{ip_port} | MOTD: {motd} | Players: {players} | Version: {version}"
             f.write(line + "\n")
 
-    update_global_ip_log(ip_set)
     if skipped_ignored:
         print(Fore.YELLOW + f"Skipped {skipped_ignored} ignored entrie(s).")
-
-def update_global_ip_log(new_entries):
-    updated_lines = {}
-    if os.path.exists(GLOBAL_IP_LOG):
-        with open(GLOBAL_IP_LOG, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    ip = line.strip().split(' |')[0]
-                    updated_lines[ip] = line.strip()
-
-    for entry in new_entries:
-        if entry not in updated_lines and not is_ignored(entry):
-            updated_lines[entry] = f"{entry} | MOTD: N/A | Players: N/A | Version: N/A"
-
-    with open(GLOBAL_IP_LOG, 'w', encoding='utf-8') as f:
-        for line in sorted(updated_lines.values()):
-            f.write(line + "\n")
 
 def read_servers(file):
     entries = []
@@ -3790,27 +3697,6 @@ def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wai
     return found, (stderr[:500] if stderr else "")
 
 
-def merge_global_ip_log(updated_ips):
-    """Merge {ip_port: line} results into the global ips.txt log."""
-    existing = {}
-    if os.path.exists(GLOBAL_IP_LOG):
-        try:
-            with open(GLOBAL_IP_LOG, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if line.strip():
-                        ip = line.strip().split(' |')[0]
-                        existing[ip] = line.strip()
-        except Exception:
-            pass
-    existing.update({k: v for k, v in (updated_ips or {}).items() if not is_ignored(k)})
-    try:
-        with open(GLOBAL_IP_LOG, 'w', encoding='utf-8') as f:
-            for line in sorted(existing.values()):
-                f.write(line + "\n")
-    except Exception:
-        pass
-
-
 class UserLogManager:
     """
     Thread-safe store that tracks the last seen server for each player name.
@@ -3931,7 +3817,7 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
 # GUI-friendly scan with streaming callbacks
 def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, login_probe=False):
     filtered = [s for s in servers if not is_ignored(s)]
-    results, online_lines, updated_ips = [], [], {}
+    results, online_lines = [], []
     total, done = len(filtered), 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -3949,9 +3835,7 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
 
             if r:
                 results.append(r)
-                ip_key = r['ip']
-                line = f"{ip_key} | MOTD: {r['motd']} | Players: {r['players']}/{r['max_players']} | Version: {r['version']}"
-                updated_ips[ip_key] = line
+                line = f"{r['ip']} | MOTD: {r['motd']} | Players: {r['players']}/{r['max_players']} | Version: {r['version']}"
                 if r['players'] > 0:
                     online_lines.append(line)
                 USER_LOG_MANAGER.update_from_result(r)
@@ -3962,19 +3846,6 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
             if on_progress:
                 try: on_progress(done, total)
                 except Exception: pass
-
-    existing = {}
-    if os.path.exists(GLOBAL_IP_LOG):
-        with open(GLOBAL_IP_LOG, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    ip = line.strip().split(' |')[0]
-                    existing[ip] = line.strip()
-    existing.update({k: v for k, v in updated_ips.items() if not is_ignored(k)})
-
-    with open(GLOBAL_IP_LOG, 'w', encoding='utf-8') as f:
-        for line in sorted(existing.values()):
-            f.write(line + "\n")
 
     return results, online_lines
 
@@ -4480,25 +4351,6 @@ def save_reason_file(file_path, rows):
     with open(file_path, "w", encoding="utf-8") as f:
         for ip, reason in rows:
             f.write(f"{ip} | Reason: {reason or 'No reason'}\n")
-
-def load_ips_rows(file_path=GLOBAL_IP_LOG):
-    rows = []
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            for ln in f:
-                if not ln.strip():
-                    continue
-                ip, motd, players, version = parse_formatted_line(ln.strip())
-                ip = get_ip_only(ip)
-                if is_valid_ip_port(ip):
-                    rows.append((ip, motd, players, version))
-    return rows
-
-def save_ips_rows(rows, file_path=GLOBAL_IP_LOG):
-    with open(file_path, "w", encoding="utf-8") as f:
-        for (ip, motd, players, version) in rows:
-            players = players or "N/A"
-            f.write(f"{ip} | MOTD: {sanitize_motd(motd)} | Players: {players} | Version: {version}\n")
 
 
 # ==================== Qt server icons + GUI (PySide6) ====================
@@ -5540,7 +5392,6 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 whitelist_seen = set()
                 lock = threading.Lock()
                 results = []
-                stream_updated = {}
 
                 def on_start(ip):
                     self._current_scan_ip = ip
@@ -5641,7 +5492,6 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                         f"{r['players']}/{r['max_players']} | Version: {r['version']}")
                                 with lock:
                                     results.append(r)
-                                    stream_updated[r["ip"]] = line
                                 try:
                                     USER_LOG_MANAGER.update_from_result(r)
                                 except Exception:
@@ -5673,7 +5523,6 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             except Exception:
                                 pass
                             if backend.startswith("masscan"):
-                                merge_global_ip_log(stream_updated)
                                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
                                 self.after(0, lambda m=msg: self.set_status(m))
                                 return "abort"
@@ -5749,7 +5598,6 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         targets = expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
                     if not targets and not results:
                         self.after(0, lambda: self.set_status("No valid targets to scan."))
-                        merge_global_ip_log(stream_updated)
                         return
                     if targets:
                         def on_progress(done, total):
@@ -5763,7 +5611,6 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             on_progress=on_progress
                         )
                         results.extend(more)
-                merge_global_ip_log(stream_updated)
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
                 if _masscan_note_is_partial(masscan_note):
                     self.after(0, lambda n=len(results): self.set_status(
@@ -8591,7 +8438,7 @@ class JSONTab(QWidget, QtBaseMixin):
 
 # ===== Qt port section: qt_rest (PySide6, 1:1 behavior) =====
 """PySide6 port of ExportTab (scanner.py:8041-8094),
-_ReasonFileTab/SavedTab/IgnoreTab (8095-8228), IpLogTab (8229-8321),
+_ReasonFileTab/SavedTab/IgnoreTab (8095-8228),
 UserLogTab (8322-8482) and FullAppGUI (5696-5734). 1:1 logic, Qt widgets only.
 
 Backend symbols (reference as-is, provided by scanner.py):
@@ -8599,8 +8446,7 @@ Backend symbols (reference as-is, provided by scanner.py):
     load_reason_file, save_reason_file, SAVED_FILE, IGNORE_FILE,
     refresh_ignore_set, is_valid_ip_port, get_ip_only,
     get_active_mc_account, whitelist_result_label,
-    run_whitelist_verifier_async, load_ips_rows, save_ips_rows,
-    GLOBAL_IP_LOG, sanitize_motd, make_tree_sortable,
+    run_whitelist_verifier_async, sanitize_motd, make_tree_sortable,
     _ip_key, _players_key, _version_key, USER_LOG_MANAGER
 """
 
@@ -8853,107 +8699,6 @@ class IgnoreTab(ReasonFileTab):
         super().__init__(parent, IGNORE_FILE, "Ignore")
 
 
-# ---- IP Log (ips.txt) Tab ----
-class IpLogTab(QWidget, QtBaseMixin):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.rows = []  # list[(ip,motd,players,version)]
-        self._build_ui()
-        self._load()
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-
-        bar = QHBoxLayout()
-        root.addLayout(bar)
-        btn_add = QPushButton("Add")
-        btn_add.clicked.connect(self._add)
-        bar.addWidget(btn_add)
-        btn_edit = QPushButton("Edit")
-        btn_edit.clicked.connect(self._edit)
-        bar.addWidget(btn_edit)
-        btn_remove = QPushButton("Remove")
-        btn_remove.clicked.connect(self._remove)
-        bar.addWidget(btn_remove)
-        btn_copy = QPushButton("Copy IP(s)")
-        btn_copy.clicked.connect(self._copy)
-        bar.addWidget(btn_copy)
-        btn_reload = QPushButton("Reload")
-        btn_reload.clicked.connect(self._load)
-        bar.addWidget(btn_reload)
-        btn_save = QPushButton("Save")
-        btn_save.clicked.connect(self._save)
-        bar.addWidget(btn_save)
-        bar.addStretch(1)
-
-        cols = ("ip", "motd", "players", "version")
-        self.tree = ResultTable()
-        self.tree.set_columns(cols)
-        root.addWidget(self.tree, 1)
-
-        # enable sorting
-        make_tree_sortable(self.tree, {
-            "ip": _ip_key,
-            "motd": lambda v: str(v).lower(),
-            "players": _players_key,
-            "version": _version_key,
-        })
-
-    def _load(self):
-        self.rows = load_ips_rows(GLOBAL_IP_LOG)
-        self.tree.delete(*self.tree.get_children())
-        for row in self.rows:
-            self.tree.insert("", "end", values=row)
-
-    def _save(self):
-        rows = []
-        for iid in self.tree.get_children():
-            vals = self.tree.item(iid, "values")
-            if vals and is_valid_ip_port(vals[0]):
-                rows.append(vals)
-        save_ips_rows(rows, GLOBAL_IP_LOG)
-        q_info(self, "IP Log", "Saved.")
-
-    def _selected_iids(self):
-        return list(self.tree.selection())
-
-    def _add(self):
-        ip = q_ask_string(self, "IP Log", "IP:PORT")
-        if not ip or not is_valid_ip_port(ip):
-            return
-        motd = q_ask_string(self, "IP Log", "MOTD (optional)") or ""
-        players = q_ask_string(self, "IP Log", "Players (e.g. 0/20 or N/A)", initial="N/A") or "N/A"
-        version = q_ask_string(self, "IP Log", "Version (optional)") or "N/A"
-        self.tree.insert("", "end", values=(get_ip_only(ip), motd, players, version))
-
-    def _edit(self):
-        iids = self._selected_iids()
-        if not iids:
-            return
-        ip, motd, players, version = self.tree.item(iids[0], "values")
-        new_ip = q_ask_string(self, "IP Log", "IP:PORT", initial=ip) or ip
-        if not is_valid_ip_port(get_ip_only(new_ip)):
-            return
-        motd = q_ask_string(self, "IP Log", "MOTD", initial=motd) or ""
-        players = q_ask_string(self, "IP Log", "Players", initial=players) or players
-        version = q_ask_string(self, "IP Log", "Version", initial=version) or version
-        self.tree.item(iids[0], values=(get_ip_only(new_ip), motd, players, version))
-
-    def _remove(self):
-        for iid in self._selected_iids():
-            self.tree.delete(iid)
-
-    def _copy(self):
-        ips = []
-        for iid in self._selected_iids():
-            v = self.tree.item(iid, "values")
-            if v:
-                ips.append(v[0])
-        if not ips:
-            return
-        QApplication.clipboard().setText("\n".join(ips))
-
-
 class UserLogTab(QWidget, QtBaseMixin):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -9134,7 +8879,6 @@ class FullAppGUI(QMainWindow):
         self.import_tab = ExportTab(nb)
         self.saved_tab = SavedTab(nb)
         self.ignore_tab = IgnoreTab(nb)
-        self.iplog_tab = IpLogTab(nb)
         self.user_log_tab = UserLogTab(nb)
         self.account_tab = AccountTab(nb)
         self.monitor_tab = ServerMonitorTab(nb)
@@ -9147,7 +8891,6 @@ class FullAppGUI(QMainWindow):
         nb.addTab(self.import_tab, "Export To MC")
         nb.addTab(self.saved_tab, "Saved List")
         nb.addTab(self.ignore_tab, "Ignore List")
-        nb.addTab(self.iplog_tab, "IP Log")
         nb.addTab(self.user_log_tab, "User Log")
         nb.addTab(self.account_tab, "Accounts")
         nb.addTab(self.proxy_tab, "Proxies")

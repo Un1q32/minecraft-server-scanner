@@ -89,8 +89,6 @@ The result table has a CRACKED column. Every handshake already detects likely of
   Saved/Ignore/Monitor, delete).
 - Maintains Saved and Ignore lists with optional reasons.
 - Filters ignored servers from scan workflows.
-- Maintains a global IP Log in the IP Log tab (legacy `ips.txt`, imported
-  into `servers.db` on first run).
 - Maintains a player log with each player’s latest known server.
 - Copies selected IPs and exports selected result sets.
 
@@ -118,7 +116,6 @@ The result table has a CRACKED column. Every handshake already detects likely of
 - Export to MC: writes text lists to Minecraft’s servers.dat.
 - Saved: manages saved servers.
 - Ignore: manages ignored servers and scans the complete list for whitelist status.
-- IP Log: manages the global ips.txt server log.
 - Player Log: searches and exports discovered player records.
 
 ## Requirements
