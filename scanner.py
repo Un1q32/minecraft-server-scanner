@@ -29,7 +29,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
         QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
-        QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSplitter,
+        QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QSplitter,
         QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
     )
     from qt_helpers import (
@@ -5587,7 +5587,93 @@ class NetworkScanTab(QtBaseMixin, QWidget):
             pass
 
         self.status_label = QLabel("Ready.", self)
-        main.addWidget(self.status_label)
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setMaximumWidth(220)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(8, 0, 8, 8)
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.progress_bar, 0)
+        main.addLayout(status_row)
+
+    def _progress_busy(self):
+        """Indeterminate bar (masscan sweep / expanding targets)."""
+        try:
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setVisible(True)
+        except Exception:
+            pass
+
+    def _progress_set(self, done, total):
+        try:
+            total = int(total)
+            if total <= 0:
+                self._progress_busy()
+                return
+            done = max(0, min(int(done), total))
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(done)
+            self.progress_bar.setVisible(True)
+        except Exception:
+            pass
+
+    def _progress_pct(self, pct):
+        try:
+            pct = max(0.0, min(100.0, float(pct)))
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(int(pct))
+            self.progress_bar.setVisible(True)
+        except Exception:
+            self._progress_busy()
+
+    def _progress_idle(self):
+        try:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(False)
+        except Exception:
+            pass
+
+    def _scan_idle(self, job):
+        if job == self._scan_job_id:
+            self._progress_idle()
+
+    def _scan_phase_progress(self, job, done, total, last_phase, msg):
+        """One GUI-thread progress tick: status text + bar; hides the bar
+        when the final tick of the last phase arrives."""
+        if job != self._scan_job_id:
+            return
+        try:
+            self.status_label.setText(msg)
+        except Exception:
+            pass
+        try:
+            if total and done < total:
+                self._progress_set(done, total)
+            elif last_phase:
+                self._progress_idle()
+            else:
+                self._progress_set(total or 1, total or 1)
+        except Exception:
+            pass
+
+    def _stream_status(self, job, opened, probed, found, pct, rate):
+        if job != self._scan_job_id:
+            return
+        try:
+            self.status_label.setText(
+                format_stream_status(opened, probed, found, pct, rate))
+        except Exception:
+            pass
+        try:
+            if pct is None:
+                self._progress_busy()
+            else:
+                self._progress_pct(pct)
+        except Exception:
+            pass
 
     def set_status(self, msg):
         try:
@@ -5733,6 +5819,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
             self._scan_stop.set()
         except Exception:
             pass
+        self._progress_idle()
         self.set_status("Scan stopped.")
 
     def scan_targets(self):
@@ -5776,19 +5863,27 @@ class NetworkScanTab(QtBaseMixin, QWidget):
             pass
         stop_event = threading.Event()
         self._scan_stop = stop_event
+        self._progress_busy()
         self.set_status("Expanding targets...")
 
         def alive():
             return job == self._scan_job_id and not stop_event.is_set()
 
         def say(msg):
-            if job == self._scan_job_id:
-                self.after(0, lambda m=msg: self.set_status(m))
+            # Job is re-checked at execution time (not just post time) so a
+            # message queued just before Stop / a new scan can't overwrite
+            # the newer status text.
+            self.after(0, lambda m=msg, j=job:
+                       self.set_status(m) if j == self._scan_job_id else None)
+
+        def go_idle():
+            self.after(0, lambda j=job: self._scan_idle(j))
 
         def work(job=job, stop_event=stop_event):
             try:
                 if use_masscan and backend.startswith("masscan") and not is_masscan_available():
                     say("masscan not found; install masscan or use Auto/Python backend.")
+                    go_idle()
                     return
                 # Shared setup runs first so streamed masscan hits appear in
                 # the table the moment their handshake completes.
@@ -5885,6 +5980,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         if backend.startswith("masscan"):
                             message = str(exc)
                             say(f"masscan target error: {message}")
+                            go_idle()
                             return
                     if not ranges and not direct:
                         targets = []
@@ -5900,7 +5996,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                 return
                             self.after(0, lambda o=opened_n["n"], p=probed_n["n"], f=len(results),
                                        pct=scan_prog["pct"], rate=scan_prog["rate"]:
-                                self.set_status(format_stream_status(o, p, f, pct, rate)))
+                                self._stream_status(job, o, p, f, pct, rate))
 
                         def handle_scan_progress(pct, rate):
                             scan_prog["pct"] = pct
@@ -5963,6 +6059,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                 hs_executor.shutdown(wait=False, cancel_futures=True)
                             except Exception:
                                 pass
+                            go_idle()
 
                         for d in direct:
                             handle_open(d)
@@ -6025,6 +6122,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         except Exception as exc:
                             outcome = finish_stream_error(f"masscan failed: {exc}")
                         if outcome == "abort":
+                            go_idle()
                             return
                         if outcome == "fallback":
                             try:
@@ -6042,16 +6140,21 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 if not skip_python:
                     if targets is None:
                         if not alive():
+                            go_idle()
                             return
                         targets = expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
                     if not targets and not results:
                         say("No valid targets to scan.")
+                        go_idle()
                         return
                     if targets:
-                        def on_progress(done, total):
+                        last_phase = not (check_cracked or check_whitelist)
+
+                        def on_progress(done, total, last_phase=last_phase):
                             if job == self._scan_job_id:
-                                self.after(0, lambda d=done, t=total:
-                                           self.set_status(f"Network scan: {d}/{t}"))
+                                self.after(0, lambda d=done, t=total, lp=last_phase:
+                                           self._scan_phase_progress(
+                                               job, d, t, lp, f"Network scan: {d}/{t}"))
 
                         more, _ = scan_servers_gui(
                             targets,
@@ -6061,9 +6164,11 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             stop_event=stop_event
                         )
                         if not alive():
+                            go_idle()
                             return
                         results.extend(more)
                 if not alive():
+                    go_idle()
                     return
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
                 if _masscan_note_is_partial(masscan_note):
@@ -6071,10 +6176,14 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         f"Minecraft servers: {len(results)}.")
                 else:
                     say(f"Scan complete. Minecraft servers: {len(results)}.")
+                if not (check_cracked or check_whitelist):
+                    go_idle()
 
                 if check_cracked and alive():
                     with lock:
                         entries = list(cracked_entries)
+                    if not entries and not check_whitelist:
+                        go_idle()
 
                     def handle_cracked_update(entry, result, message, was_cached):
                         if cracked_job != self._cracked_job_id:
@@ -6088,16 +6197,19 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         self.after(0, lambda ip=entry.get("ip"), label=label:
                                    self._update_scan_row_cracked(ip, label))
 
-                    def handle_cracked_progress(done, total):
+                    def handle_cracked_progress(done, total, last=not check_whitelist):
                         if cracked_job != self._cracked_job_id:
                             return
-                        self.after(0, lambda d=done, t=total:
-                                   self.set_status(f"Checking cracked: {d}/{t}"))
+                        self.after(0, lambda d=done, t=total, lp=last:
+                                   self._scan_phase_progress(
+                                       job, d, t, lp, f"Checking cracked: {d}/{t}"))
                     run_cracked_verifier_async(entries, handle_cracked_update, progress_cb=handle_cracked_progress)
 
-                if check_whitelist:
+                if check_whitelist and alive():
                     with lock:
                         entries = list(whitelist_entries)
+                    if not entries:
+                        go_idle()
 
                     def handle_update(entry, result, message):
                         if whitelist_job != self._whitelist_job_id:
@@ -6110,10 +6222,12 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         self.after(0, lambda d=done, t=total:
-                                   self.set_status(f"Checking whitelist: {d}/{t}"))
+                                   self._scan_phase_progress(
+                                       job, d, t, True, f"Checking whitelist: {d}/{t}"))
                     run_whitelist_verifier_async(entries, account, handle_update, progress_cb=handle_progress)
             except Exception as exc:
                 message = str(exc)
+                go_idle()
                 say(f"Scan failed: {message}")
 
         threading.Thread(target=work, daemon=True).start()
