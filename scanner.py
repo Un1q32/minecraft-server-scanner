@@ -916,16 +916,33 @@ def upsert_mc_accounts(accounts, active_uuid=None):
     return data
 
 def import_prism_accounts(path=PRISM_ACCOUNTS_PATH):
+    """Import accounts from Prism Launcher's accounts.json.
+
+    Returns (imported, skipped). Accounts with a cached access token import
+    directly; accounts with only an MSA refresh token (Prism only refreshes
+    the last-used account, so the rest usually have no access token) import
+    as refresh-only placeholders — probe them (Test Selected / Probe All)
+    to fetch fresh access tokens. Re-imports never wipe already-stored
+    tokens: empty values are stripped before merging.
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     imported = []
-    for raw in data.get("accounts", []) if isinstance(data, dict) else []:
+    skipped = []
+    entries = data.get("accounts", []) if isinstance(data, dict) else []
+    for idx, raw in enumerate(entries):
+        if not isinstance(raw, dict):
+            skipped.append((f"entry #{idx}", "not an account object"))
+            continue
         profile = raw.get("profile") or {}
         ygg = raw.get("ygg") or {}
         xrp_mc = raw.get("xrp-mc") or {}
         msa = raw.get("msa") or {}
-        name = profile.get("name") or raw.get("name") or ""
-        profile_id = profile.get("id") or raw.get("profileId") or ""
+        name = (profile.get("name") or ygg.get("username")
+                or raw.get("name") or "")
+        profile_id = (profile.get("id") or ygg.get("uuid")
+                      or raw.get("profileId") or "")
+        label = name or profile_id or f"entry #{idx}"
         token_source = ""
         access_token = ""
         if ygg.get("token"):
@@ -937,18 +954,27 @@ def import_prism_accounts(path=PRISM_ACCOUNTS_PATH):
         elif raw.get("accessToken"):
             access_token = raw.get("accessToken")
             token_source = "Prism accessToken"
-        refresh_token = msa.get("refresh_token") or raw.get("refreshToken") or ""
+        refresh_token = (msa.get("refresh_token") or raw.get("refreshToken") or "")
+        if not name or not profile_id:
+            skipped.append((label, "no name/UUID in Prism profile — launch the account in Prism once"))
+            continue
+        if not access_token and not refresh_token:
+            skipped.append((label, "no usable token (no access token and no MSA refresh token)"))
+            continue
         account = _normalize_mc_account(name, profile_id, access_token, refresh_token)
         account["source"] = "Prism Launcher"
-        account["token_source"] = token_source
+        account["token_source"] = token_source or ("Prism MSA refresh" if refresh_token else "")
         account["has_xrp_mc_token"] = bool(xrp_mc.get("token"))
         account["has_ygg_token"] = bool(ygg.get("token"))
-        account["msa_client_id"] = raw.get("msa-client-id") or raw.get("msaClientId") or ""
-        if account["name"] and account["uuid"] and account["access_token"]:
-            imported.append(account)
+        account["msa_client_id"] = (msa.get("client_id") or raw.get("msa-client-id")
+                                    or raw.get("msaClientId") or "")
+        # Strip empties so merging can't blank a good stored token.
+        # (name/uuid are guaranteed truthy here, so nothing needed is lost.)
+        account = {k: v for k, v in account.items() if v not in ("", None)}
+        imported.append(account)
     if imported:
         upsert_mc_accounts(imported, active_uuid=imported[0].get("uuid"))
-    return imported
+    return imported, skipped
 
 def minecraft_sha1_hexdigest(*parts):
     digest = hashlib.sha1()
@@ -5620,9 +5646,15 @@ class AccountTab(QWidget):
                 return
             path = picked
         try:
-            imported = import_prism_accounts(path)
+            imported, skipped = import_prism_accounts(path)
             self.refresh()
-            self.set_status(f"Imported {len(imported)} Prism account(s).")
+            msg = f"Imported {len(imported)} Prism account(s)."
+            if skipped:
+                detail = "; ".join(f"{label}: {reason}" for label, reason in skipped[:5])
+                if len(skipped) > 5:
+                    detail += f"; …and {len(skipped) - 5} more"
+                msg += f" Skipped {len(skipped)}: {detail}"
+            self.set_status(msg)
         except Exception as exc:
             q_error(self, "Accounts", f"Import failed: {exc}")
             self.set_status(f"Import failed: {exc}")
