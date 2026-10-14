@@ -6491,6 +6491,7 @@ class ServersTab(QWidget, QtBaseMixin):
         super().__init__(parent)
         self._entries = []  # list[dict] from query_server_db
         self._refresh_pending = False
+        self._sync_note = ""   # last shared-DB sync summary, kept in the status
         self._build_ui()
         register_server_db_tab(self)
         self.refresh_from_db()
@@ -6653,7 +6654,10 @@ class ServersTab(QWidget, QtBaseMixin):
             self.count_label.setText(f"{len(entries)} server(s)")
         except Exception:
             pass
-        self.set_status(f"Tracking {len(entries)} server(s) in servers.db.")
+        status = f"Tracking {len(entries)} server(s) in servers.db."
+        if self._sync_note:
+            status += " | " + self._sync_note
+        self.set_status(status)
 
     # ---- selection helpers ----
     def _selected_ips(self):
@@ -6817,13 +6821,16 @@ class ServersTab(QWidget, QtBaseMixin):
                     "servers, refresh last-seen dates both ways.")
         except Exception:
             pass
-        self.refresh_from_db()
-        self.set_status(
-            f"Shared-DB sync: ↑{summary.get('uploaded', 0)} uploaded "
+        # Keep the summary visible: refreshing the table also sets a status,
+        # so store the note and let both show up together.
+        self._sync_note = (
+            f"Shared DB: ↑{summary.get('uploaded', 0)} uploaded "
             f"({summary.get('merged_on_server', 0)} new for server), "
             f"↓{summary.get('downloaded', 0)} downloaded "
             f"({summary.get('inserted', 0)} new, {summary.get('updated', 0)} "
-            f"refreshed). Server holds {summary.get('total_remote', 0)}.")
+            f"refreshed), server holds {summary.get('total_remote', 0)}.")
+        self.refresh_from_db()
+        self.set_status(self._sync_note)
 
 # ===== Qt port section: qt_monitor (PySide6, 1:1 behavior) =====
 """PySide6 port of ServerMonitorTab (scanner.py lines 6350-6737)."""

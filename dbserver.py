@@ -37,9 +37,10 @@ Security model (deliberately simple for non-technical users):
 * Plain HTTP keeps setup trivial (no certificates for normies), but anyone
   on the path can SEE the traffic.  HMAC protects the *token* from passive
   sniffing, but a full active MITM on HTTP could still steal/replay *data*.
-  If your server list is sensitive, put this behind HTTPS: either pass
-  ``--tls-cert chain.pem --tls-key key.pem`` (then clients use
-  ``https://...``) or run behind a reverse proxy (Caddy/nginx) / Tailscale.
+  If your server list is sensitive, put this behind HTTPS: drop cert.pem +
+  privkey.pem in the server's working directory (auto-detected, then clients
+  use ``https://...``), pass ``--tls-cert/--tls-key`` explicitly, or run
+  behind a reverse proxy (Caddy/nginx) / Tailscale.
 
 Protocol
 --------
@@ -611,6 +612,10 @@ def main(argv=None):
     ap.add_argument("--tls-key", default="", help="PEM private key for https://")
     args = ap.parse_args(argv)
 
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     init_db(args.db)
     token = load_or_create_token(args.token_file, args.token or None)
     if not args.token and not os.environ.get("DBSERVER_TOKEN") and os.path.exists(args.token_file):
@@ -632,18 +637,30 @@ def main(argv=None):
     server.shared_token = token
     server.daemon_threads = True
     scheme = "http"
-    if args.tls_cert and args.tls_key:
+    tls_cert, tls_key = args.tls_cert, args.tls_key
+    if not (tls_cert and tls_key):
+        # Zero-config TLS: drop cert.pem + privkey.pem next to the server.
+        if os.path.isfile("cert.pem") and os.path.isfile("privkey.pem"):
+            tls_cert, tls_key = "cert.pem", "privkey.pem"
+    if tls_cert and tls_key:
         import ssl
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(args.tls_cert, args.tls_key)
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(tls_cert, tls_key)
+        except Exception as exc:
+            print(f"ERROR: could not load TLS cert/key ({tls_cert}, {tls_key}): {exc}",
+                  file=sys.stderr)
+            sys.exit(2)
         server.socket = ctx.wrap_socket(server.socket, server_side=True)
         scheme = "https"
+        print(f"TLS enabled ({tls_cert}, {tls_key}) -- clients must use https:// URLs.")
     print(f"Serving netdb on {scheme}://{args.host}:{args.port} "
           f"(db={server.db_path})")
     if scheme == "http":
         print("NOTE: plain HTTP -- clients auth with HMAC so the token itself "
-              "is never sent in cleartext, but use --tls-cert/--tls-key or a "
-              "reverse proxy if your list is sensitive.")
+              "is never sent in cleartext, but drop cert.pem + privkey.pem in "
+              "this directory (or use --tls-cert/--tls-key / a reverse proxy) "
+              "if your list is sensitive.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
