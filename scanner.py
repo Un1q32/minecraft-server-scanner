@@ -6626,7 +6626,8 @@ class ServersTab(QWidget, QtBaseMixin):
             try:
                 entries = query_server_db(query)
             except Exception as exc:
-                self.after(0, lambda: self.set_status(f"DB load failed: {exc}"))
+                err = str(exc)
+                self.after(0, lambda err=err: self.set_status(f"DB load failed: {err}"))
                 return
             self.after(0, lambda: self._populate(entries))
 
@@ -6753,7 +6754,8 @@ class ServersTab(QWidget, QtBaseMixin):
                 self.after(0, lambda: self.set_status(
                     f"Rescan complete. Responded: {len(results)}."))
             except Exception as exc:
-                self.after(0, lambda: self.set_status(f"Rescan failed: {exc}"))
+                err = str(exc)
+                self.after(0, lambda err=err: self.set_status(f"Rescan failed: {err}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -6793,9 +6795,10 @@ class ServersTab(QWidget, QtBaseMixin):
             try:
                 summary = netdb_sync_once(u, t)
             except Exception as exc:
-                self.after(0, lambda: self._netdb_sync_failed(str(exc)))
+                err = str(exc)
+                self.after(0, lambda err=err: self._netdb_sync_failed(err))
                 return
-            self.after(0, lambda: self._netdb_sync_done(summary))
+            self.after(0, lambda summary=summary: self._netdb_sync_done(summary))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -7152,7 +7155,8 @@ class ServerMonitorTab(QtBaseMixin, QWidget):
             try:
                 self._run_monitor_pass()
             except Exception as exc:
-                self.after(0, lambda: self._set_status(f"Monitor error: {exc}"))
+                err = str(exc)
+                self.after(0, lambda err=err: self._set_status(f"Monitor error: {err}"))
             elapsed = time.time() - start
             wait = max(0, self._monitor_interval - elapsed)
             if self._stop_event.wait(wait):
