@@ -13,6 +13,7 @@ Minecraft Server Scanner is a Windows desktop application that discovers, checks
 - Searches JSON data with boolean expressions using AND, OR, NOT, and parentheses.
 - Loads server lists from text files.
 - Scans individual servers or complete result sets concurrently.
+- The Stop button cancels a running Network Scan (a new scan cancels the old one); results found so far are kept.
 - Shows server icons, MOTD, online players, maximum players, version, and sampled player names.
 - Filters scan results by player count.
 - Filters versions with an editable substring search, such as 26.3.

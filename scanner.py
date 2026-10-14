@@ -16,7 +16,7 @@ import ipaddress
 import urllib.request
 import urllib.error
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from colorama import init, Fore, Style
 import nbtlib
 from nbtlib import Compound, String, Byte
@@ -3660,7 +3660,12 @@ def format_stream_status(opened, probed, found, pct=None, rate=None):
     return f"masscan: {pct:.0f}% | {opened} open | handshake: {probed} | Minecraft: {found}"
 
 
-def _drain_masscan_stdout(proc, timeout, frag_cb, progress_cb=None, note_cap=4096):
+class ScanStopped(Exception):
+    """Raised when the user cancels a running scan (Stop button / new scan)."""
+
+
+def _drain_masscan_stdout(proc, timeout, frag_cb, progress_cb=None, note_cap=4096,
+                           stop_event=None):
     """Feed \\r/\\n-separated stdout fragments to callbacks until EOF.
 
     masscan's progress line uses bare \\r (no newline), so the pipe is read
@@ -3709,6 +3714,22 @@ def _drain_masscan_stdout(proc, timeout, frag_cb, progress_cb=None, note_cap=409
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     buf = ""
+    # A stop request must kill masscan even while the stdout read below is
+    # blocked (quiet sweep periods); the drain then raises ScanStopped.
+    if stop_event is not None and not stop_event.is_set():
+        def _watch_stop():
+            while proc.poll() is None:
+                if stop_event.wait(0.25):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+        try:
+            th = threading.Thread(target=_watch_stop, daemon=True)
+            th.start()
+        except Exception:
+            pass
     try:
         watchdog.start()
         while True:
@@ -3752,6 +3773,8 @@ def _drain_masscan_stdout(proc, timeout, frag_cb, progress_cb=None, note_cap=409
                     stream.close()
             except Exception:
                 pass
+    if stop_event is not None and stop_event.is_set():
+        raise ScanStopped("scan stopped by user")
     return timed_out["hit"], "\n".join(other_parts).strip()[:note_cap]
 
 
@@ -3879,7 +3902,8 @@ def sudo_noninteractive_ok(timeout=10):
 
 def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
                           wait=MASSCAN_DEFAULT_WAIT, on_open=None, on_scan_progress=None,
-                          timeout=None, exe=None, use_sudo=False, sudo_password=None):
+                          timeout=None, exe=None, use_sudo=False, sudo_password=None,
+                          stop_event=None):
     """Run masscan and call on_open(ip_port) live as open ports are found.
 
     masscan runs with `--interactive` (which flushes a `Discovered open
@@ -3966,7 +3990,8 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     # One merged pipe: masscan's \r progress, flushed Discovered lines and
     # buffered -oL lines all arrive here; nothing can deadlock or stay hidden.
     timed_out, other = _drain_masscan_stdout(proc, timeout, handle_result,
-                                             progress_cb=on_scan_progress)
+                                             progress_cb=on_scan_progress,
+                                             stop_event=stop_event)
     stderr = other
     if timed_out:
         if found:
@@ -3980,7 +4005,7 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             return _run_masscan_streaming_plain(
                 base_cmd, masscan_targets, port_spec, rate, wait,
                 timeout, found, seen, emit, sudo_password if use_sudo else None,
-                on_scan_progress=on_scan_progress)
+                on_scan_progress=on_scan_progress, stop_event=stop_event)
         if found:
             return found, stderr[:500]
         _raise_masscan_error(returncode, stderr)
@@ -3989,7 +4014,7 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
 
 def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wait,
                                  timeout, found, seen, emit, sudo_password,
-                                 on_scan_progress=None):
+                                 on_scan_progress=None, stop_event=None):
     """Fallback for masscan builds without --interactive: same merged stream
     with only -oL - list lines (still live in chunks, no temp files)."""
     cmd = base_cmd + list(masscan_targets) + [
@@ -4013,7 +4038,8 @@ def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wai
         return False
 
     timed_out, other = _drain_masscan_stdout(proc, timeout, handle_result,
-                                             progress_cb=on_scan_progress)
+                                             progress_cb=on_scan_progress,
+                                             stop_event=stop_event)
     stderr = other
     if timed_out:
         if found:
@@ -4146,37 +4172,58 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
     return None
 
 # GUI-friendly scan with streaming callbacks
-def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, login_probe=False):
+def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, login_probe=False,
+                     stop_event=None):
     filtered = [s for s in servers if not is_ignored(s)]
     results, online_lines = [], []
     total, done = len(filtered), 0
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        def task(ip):
-            if on_start:
-                try: on_start(ip)
-                except Exception: pass
-            return ping_server(ip)
+    def task(ip):
+        if on_start:
+            try: on_start(ip)
+            except Exception: pass
+        return ping_server(ip)
 
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    futures = {}
+    stopped = False
+    try:
         futures = {executor.submit(task, s): s for s in filtered}
 
-        for fut in as_completed(futures):
-            r = fut.result()
-            done += 1
+        pending = set(futures)
+        while pending:
+            if stop_event is not None and stop_event.is_set():
+                stopped = True
+                break
+            # Short wait (instead of as_completed) so a stop request is
+            # honored promptly even while every worker is mid-handshake.
+            done_set, pending = wait(pending, timeout=0.25,
+                                     return_when=FIRST_COMPLETED)
+            for fut in done_set:
+                r = fut.result()
+                done += 1
 
-            if r:
-                results.append(r)
-                line = f"{r['ip']} | MOTD: {r['motd']} | Players: {r['players']}/{r['max_players']} | Version: {r['version']}"
-                if r['players'] > 0:
-                    online_lines.append(line)
-                USER_LOG_MANAGER.update_from_result(r)
-                if on_result:
-                    try: on_result(r, line)
+                if r:
+                    results.append(r)
+                    line = f"{r['ip']} | MOTD: {r['motd']} | Players: {r['players']}/{r['max_players']} | Version: {r['version']}"
+                    if r['players'] > 0:
+                        online_lines.append(line)
+                    USER_LOG_MANAGER.update_from_result(r)
+                    if on_result:
+                        try: on_result(r, line)
+                        except Exception: pass
+
+                if on_progress:
+                    try: on_progress(done, total)
                     except Exception: pass
-
-            if on_progress:
-                try: on_progress(done, total)
+    finally:
+        if stopped:
+            for f in futures:
+                try: f.cancel()
                 except Exception: pass
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
 
     return results, online_lines
 
@@ -5273,6 +5320,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         self._current_scan_ip = None
         self._cracked_job_id = 0
         self._whitelist_job_id = 0
+        self._scan_job_id = 0
+        self._scan_stop = threading.Event()
         self._build_ui()
 
     # ---- Tk-compat var properties (read through to the Qt widgets) ----
@@ -5412,6 +5461,10 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         scan_btn = QPushButton("Scan Targets", controls)
         scan_btn.clicked.connect(self.scan_targets)
         cl.addWidget(scan_btn)
+        stop_btn = QPushButton("Stop", controls)
+        stop_btn.setToolTip("Cancel the running scan (keeps results found so far).")
+        stop_btn.clicked.connect(self.stop_scan)
+        cl.addWidget(stop_btn)
         copy_btn = QPushButton("Copy IP(s)", controls)
         copy_btn.clicked.connect(self.copy_selected)
         cl.addWidget(copy_btn)
@@ -5666,6 +5719,22 @@ class NetworkScanTab(QtBaseMixin, QWidget):
             return None, "prompt timed out after 5 minutes (no answer)"
         return holder.get("pw"), holder.get("err")
 
+    def stop_scan(self):
+        """Cancel the running network scan (new scans call this implicitly).
+
+        Wakes the worker out of masscan/handshake waits; rows found so far
+        stay in the table. Follow-up cracked/whitelist checks from the
+        cancelled scan are invalidated too.
+        """
+        self._scan_job_id += 1
+        self._cracked_job_id += 1
+        self._whitelist_job_id += 1
+        try:
+            self._scan_stop.set()
+        except Exception:
+            pass
+        self.set_status("Scan stopped.")
+
     def scan_targets(self):
         try:
             max_hosts_raw = int(self.max_hosts_edit.text().strip() or NETWORK_SCAN_MAX_HOSTS)
@@ -5696,12 +5765,30 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         pre_version = self.pre_version_edit.text().strip()
         check_cracked_flag = self.check_cracked_check.isChecked()
         check_whitelist_flag = self.check_whitelist_check.isChecked()
+        # A new scan cancels any running one: bump the generation (stale
+        # workers see the mismatch and quit quietly) and wake the old
+        # worker out of its blocking waits, then hand this scan a fresh flag.
+        self._scan_job_id += 1
+        job = self._scan_job_id
+        try:
+            self._scan_stop.set()
+        except Exception:
+            pass
+        stop_event = threading.Event()
+        self._scan_stop = stop_event
         self.set_status("Expanding targets...")
 
-        def work():
+        def alive():
+            return job == self._scan_job_id and not stop_event.is_set()
+
+        def say(msg):
+            if job == self._scan_job_id:
+                self.after(0, lambda m=msg: self.set_status(m))
+
+        def work(job=job, stop_event=stop_event):
             try:
                 if use_masscan and backend.startswith("masscan") and not is_masscan_available():
-                    self.after(0, lambda: self.set_status("masscan not found; install masscan or use Auto/Python backend."))
+                    say("masscan not found; install masscan or use Auto/Python backend.")
                     return
                 # Shared setup runs first so streamed masscan hits appear in
                 # the table the moment their handshake completes.
@@ -5727,9 +5814,12 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 results = []
 
                 def on_start(ip):
-                    self._current_scan_ip = ip
+                    if job == self._scan_job_id:
+                        self._current_scan_ip = ip
 
                 def on_result(r, line):
+                    if job != self._scan_job_id or stop_event.is_set():
+                        return
                     if not r:
                         return
                     if only_players and r.get("players", 0) <= 0:
@@ -5758,6 +5848,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                     self.scan_rows.append(row)
 
                     def add_row(row=row):
+                        if job != self._scan_job_id:
+                            return
                         try:
                             filt = self.version_filter_combo.currentText()
                         except Exception:
@@ -5792,7 +5884,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         ranges, direct = [], []
                         if backend.startswith("masscan"):
                             message = str(exc)
-                            self.after(0, lambda m=message: self.set_status(f"masscan target error: {m}"))
+                            say(f"masscan target error: {message}")
                             return
                     if not ranges and not direct:
                         targets = []
@@ -5804,6 +5896,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         hs_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
                         def update_stream_status():
+                            if job != self._scan_job_id:
+                                return
                             self.after(0, lambda o=opened_n["n"], p=probed_n["n"], f=len(results),
                                        pct=scan_prog["pct"], rate=scan_prog["rate"]:
                                 self.set_status(format_stream_status(o, p, f, pct, rate)))
@@ -5836,6 +5930,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             update_stream_status()
 
                         def handle_open(ip_port):
+                            if job != self._scan_job_id or stop_event.is_set():
+                                return
                             with lock:
                                 if ip_port in submitted:
                                     return
@@ -5857,45 +5953,62 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                 pass
                             if backend.startswith("masscan"):
                                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
-                                self.after(0, lambda m=msg: self.set_status(m))
+                                say(msg)
                                 return "abort"
-                            self.after(0, lambda m=msg: self.set_status(m + " Falling back to Python scan..."))
+                            say(msg + " Falling back to Python scan...")
                             return "fallback"
+
+                        def stop_stream_quietly():
+                            try:
+                                hs_executor.shutdown(wait=False, cancel_futures=True)
+                            except Exception:
+                                pass
 
                         for d in direct:
                             handle_open(d)
+                        if not alive():
+                            stop_stream_quietly()
+                            return
                         eta = _format_masscan_eta(_masscan_estimate_seconds(
                             ranges, ports, masscan_rate, masscan_wait))
-                        self.after(0, lambda e=eta: self.set_status(
-                            f"masscan: discovering open ports (live){e}..."))
+                        say(f"masscan: discovering open ports (live){eta}...")
                         outcome = "ok"
                         try:
                             _, masscan_note = run_masscan_streaming(
                                 ranges, ports, rate=masscan_rate,
                                 wait=masscan_wait, on_open=handle_open,
-                                on_scan_progress=handle_scan_progress)
+                                on_scan_progress=handle_scan_progress,
+                                stop_event=stop_event)
+                        except ScanStopped:
+                            stop_stream_quietly()
+                            return
                         except PermissionError:
                             if sudo_available() and ranges:
-                                self.after(0, lambda: self.set_status("masscan needs root; trying sudo..."))
+                                say("masscan needs root; trying sudo...")
                                 passwordless = sudo_noninteractive_ok()
                                 sudo_pw = None
                                 sudo_err = None
                                 if passwordless:
-                                    self.after(0, lambda: self.set_status("masscan: retrying with sudo..."))
+                                    say("masscan: retrying with sudo...")
                                 else:
-                                    self.after(0, lambda: self.set_status(
-                                        "sudo password required \u2014 waiting for the popup..."))
+                                    say("sudo password required \u2014 waiting for the popup...")
                                     sudo_pw, sudo_err = self._prompt_sudo_password()
+                                if not alive():
+                                    stop_stream_quietly()
+                                    return
                                 if passwordless or sudo_pw:
                                     try:
-                                        self.after(0, lambda e=eta: self.set_status(
-                                            f"masscan: discovering open ports with sudo (live){e}..."))
+                                        say(f"masscan: discovering open ports with sudo (live){eta}...")
                                         _, masscan_note = run_masscan_streaming(
                                             ranges, ports, rate=masscan_rate,
                                             wait=masscan_wait, on_open=handle_open,
                                             on_scan_progress=handle_scan_progress,
-                                            use_sudo=True, sudo_password=sudo_pw)
+                                            use_sudo=True, sudo_password=sudo_pw,
+                                            stop_event=stop_event)
                                         sudo_pw = None
+                                    except ScanStopped:
+                                        stop_stream_quietly()
+                                        return
                                     except PermissionError as exc2:
                                         outcome = finish_stream_error(f"sudo failed: {exc2}")
                                     except Exception as exc2:
@@ -5928,31 +6041,38 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             skip_python = True
                 if not skip_python:
                     if targets is None:
+                        if not alive():
+                            return
                         targets = expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
                     if not targets and not results:
-                        self.after(0, lambda: self.set_status("No valid targets to scan."))
+                        say("No valid targets to scan.")
                         return
                     if targets:
                         def on_progress(done, total):
-                            self.after(0, lambda d=done, t=total:
-                                       self.set_status(f"Network scan: {d}/{t}"))
+                            if job == self._scan_job_id:
+                                self.after(0, lambda d=done, t=total:
+                                           self.set_status(f"Network scan: {d}/{t}"))
 
                         more, _ = scan_servers_gui(
                             targets,
                             on_start=on_start,
                             on_result=on_result,
-                            on_progress=on_progress
+                            on_progress=on_progress,
+                            stop_event=stop_event
                         )
+                        if not alive():
+                            return
                         results.extend(more)
+                if not alive():
+                    return
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
                 if _masscan_note_is_partial(masscan_note):
-                    self.after(0, lambda n=len(results): self.set_status(
-                        "Scan complete \u2014 masscan stopped early (timeout), results partial. "
-                        f"Minecraft servers: {n}."))
+                    say(f"Scan complete \u2014 masscan stopped early (timeout), results partial. "
+                        f"Minecraft servers: {len(results)}.")
                 else:
-                    self.after(0, lambda n=len(results): self.set_status(f"Scan complete. Minecraft servers: {n}."))
+                    say(f"Scan complete. Minecraft servers: {len(results)}.")
 
-                if check_cracked:
+                if check_cracked and alive():
                     with lock:
                         entries = list(cracked_entries)
 
@@ -5994,7 +6114,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                     run_whitelist_verifier_async(entries, account, handle_update, progress_cb=handle_progress)
             except Exception as exc:
                 message = str(exc)
-                self.after(0, lambda m=message: self.set_status(f"Scan failed: {m}"))
+                say(f"Scan failed: {message}")
 
         threading.Thread(target=work, daemon=True).start()
 
