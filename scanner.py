@@ -8,6 +8,7 @@ import json
 import re
 import os
 import random
+import sys
 import time
 import shutil
 import subprocess
@@ -19,9 +20,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from colorama import init, Fore, Style
 import nbtlib
 from nbtlib import Compound, String, Byte
-
-# Hide console window
-if os.name == "nt": __import__("ctypes").windll.user32.ShowWindow(__import__("ctypes").windll.kernel32.GetConsoleWindow(), 0)
 
 # Qt (PySide6) UI + threading
 import threading
@@ -9304,7 +9302,6 @@ class FullAppGUI(QMainWindow):
 
 # ==================== GUI entry ====================
 def main():  #gone but not forgotten
-    import sys
     try:
         init_server_db()
     except Exception:
