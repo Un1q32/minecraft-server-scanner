@@ -66,7 +66,8 @@ The result table has a CRACKED column. Every handshake already detects likely of
 
 ### Whitelist verification
 
-- Checks whitelist access with an authenticated Minecraft account.
+- Checks whitelist access with your stored Minecraft accounts.
+- Distributes whitelist probes across all accounts in rotation (no active account).
 - Uses the server’s detected protocol for each whitelist login probe.
 - Provides a Check Whitelist action below result tables for selected rows.
 - Supports whitelist checks during normal scans.
@@ -84,7 +85,6 @@ The result table has a CRACKED column. Every handshake already detects likely of
 - Tests selected accounts or all stored accounts.
 - Resolves account names and UUIDs from valid access tokens.
 - Refreshes Microsoft accounts when refresh-token data is available.
-- Sets an active account for manual whitelist checks.
 - Removes failed accounts.
 
 ### Proxy management
@@ -210,4 +210,4 @@ Example:
 - Shodan searches follow Shodan API limits and terms.
 - Minecraft servers can reject status or login probes, throttle connections, require a different protocol, or return incomplete metadata.
 - ASN expansion depends on the external BGPView API and the configured host limit.
-- Whitelist probing uses authenticated accounts and can rotate accounts and proxies when those options are enabled.
+- Whitelist probing rotates across all stored accounts, and can rotate proxies too when proxy mode is enabled.

@@ -892,19 +892,12 @@ def _normalize_mc_account(name, profile_id, access_token, refresh_token=""):
         "imported_at": time.time()
     }
 
-def get_active_mc_account():
-    data = _load_mc_accounts()
-    accounts = [a for a in data.get("accounts", []) if a.get("access_token") and a.get("uuid") and a.get("name")]
-    if not accounts:
-        return None
-    active_uuid = data.get("active_uuid")
-    for account in accounts:
-        if account.get("uuid") == active_uuid:
-            return account
-    return accounts[0]
+def upsert_mc_accounts(accounts):
+    """Merge accounts into storage. Returns (data, saved_ok).
 
-def upsert_mc_accounts(accounts, active_uuid=None):
-    """Merge accounts into storage. Returns (data, saved_ok)."""
+    No active account: whitelist checks rotate across all stored accounts.
+    (Old files may still carry an active_uuid key; it is ignored.)
+    """
     data = _load_mc_accounts()
     existing = {}
     for account in data.get("accounts", []):
@@ -912,6 +905,8 @@ def upsert_mc_accounts(accounts, active_uuid=None):
         if key:
             existing[key] = account
     for account in accounts:
+        account = dict(account)
+        account.pop("active_uuid", None)
         key = _account_key(account)
         if not key:
             continue
@@ -919,10 +914,7 @@ def upsert_mc_accounts(accounts, active_uuid=None):
         merged.update(account)
         existing[key] = merged
     data["accounts"] = list(existing.values())
-    if active_uuid:
-        data["active_uuid"] = active_uuid
-    elif not data.get("active_uuid") and data["accounts"]:
-        data["active_uuid"] = data["accounts"][0].get("uuid", "")
+    data.pop("active_uuid", None)
     saved = _save_mc_accounts(data)
     return data, saved
 
@@ -987,7 +979,7 @@ def import_prism_accounts(path=PRISM_ACCOUNTS_PATH):
         imported.append(account)
     saved = True
     if imported:
-        _, saved = upsert_mc_accounts(imported, active_uuid=imported[0].get("uuid"))
+        _, saved = upsert_mc_accounts(imported)
     return imported, skipped, saved
 
 def minecraft_sha1_hexdigest(*parts):
@@ -1118,7 +1110,7 @@ def refresh_minecraft_account(account):
     refreshed["name"] = profile.get("name") or refreshed.get("name") or ""
     refreshed["msa_client_id"] = client_id
     refreshed["token_source"] = "Minecraft Services refresh"
-    upsert_mc_accounts([refreshed], active_uuid=refreshed.get("uuid"))
+    upsert_mc_accounts([refreshed])
     return refreshed
 
 def ensure_minecraft_session_join(account, server_hash, cooldown=None, retries=None):
@@ -1592,6 +1584,26 @@ def probe_accounts_async(accounts, callback, progress_cb=None):
 def get_all_mc_accounts():
     data = _load_mc_accounts()
     return [a for a in data.get("accounts", []) if a.get("access_token") and a.get("uuid") and a.get("name")]
+
+_ACCOUNT_ROTATION_LOCK = threading.Lock()
+_ACCOUNT_ROTATION_IDX = [0]
+
+
+def next_mc_account(pool=None):
+    """Next usable account, round-robin. No active account: every whitelist
+    probe takes the next account in rotation so Mojang rate limits spread
+    across all stored accounts instead of hammering one."""
+    accounts = list(pool) if pool else get_all_mc_accounts()
+    accounts = [a for a in accounts if a and a.get("access_token")]
+    if not accounts:
+        return None
+    with _ACCOUNT_ROTATION_LOCK:
+        acc = accounts[_ACCOUNT_ROTATION_IDX[0] % len(accounts)]
+        _ACCOUNT_ROTATION_IDX[0] += 1
+    try:
+        return dict(acc)
+    except Exception:
+        return acc
 
 def read_mc_byte_array_from_bytes(buf, pos):
     length, pos = read_varint_from_bytes(buf, pos)
@@ -2644,7 +2656,7 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                                 return None, append_mod_warning(f"Token profile lookup failed: {detail}", mod_warning), "done"
                             account.clear()
                             account.update(resolved)
-                            upsert_mc_accounts([account], active_uuid=account.get("uuid"))
+                            upsert_mc_accounts([account])
                             use_auth_start = True
                             reconnect_needed = True
                             _throttle_online_whitelist_probe(account)
@@ -2874,10 +2886,10 @@ def check_selected_whitelist(parent, tree):
     """Manually probe the currently selected result rows.
 
     Cracked (offline-mode) servers are checked without any Minecraft account;
-    only online-mode servers need the active token for Mojang auth.
+    online-mode servers rotate across all stored accounts for Mojang auth.
     (Qt port: identical logic, QMessageBox via qt_helpers.)
     """
-    account = get_active_mc_account()
+    account = None
     selected = tree.selection()
     if not selected:
         q_info(parent, "Check Whitelist", "Select one or more server rows first.")
@@ -2955,6 +2967,9 @@ def run_whitelist_verifier_async(entries, account, callback, progress_cb=None, w
     without Mojang auth, so they run fully parallel with no throttle. Only
     online-mode servers take the Mojang path, which is still spaced by
     WHITELIST_PROBE_DELAY with the original sessionserver 429 backoff.
+
+    There is no active account: each entry takes the next stored account in
+    rotation (the passed account is only a fallback when storage is empty).
     """
     # Proxy mode: route through working proxies and rotate accounts in parallel.
     if _WHITELIST_USE_PROXIES:
@@ -2976,13 +2991,15 @@ def run_whitelist_verifier_async(entries, account, callback, progress_cb=None, w
         max_workers = max(1, min(WHITELIST_VERIFY_WORKERS, total))
     lock = threading.Lock()
     counter = {"done": 0}
+    pool = get_all_mc_accounts() or ([account] if account else [])
 
     def _one(entry):
+        acc = next_mc_account(pool)
         try:
-            result, message = _probe_whitelist_entry(entry, account)
+            result, message = _probe_whitelist_entry(entry, acc)
         except Exception as exc:
             result, message = None, str(exc)
-        log_whitelist_probe(entry, result, message, account=account)
+        log_whitelist_probe(entry, result, message, account=acc)
         try:
             callback(entry, result, message)
         except Exception:
@@ -3036,9 +3053,7 @@ def run_bulk_whitelist_verifier_async(entries, accounts, proxies, callback, prog
     if not working_proxies:
         working_proxies = usable  # no pre-test needed; untested proxies are used as-is
     accounts = [a for a in (accounts or []) if a and a.get("access_token")]
-    if not accounts:
-        accounts = [a for a in [get_active_mc_account()] if a]
-    if not entries:
+    if not accounts or not entries:
         return
     total = len(entries)
     if workers is None or workers < 1:
@@ -5505,7 +5520,7 @@ def _get_icon_manager():
 and sudo password dialog (lines 4637-4739). 1:1 behavior, Qt widgets only.
 
 Backend symbols (reference as-is, provided by scanner.py):
-    _load_mc_accounts, _save_mc_accounts, _account_key, get_active_mc_account,
+    _load_mc_accounts, _save_mc_accounts, _account_key,
     import_prism_accounts, PRISM_ACCOUNTS_PATH, _normalize_mc_account,
     upsert_mc_accounts, import_tokens_from_text, probe_accounts_async,
     probe_account, open_whitelist_log_file
@@ -5564,9 +5579,6 @@ class AccountTab(QWidget):
         btn_add_manual = QPushButton("Add Manual Token")
         btn_add_manual.clicked.connect(self.add_manual)
         bar.addWidget(btn_add_manual)
-        btn_set_active = QPushButton("Set Active")
-        btn_set_active.clicked.connect(self.set_active)
-        bar.addWidget(btn_set_active)
         btn_test = QPushButton("Test Selected")
         btn_test.clicked.connect(self.test_selected)
         bar.addWidget(btn_test)
@@ -5584,7 +5596,7 @@ class AccountTab(QWidget):
         bar.addWidget(btn_log)
         bar.addStretch(1)
 
-        cols = ("active", "name", "uuid", "source", "token_source", "status")
+        cols = ("name", "uuid", "source", "token_source", "status")
         self.tree = ResultTable()
         self.tree.set_columns(cols)
         layout.addWidget(self.tree, 1)
@@ -5594,7 +5606,6 @@ class AccountTab(QWidget):
 
     def refresh(self):
         data = _load_mc_accounts()
-        active_uuid = data.get("active_uuid", "")
         self.tree.delete(*self.tree.get_children())
         self._row_keys = {}
         count = 0
@@ -5603,12 +5614,10 @@ class AccountTab(QWidget):
             if not key:
                 continue
             count += 1
-            active = "Yes" if (account.get("uuid") and account.get("uuid") == active_uuid) else ""
             iid = self.tree.insert(
                 "",
                 "end",
                 values=(
-                    active,
                     account.get("name", ""),
                     account.get("uuid", ""),
                     account.get("source", ""),
@@ -5617,11 +5626,7 @@ class AccountTab(QWidget):
                 )
             )
             self._row_keys[iid] = key
-        active = get_active_mc_account()
-        if active:
-            self.set_status(f"{count} account(s). Active: {active.get('name')}.")
-        else:
-            self.set_status(f"{count} account(s). No active account.")
+        self.set_status(f"{count} account(s). Whitelist checks rotate across all of them.")
 
     def _status_for(self, account, key):
         for k in (key, account.get("uuid"), account.get("name")):
@@ -5703,7 +5708,7 @@ class AccountTab(QWidget):
                 "Minecraft Account",
                 "MSA client id (optional; Prism fills this automatically):"
             ) or ""
-        _, saved = upsert_mc_accounts([account], active_uuid=account.get("uuid"))
+        _, saved = upsert_mc_accounts([account])
         if not saved:
             q_error(self, "Accounts", _mc_save_error("add the account"))
             return
@@ -5799,22 +5804,6 @@ class AccountTab(QWidget):
                 self.after(0, lambda a=acc, o=ok, m=msg, kk=k: self._finish_probe(kk, a, o, m))
         threading.Thread(target=worker, daemon=True).start()
 
-    def set_active(self):
-        key = self._selected_key()
-        if not key:
-            q_info(self, "Accounts", "Select an account first.")
-            return
-        data = _load_mc_accounts()
-        account = next((a for a in data.get("accounts", []) if _account_key(a) == key), None)
-        if not account or not account.get("uuid"):
-            q_info(self, "Accounts", "This account has no UUID yet. Probe it first to fetch its UUID.")
-            return
-        data["active_uuid"] = account["uuid"]
-        if not _save_mc_accounts(data):
-            q_error(self, "Accounts", _mc_save_error("set the active account"))
-            return
-        self.refresh()
-
     def remove_selected(self):
         keys = self._selected_keys()
         if not keys:
@@ -5824,11 +5813,7 @@ class AccountTab(QWidget):
         kept = [a for a in data.get("accounts", []) if _account_key(a) not in keys]
         removed = len(data.get("accounts", [])) - len(kept)
         data["accounts"] = kept
-        active = data.get("active_uuid")
-        if active and not any(a.get("uuid") == active for a in kept):
-            data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
-        if not data.get("active_uuid") and kept:
-            data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
+        data.pop("active_uuid", None)
         if not _save_mc_accounts(data):
             q_error(self, "Accounts", _mc_save_error("remove the account(s)"))
             return
@@ -5852,11 +5837,7 @@ class AccountTab(QWidget):
             q_info(self, "Accounts", "No failed accounts to remove.")
             return
         data["accounts"] = kept
-        active = data.get("active_uuid")
-        if active and not any(a.get("uuid") == active for a in kept):
-            data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
-        if not data.get("active_uuid") and kept:
-            data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
+        data.pop("active_uuid", None)
         if not _save_mc_accounts(data):
             q_error(self, "Accounts", _mc_save_error("remove the failed account(s)"))
             return
@@ -6664,7 +6645,9 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 check_cracked = check_cracked_flag
                 # Cracked servers need no account (offline probe, no Mojang auth);
                 # account may be None and only online-mode hits will report it.
-                account = get_active_mc_account() if check_whitelist else None
+                # Cracked servers need no account; online-mode whitelist probes
+                # rotate across all stored accounts (no active account).
+                account = None
                 if check_cracked:
                     self._cracked_job_id += 1
                 cracked_job = self._cracked_job_id
@@ -7279,9 +7262,6 @@ class ProxyTab(QWidget, QtBaseMixin):
         self.workers_edit = QLineEdit("0")
         self.workers_edit.setMaximumWidth(60)
         row2.addWidget(self.workers_edit)
-        self.use_all_accounts = QCheckBox("Use all accounts")
-        self.use_all_accounts.setChecked(True)
-        row2.addWidget(self.use_all_accounts)
         btn_start = QPushButton("Start Scan")
         btn_start.clicked.connect(self.start_bulk_scan)
         row2.addWidget(btn_start)
@@ -7484,7 +7464,7 @@ class ProxyTab(QWidget, QtBaseMixin):
         if not proxies:
             q_info("Bulk Whitelist", "No proxies loaded. Add some in the Proxies tab first.")
             return
-        accounts = get_all_mc_accounts() if self.use_all_accounts.isChecked() else [a for a in [get_active_mc_account()] if a]
+        accounts = get_all_mc_accounts()
         # Cracked servers need no account (offline probe, no Mojang auth), so
         # allow the scan with zero accounts; online-mode hits will report it.
         try:
@@ -9081,7 +9061,8 @@ class ShodanTab(QWidget, QtBaseMixin):
         only_cracked = self.only_cracked_cb.isChecked()
         check_whitelist = self.check_whitelist_cb.isChecked()
         # Cracked servers need no account (offline probe, no Mojang auth).
-        account = get_active_mc_account() if check_whitelist else None
+        # Online-mode whitelist probes rotate across all stored accounts.
+        account = None
         self.scan_rows = []
         if only_cracked or check_whitelist:
             self._reset_scan_row_map()
@@ -9759,7 +9740,8 @@ class JSONTab(QWidget, QtBaseMixin):
         only_cracked = self.only_cracked_check.isChecked()
         check_whitelist = self.check_whitelist_check.isChecked()
         # Cracked servers need no account (offline probe, no Mojang auth).
-        account = get_active_mc_account() if check_whitelist else None
+        # Online-mode whitelist probes rotate across all stored accounts.
+        account = None
         self.scan_rows = []
         if only_cracked or check_whitelist:
             self._reset_scan_row_map()
@@ -10031,7 +10013,7 @@ Backend symbols (reference as-is, provided by scanner.py):
     import_file_to_servers_dat, BACKUP_PATH, SERVERS_DAT_PATH,
     load_reason_file, save_reason_file, SAVED_FILE, IGNORE_FILE,
     refresh_ignore_set, is_valid_ip_port, get_ip_only,
-    get_active_mc_account, whitelist_result_label,
+    get_all_mc_accounts, next_mc_account, whitelist_result_label,
     run_whitelist_verifier_async, sanitize_motd, make_tree_sortable,
     _ip_key, _players_key, _version_key, USER_LOG_MANAGER
 """
@@ -10198,8 +10180,9 @@ class ReasonFileTab(QWidget, QtBaseMixin):
         q_info(self, self.tab_name, "Saved.")
 
     def _scan_whitelist(self):
-        # Cracked servers need no account; online-mode hits report missing auth.
-        account = get_active_mc_account()
+        # Cracked servers need no account; online-mode probes rotate
+        # across all stored accounts (no active account).
+        account = None
         entries = []
         for iid in self.tree.get_children(""):
             values = self.tree.item(iid, "values")
