@@ -87,6 +87,9 @@ The result table has a CRACKED column. Every handshake already detects likely of
   times-seen count. Every scan records automatically — no manual add step.
 - The Servers tab browses that history (search, rescan, copy, export, add to
   Saved/Ignore/Monitor, delete).
+- The Servers tab can sync that history with a shared network DB
+  (`dbserver.py`): one Sync DB button uploads your new sightings and
+  downloads other clients' servers, refreshing last-seen dates both ways.
 - Maintains Saved and Ignore lists with optional reasons.
 - Filters ignored servers from scan workflows.
 - Maintains a player log with each player’s latest known server.
@@ -117,6 +120,33 @@ The result table has a CRACKED column. Every handshake already detects likely of
 - Saved: manages saved servers.
 - Ignore: manages ignored servers and scans the complete list for whitelist status.
 - Player Log: searches and exports discovered player records.
+
+## Shared network DB (`dbserver.py`)
+
+Multiple scanner clients can pool their finds through one central server:
+
+1. On a machine you can port-forward, run:
+
+       python3 dbserver.py --port 8777
+
+   The first run prints a random shared token (saved as `.dbserver_token`,
+   mode 0600). Forward TCP 8777 to that machine.
+2. In every client's Servers tab, paste the server URL
+   (e.g. `http://your-host:8777`) and the token into the Shared DB row,
+   then press **Sync DB**. That is the whole setup.
+
+Each sync uploads the servers this client has seen since its last sync and
+downloads everything other clients added, merging first-seen (oldest wins)
+and last-seen/MOTD/players/version (newest wins) on both sides. A confirmed
+cracked verdict is never downgraded by a re-sight.
+
+Security: every `/api/*` endpoint requires auth — unauthenticated reads and
+writes get 401 and reveal nothing. Clients sign requests with HMAC-SHA256
+(the token itself never travels on the wire; plain `Bearer` is also accepted
+for curl debugging), nonces are single-use, timestamps must be within
+±5 minutes, and 5 bad logins from one IP earns a 1-minute throttle (HTTP 429).
+Traffic is plain HTTP so setup stays trivial; pass `--tls-cert/--tls-key`
+(or run behind Caddy/nginx/Tailscale) if your list is sensitive.
 
 ## Requirements
 

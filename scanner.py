@@ -48,6 +48,7 @@ except ImportError as _qt_err:
 
 import base64  
 import io      
+import secrets
 try:
     from PIL import Image
     _PIL_AVAILABLE = True
@@ -251,11 +252,13 @@ def init_server_db():
                 " first_seen REAL DEFAULT 0,"
                 " last_seen REAL DEFAULT 0,"
                 " times_seen INTEGER DEFAULT 1,"
-                " last_source TEXT DEFAULT ''"
+                " last_source TEXT DEFAULT '',"
+                " needs_sync INTEGER DEFAULT 1"
                 ")"
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen ON servers(last_seen DESC)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_servers_version ON servers(version)")
+            _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
             con.commit()
         finally:
             con.close()
@@ -479,6 +482,7 @@ def _ensure_server_db():
                 con.close()
     except Exception:
         pass
+
 
 ICON_ENABLED = True           
 ICON_SIZE = 24                
@@ -6429,8 +6433,6 @@ class ServersTab(QWidget, QtBaseMixin):
             return
         self.set_status("Rechecking whitelist for selected server(s)…")
         check_selected_whitelist(self, self.tree)
-
-
 
 # ===== Qt port section: qt_monitor (PySide6, 1:1 behavior) =====
 """PySide6 port of ServerMonitorTab (scanner.py lines 6350-6737)."""
