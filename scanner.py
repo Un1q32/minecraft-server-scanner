@@ -6831,7 +6831,12 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                 pass
                             skip_python = True
                 # Auto chain by outcome: masscan first; if it never ran or
-                # fell back, minescan gets its turn before Python.
+                # fell back, minescan gets its turn before Python. Announce
+                # skips so Auto's choice is never a mystery.
+                if auto and not masscan_up and minescan_up:
+                    say("masscan not found; trying minescan instead...")
+                if auto and not masscan_up and not minescan_up:
+                    say("masscan/minescan not found; Python scan...")
                 if minescan_up and not skip_python and (masscan_failed or not masscan_tried):
                     # ---- minescan path (msrustmod-style): webscan already did
                     # TCP + Minecraft handshake per hit, so results stream
