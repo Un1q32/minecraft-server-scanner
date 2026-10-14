@@ -30,9 +30,21 @@ ASN scanning resolves announced IPv4 prefixes through BGPView, expands the prefi
 
 The Backend selector controls port discovery:
 
-- `Auto (masscan → Python)` (default): uses masscan SYN discovery when the binary is available, then runs the Minecraft handshake only on open ports. Falls back to pure Python when masscan is missing or lacks privileges.
+- `Auto (masscan → minescan → Python)` (default): masscan SYN discovery
+  when the binary is available (plus the Minecraft handshake only on open
+  ports), otherwise the minescan (webscan) async backend when its binary is
+  available — unprivileged, no sudo needed — otherwise pure Python.
+  Falls back down the chain when a helper is missing or fails.
+- `minescan (unprivileged async)`: requires the webscan binary and fails
+  clearly when it is missing instead of falling back.
 - `masscan (fast SYN + handshake)`: requires masscan and fails clearly when it is missing or unprivileged instead of falling back.
-- `Python (handshake only)`: original ThreadPool handshake scan, no masscan.
+- `Python (handshake only)`: original ThreadPool handshake scan, no helpers.
+
+The minescan backend is the Rust `webscan` scanner: drop the built binary
+next to `scanner.py` (as `webscan`), or `cargo build --release` in
+`~/Downloads/minescan`, or point `WEBSCAN_BIN` at it. Targets (IPs, CIDRs,
+ASN prefixes) stream to it natively; hits arrive with MOTD/players/version
+already known, so no second handshake pool is needed.
 
 Phase 1 (masscan) passes CIDR/range/ASN prefixes directly to masscan (`-p <ports> --open --rate <pps> --wait <s> --interactive -oL -`), so large ranges do not need per-host Python expansion. `--interactive` makes masscan print and flush one `Discovered open port ...` line per hit, which the scanner reads live from masscan's stdout pipe — each open port is handed to the Minecraft handshake pool immediately and rows appear in the table as hosts are discovered and verified, not batched at the end. (masscan's `-oL` file output is libc-buffered and only lands in chunks, which is why file-tailing can't stream; the interactive stream is flushed per result. `-oL -` list lines on the same pipe act as backup, and very old masscan builds without `--interactive` fall back to parsing those.) Everything flows through pipes — no temp files — so privileged and unprivileged runs can't disagree over output files. While the sweep runs, the status bar shows live progress from masscan's own stats (`masscan: 42% @ 9.83kpps | 12 open | handshake: 40 | Minecraft: 3`). Tune packets-per-second with Rate and post-scan wait with Wait. The kill-timeout scales with the sweep size (hosts × ports ÷ rate + wait + margin — a /8 at 10kpps gets ~30min, not a fixed cutoff), and the starting status shows the estimate (`masscan: discovering open ports (live) (~28 min)...`). If the timeout still hits first, results found so far are kept and the status says the results are partial. masscan needs raw-socket privileges: run as root/Administrator (Linux: `sudo`, Windows: admin + Npcap). Without privileges the Auto backend falls back to Python automatically.
 

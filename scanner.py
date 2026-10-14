@@ -12,6 +12,7 @@ import sys
 import time
 import shutil
 import subprocess
+import tempfile
 import ipaddress
 import urllib.request
 import urllib.error
@@ -3664,6 +3665,528 @@ class ScanStopped(Exception):
     """Raised when the user cancels a running scan (Stop button / new scan)."""
 
 
+# ==================== MINESCAN BACKEND ====================
+# Phase 1 alternative based on msrustmod (~/Downloads/msrustmod): the Rust
+# `webscan` binary (~/Downloads/minescan, `cargo build --release`) does
+# unprivileged async TCP + Minecraft Server List Ping and streams NDJSON
+# hits on stdout plus an "Attempts: … | TCP Open: … | Minecraft: …" progress
+# line on stderr. No root, no sudo, no raw sockets — unlike masscan.
+#
+# Like the masscan path, each hit is handed to the table/DB the moment it
+# arrives; webscan already did the Minecraft handshake, so no second pool
+# is needed.
+
+MINESCAN_CONCURRENCY = 10000
+MINESCAN_CONNECT_TIMEOUT = 3
+MINESCAN_MINECRAFT_TIMEOUT = 5
+MINESCAN_MAX_HOSTS = 1000000  # cap for *expanded* targets only (native ranges stream)
+MINESCAN_OUTPUT_TIMEOUT_MARGIN = 30
+
+_MS_STATS_RE = {
+    "attempts": re.compile(r"Attempts:\s*([0-9]+)"),
+    "tcp_open": re.compile(r"TCP Open:\s*([0-9]+)"),
+    "minecraft": re.compile(r"Minecraft:\s*([0-9]+)"),
+    "rate": re.compile(r"Rate:\s*([0-9.]+)/s"),
+    "elapsed": re.compile(r"Elapsed:\s*([0-9]+)s"),
+}
+
+
+def locate_minescan_binary(override=""):
+    """Find the webscan binary: explicit path, $WEBSCAN_BIN/$MINESCAN_BIN,
+    known build locations, then PATH. Returns "" when not found."""
+    o = (override or "").strip()
+    if o:
+        return o if (os.path.isfile(o) and os.access(o, os.X_OK)) else ""
+    for env in ("WEBSCAN_BIN", "MINESCAN_BIN"):
+        v = (os.environ.get(env) or "").strip()
+        if v and os.path.isfile(v) and os.access(v, os.X_OK):
+            return v
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        here = ""
+    candidates = []
+    if here:
+        # Beside the script itself: just drop the webscan binary next to
+        # scanner.py and it is picked up with zero configuration.
+        candidates.append(os.path.join(here, "webscan"))
+    candidates += [
+        os.path.expanduser("~/Downloads/minescan/target/release/webscan"),
+        os.path.abspath(os.path.join("minescan", "target", "release", "webscan")),
+        os.path.abspath("webscan"),
+    ]
+    for cand in candidates:
+        try:
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        except Exception:
+            continue
+    for name in ("webscan", "minescan"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def is_minescan_available(override=""):
+    """True when the webscan binary exists and looks right (--help probe)."""
+    exe = locate_minescan_binary(override)
+    if not exe:
+        return False
+    try:
+        proc = subprocess.run([exe, "--help"], capture_output=True,
+                              text=True, timeout=10)
+        out = ((proc.stdout or "") + " " + (proc.stderr or "")).lower()
+        return "minecraft" in out or "--ports" in out
+    except Exception:
+        return False
+
+
+def minescan_status_line(override=""):
+    exe = locate_minescan_binary(override)
+    if not exe:
+        return ("minescan: webscan binary not found (cargo build --release "
+                "in ~/Downloads/minescan, or set WEBSCAN_BIN)")
+    if not is_minescan_available(override):
+        return f"minescan: {exe} (--help check failed)"
+    return f"minescan: {exe} (unprivileged async, no sudo needed)"
+
+
+def parse_minescan_hit(line):
+    """Parse one webscan NDJSON hit into a ping_server-style result dict.
+
+    Returns None for blank lines, {"protocol": "tcp"} open-port lines and
+    garbage. Shape matches ping_server() output so table/DB/whitelist code
+    works unchanged (no player sample: cracked stays undiscovered here).
+    """
+    try:
+        data = json.loads((line or "").strip())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    proto = str(data.get("protocol", "") or "").lower()
+    if proto and proto != "minecraft":
+        return None
+    ip = str(data.get("ip", "") or "").strip()
+    try:
+        port = int(data.get("port", 0))
+    except Exception:
+        return None
+    if not ip or not (1 <= port <= 65535):
+        return None
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    version = str(data.get("version", "") or "").strip() or "N/A"
+    try:
+        online = max(0, int(data.get("players_online", 0) or 0))
+    except Exception:
+        online = 0
+    try:
+        maximum = max(0, int(data.get("players_max", 0) or 0))
+    except Exception:
+        maximum = 0
+    try:
+        protocol = int(data.get("protocol_version")) if data.get("protocol_version") is not None else None
+    except Exception:
+        protocol = None
+    motd = sanitize_motd(data.get("description", "") or "")
+    return {"ip": f"{ip}:{port}", "motd": motd, "players": online,
+            "max_players": maximum, "version": version, "protocol": protocol,
+            "cracked": False, "players_sample": []}
+
+
+def parse_minescan_stats(segment):
+    """Parse a webscan stderr progress segment.
+
+    ("Attempts: 123 | TCP Open: 45 | Minecraft: 6 | … Rate: 8200/s |
+    Elapsed: 12s") -> dict, or None when it carries no counters.
+    """
+    seg = segment or ""
+    try:
+        m = _MS_STATS_RE["attempts"].search(seg)
+        if not m:
+            return None
+        out = {"attempts": int(m.group(1)), "tcp_open": 0, "minecraft": 0,
+               "rate": 0.0, "elapsed": 0}
+        for key in ("tcp_open", "minecraft", "elapsed"):
+            mm = _MS_STATS_RE[key].search(seg)
+            if mm:
+                try:
+                    out[key] = int(mm.group(1))
+                except Exception:
+                    pass
+        mm = _MS_STATS_RE["rate"].search(seg)
+        if mm:
+            try:
+                out["rate"] = float(mm.group(1))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return None
+
+
+def build_minescan_inputs(target_text, ports, max_hosts=MINESCAN_MAX_HOSTS):
+    """Convert GUI target text into webscan runs (mirrors msrustmod).
+
+    IPs/CIDRs/ASN prefixes stream natively (never expanded, never capped);
+    dash ranges, hostnames and ip:port entries expand to IPs (bounded by
+    max_hosts) and ride along grouped by port. Returns
+    (runs, warnings) where each run is {"targets": [...], "ports": [...],
+    "estimate": hosts*ports}.
+    """
+    ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
+    port_set = set(ports)
+    ranges = []
+    seen_range = set()
+    main_ips = []
+    seen_main = set()
+    foreign = {}  # off-list port -> [ips]
+    expanded_total = 0
+    warnings = []
+
+    def add_range(spec):
+        if spec and spec not in seen_range:
+            seen_range.add(spec)
+            ranges.append(spec)
+
+    for token in _split_target_tokens(target_text):
+        try:
+            if re.match(r"^(?:AS)?\d+$", token, re.I):
+                try:
+                    prefixes = fetch_asn_prefixes(token)
+                except Exception as exc:
+                    warnings.append(f"ASN {token}: {exc}")
+                    continue
+                n = 0
+                for prefix in prefixes:
+                    try:
+                        net = ipaddress.ip_network(prefix, strict=False)
+                    except ValueError:
+                        continue
+                    if net.version != 4:
+                        continue
+                    if str(net) not in seen_range:
+                        seen_range.add(str(net))
+                        ranges.append(str(net))
+                        n += 1
+                warnings.append(f"ASN {token}: {n} prefix(es) stream to minescan")
+                continue
+            if "/" in token:
+                try:
+                    net = ipaddress.ip_network(token, strict=False)
+                except ValueError:
+                    continue
+                if net.version != 4:
+                    continue
+                add_range(str(net))
+                continue
+            if "-" in token and "/" not in token and ":" not in token:
+                left, right = token.split("-", 1)
+                try:
+                    start = ipaddress.ip_address(left.strip())
+                    end = ipaddress.ip_address(right.strip())
+                except ValueError:
+                    continue
+                if start.version != 4 or end.version != 4 or int(end) < int(start):
+                    continue
+                remaining = max(0, max_hosts - expanded_total)
+                for ip in expand_ip_range(left, right, remaining):
+                    if expanded_total >= max_hosts:
+                        warnings.append("host limit reached; remaining targets skipped")
+                        break
+                    if ip not in seen_main:
+                        seen_main.add(ip)
+                        main_ips.append(ip)
+                        expanded_total += 1
+                continue
+            host, explicit_port = None, None
+            if ":" in token:
+                host, port_txt = token.rsplit(":", 1)
+                host = host.strip()
+                try:
+                    explicit_port = int(port_txt.strip())
+                except ValueError:
+                    continue
+                if not (1 <= explicit_port <= 65535):
+                    continue
+            else:
+                host = token
+            try:
+                ipaddress.ip_address(host)
+                ip_str = host
+            except ValueError:
+                try:
+                    ip_str = socket.gethostbyname(host)
+                except Exception:
+                    continue
+            if explicit_port is None or explicit_port in port_set:
+                if expanded_total >= max_hosts:
+                    warnings.append("host limit reached; remaining targets skipped")
+                    continue
+                if ip_str not in seen_main:
+                    seen_main.add(ip_str)
+                    main_ips.append(ip_str)
+                    expanded_total += 1
+            else:
+                bucket = foreign.setdefault(explicit_port, [])
+                if ip_str not in bucket:
+                    bucket.append(ip_str)
+                    expanded_total += 1
+        except Exception:
+            continue
+
+    def estimate(targets, nports):
+        hosts = 0
+        for spec in targets:
+            hosts += _masscan_count_hosts(spec, cap=None)
+        return hosts * max(1, nports)
+
+    runs = []
+    if ranges or main_ips:
+        tgts = list(ranges) + list(main_ips)
+        runs.append({"targets": tgts, "ports": list(ports),
+                     "estimate": estimate(tgts, len(ports))})
+    for p in sorted(foreign):
+        tgts = list(foreign[p])
+        runs.append({"targets": tgts, "ports": [p],
+                     "estimate": estimate(tgts, 1)})
+    return runs, warnings
+
+
+def minescan_estimate_seconds(runs, rate):
+    """Expected sweep duration in seconds (probes/rate), estimate-only."""
+    try:
+        rate = max(1, int(rate))
+    except Exception:
+        rate = MASSCAN_DEFAULT_RATE
+    try:
+        probes = sum(int(r.get("estimate", 0) or 0) for r in (runs or []))
+    except Exception:
+        probes = 0
+    return probes / rate
+
+
+def minescan_default_timeout(runs, rate):
+    """Watchdog timeout scaled to the sweep size: expected + margin."""
+    try:
+        expected = minescan_estimate_seconds(runs, rate)
+    except Exception:
+        expected = 0
+    return max(180, int(expected + MINESCAN_OUTPUT_TIMEOUT_MARGIN + 60))
+
+
+def format_minescan_status(stats, found):
+    """Status-bar text for a live minescan sweep."""
+    try:
+        parts = [f"minescan: {stats.get('attempts', 0)} attempts",
+                 f"{stats.get('tcp_open', 0)} open",
+                 f"Minecraft: {found}"]
+        rate = float(stats.get("rate", 0) or 0)
+        if rate > 0:
+            parts.append(f"{rate:.0f}/s")
+        return " | ".join(parts)
+    except Exception:
+        return f"minescan: {found} found"
+
+
+def run_minescan_streaming(targets, ports, rate=0, concurrency=MINESCAN_CONCURRENCY,
+                           connect_timeout=MINESCAN_CONNECT_TIMEOUT,
+                           minecraft_timeout=MINESCAN_MINECRAFT_TIMEOUT,
+                           protocol_version=PROTOCOL_VERSION, timeout=None,
+                           exe=None, on_hit=None, on_stats=None,
+                           stop_event=None):
+    """Run webscan on one target list, calling on_hit(dict) live per hit.
+
+    Targets are written to a temp file (one IP/CIDR per line) so huge
+    ranges never hit command-line limits. Returns (hits, note). Raises
+    FileNotFoundError when the binary is missing, ScanStopped on cancel,
+    TimeoutError on timeout, RuntimeError on hard failure with no hits.
+    Thread-safe callbacks: reader threads, portable (no select-on-pipes,
+    which Windows lacks).
+    """
+    exe = exe or locate_minescan_binary()
+    if not exe:
+        raise FileNotFoundError(
+            "webscan binary not found. Build it with `cargo build --release` in "
+            "~/Downloads/minescan (binary: target/release/webscan) or set WEBSCAN_BIN.")
+    ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
+    targets = [t for t in (targets or []) if t]
+    if not targets:
+        return [], "no targets"
+    if timeout is None:
+        timeout = 0
+    try:
+        rate = max(0, int(rate))
+    except Exception:
+        rate = 0
+
+    fd, targets_path = tempfile.mkstemp(prefix="minescan_targets_", suffix=".txt",
+                                        text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for spec in dict.fromkeys(targets):
+                f.write(f"{spec}\n")
+    except Exception:
+        try:
+            os.unlink(targets_path)
+        except Exception:
+            pass
+        raise
+
+    cmd = [exe, targets_path, "-p", ",".join(str(p) for p in ports),
+           "--output", "ndjson",
+           "--concurrency", str(max(1, min(int(concurrency), 100000))),
+           "--rate", str(rate),
+           "--connect-timeout", str(max(1, min(int(connect_timeout), 120))),
+           "--minecraft-timeout", str(max(1, min(int(minecraft_timeout), 120))),
+           "--protocol-version", str(int(protocol_version))]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        try:
+            os.unlink(targets_path)
+        except Exception:
+            pass
+        raise FileNotFoundError("webscan binary not found. Install it or use another backend.")
+
+    hits = []
+    hits_lock = threading.Lock()
+    err_tail = []
+    last_stats = {"attempts": 0, "tcp_open": 0, "minecraft": 0, "rate": 0.0, "elapsed": 0}
+    last_stats_at = [0.0]
+
+    def emit_hit(hit):
+        with hits_lock:
+            hits.append(hit)
+        if on_hit:
+            try:
+                on_hit(hit)
+            except Exception:
+                pass
+
+    def feed_stats(seg):
+        stats = parse_minescan_stats(seg)
+        if not stats:
+            return
+        now = time.time()
+        with hits_lock:
+            advanced = stats["attempts"] != last_stats["attempts"]
+            last_stats.update(stats)
+        if on_stats and advanced and (now - last_stats_at[0] >= 0.5):
+            last_stats_at[0] = now
+            try:
+                on_stats(dict(stats))
+            except Exception:
+                pass
+
+    def read_stdout():
+        buf = ""
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(65536)
+                if not chunk:
+                    break
+                try:
+                    buf += chunk.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    hit = parse_minescan_hit(line)
+                    if hit is not None:
+                        emit_hit(hit)
+        except Exception:
+            pass
+        finally:
+            if buf.strip():
+                hit = parse_minescan_hit(buf)
+                if hit is not None:
+                    emit_hit(hit)
+
+    def read_stderr():
+        frag = ""
+        try:
+            while True:
+                chunk = proc.stderr.read1(65536) if hasattr(proc.stderr, "read1") else proc.stderr.read(65536)
+                if not chunk:
+                    break
+                try:
+                    text = chunk.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                for ch in text:
+                    if ch == "\r" or ch == "\n":
+                        if frag.strip():
+                            feed_stats(frag)
+                            if len(err_tail) < 20 and parse_minescan_stats(frag) is None:
+                                err_tail.append(frag.strip()[:500])
+                            frag = ""
+                    elif len(frag) < 4096:
+                        frag += ch
+                if frag.strip():
+                    feed_stats(frag)
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=read_stdout, daemon=True)
+    t_err = threading.Thread(target=read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+    start = time.time()
+    timed_out = False
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise ScanStopped("scan stopped by user")
+            if timeout and (time.time() - start) > timeout:
+                timed_out = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
+            try:
+                rc = proc.wait(timeout=0.25)
+                if rc is not None:
+                    break
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        t_out.join(timeout=10)
+        t_err.join(timeout=10)
+        try:
+            os.unlink(targets_path)
+        except Exception:
+            pass
+    with hits_lock:
+        found = list(hits)
+    if stop_event is not None and stop_event.is_set():
+        raise ScanStopped("scan stopped by user")
+    if timed_out:
+        if found:
+            return found, f"[partial: timed out after {int(time.time() - start)}s]"
+        raise TimeoutError("minescan timed out with no hits")
+    try:
+        returncode = proc.returncode
+    except Exception:
+        returncode = -1
+    if returncode not in (0, None):
+        tail = "\n".join(err_tail[-5:]).strip()[:500]
+        if found:
+            return found, (tail or f"exit {returncode}")
+        raise RuntimeError(f"minescan failed (exit {returncode})" + (f": {tail}" if tail else ""))
+    return found, ""
+
+
 def _drain_masscan_stdout(proc, timeout, frag_cb, progress_cb=None, note_cap=4096,
                            stop_event=None):
     """Feed \\r/\\n-separated stdout fragments to callbacks until EOF.
@@ -5350,6 +5873,10 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         return _TextVarAdapter(self.masscan_status_label)
 
     @property
+    def minescan_status_var(self):
+        return _TextVarAdapter(self.minescan_status_label)
+
+    @property
     def version_filter_var(self):
         return _ComboVarAdapter(self.version_filter_combo)
 
@@ -5416,12 +5943,13 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         self.backend_combo.setEditable(False)
         self.backend_combo.addItems(
             [
-                "Auto (masscan \u2192 Python)",
+                "Auto (masscan \u2192 minescan \u2192 Python)",
+                "minescan (unprivileged async)",
                 "masscan (fast SYN + handshake)",
                 "Python (handshake only)",
             ]
         )
-        self.backend_combo.setCurrentText("Auto (masscan \u2192 Python)")
+        self.backend_combo.setCurrentText("Auto (masscan \u2192 minescan \u2192 Python)")
         self.backend_combo.setMinimumWidth(240)
         bb.addWidget(self.backend_combo)
         bb.addWidget(QLabel("Rate (pps):", backend_bar))
@@ -5446,10 +5974,14 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         except Exception:
             self.masscan_status_label.setText("")
         bb.addWidget(self.masscan_status_label)
+        self.minescan_status_label = QLabel(backend_bar)
+        try:
+            self.minescan_status_label.setText(minescan_status_line())
+        except Exception:
+            self.minescan_status_label.setText("")
+        bb.addWidget(self.minescan_status_label)
         recheck_btn = QPushButton("Recheck", backend_bar)
-        recheck_btn.clicked.connect(
-            lambda: self.masscan_status_label.setText(masscan_status_line())
-        )
+        recheck_btn.clicked.connect(self._recheck_backends)
         bb.addWidget(recheck_btn)
         bb.addStretch(1)
         main.addWidget(backend_bar)
@@ -5675,6 +6207,21 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         except Exception:
             pass
 
+    def _minescan_status(self, job, attempts, stats, found, total_est):
+        if job != self._scan_job_id:
+            return
+        try:
+            self.status_label.setText(format_minescan_status(stats, found))
+        except Exception:
+            pass
+        try:
+            if total_est and total_est > 0:
+                self._progress_set(min(attempts, total_est), total_est)
+            else:
+                self._progress_busy()
+        except Exception:
+            pass
+
     def set_status(self, msg):
         try:
             super().set_status(msg)  # type: ignore[misc]
@@ -5805,6 +6352,16 @@ class NetworkScanTab(QtBaseMixin, QWidget):
             return None, "prompt timed out after 5 minutes (no answer)"
         return holder.get("pw"), holder.get("err")
 
+    def _recheck_backends(self):
+        try:
+            self.masscan_status_label.setText(masscan_status_line())
+        except Exception:
+            pass
+        try:
+            self.minescan_status_label.setText(minescan_status_line())
+        except Exception:
+            pass
+
     def stop_scan(self):
         """Cancel the running network scan (new scans call this implicitly).
 
@@ -5831,17 +6388,23 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         try:
             backend = self.backend_combo.currentText()
         except Exception:
-            backend = "Auto (masscan \u2192 Python)"
-        use_masscan = backend != "Python (handshake only)"
-        if use_masscan:
+            backend = "Auto (masscan \u2192 minescan \u2192 Python)"
+        strict_minescan = backend.startswith("minescan")
+        strict_masscan = backend.startswith("masscan")
+        auto = backend.startswith("Auto")
+        use_minescan = strict_minescan or auto
+        use_masscan = strict_masscan or auto
+        if use_minescan or use_masscan:
             max_hosts = max(1, min(max_hosts_raw, MASSCAN_MAX_HOSTS))
         else:
             max_hosts = max(1, min(max_hosts_raw, 65536))
         ports = parse_ports(self.ports_edit.text())
         try:
-            masscan_rate = int((self.masscan_rate_edit.text() or "").strip() or MASSCAN_DEFAULT_RATE)
+            scan_rate = int((self.masscan_rate_edit.text() or "").strip() or MASSCAN_DEFAULT_RATE)
         except ValueError:
-            masscan_rate = MASSCAN_DEFAULT_RATE
+            scan_rate = MASSCAN_DEFAULT_RATE
+        masscan_rate = scan_rate
+        minescan_rate = scan_rate
         try:
             masscan_wait = int((self.masscan_wait_edit.text() or "").strip() or MASSCAN_DEFAULT_WAIT)
         except ValueError:
@@ -5881,7 +6444,15 @@ class NetworkScanTab(QtBaseMixin, QWidget):
 
         def work(job=job, stop_event=stop_event):
             try:
-                if use_masscan and backend.startswith("masscan") and not is_masscan_available():
+                # Probe once up front; Auto prefers masscan, then minescan.
+                masscan_up = use_masscan and is_masscan_available()
+                minescan_up = use_minescan and is_minescan_available()
+                if strict_minescan and not minescan_up:
+                    say("minescan/webscan not found; build it (cargo build --release in "
+                        "~/Downloads/minescan), set WEBSCAN_BIN, or use another backend.")
+                    go_idle()
+                    return
+                if strict_masscan and not masscan_up:
                     say("masscan not found; install masscan or use Auto/Python backend.")
                     go_idle()
                     return
@@ -5969,7 +6540,106 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 targets = None
                 skip_python = False
                 masscan_note = ""
-                if use_masscan and is_masscan_available():
+                minescan_note = ""
+                # Auto order: masscan first (when up), then minescan, then
+                # Python. Strict minescan skips masscan via use_masscan=False.
+                if minescan_up and not masscan_up:
+                    # ---- minescan path (msrustmod-style): webscan already did
+                    # TCP + Minecraft handshake per hit, so results stream
+                    # straight to the table/DB with no second pool. ----
+                    try:
+                        ms_runs, ms_warnings = build_minescan_inputs(
+                            targets_raw, ports, max_hosts)
+                    except Exception as exc:
+                        ms_runs, ms_warnings = [], [str(exc)]
+                    for w in ms_warnings[:5]:
+                        say(f"minescan: {w}")
+                    if not ms_runs:
+                        if strict_minescan:
+                            say("minescan: no valid targets to scan.")
+                            go_idle()
+                            return
+                    else:
+                        total_est = sum(int(r.get("estimate", 0) or 0) for r in ms_runs)
+                        eta = _format_masscan_eta(
+                            minescan_estimate_seconds(ms_runs, minescan_rate))
+                        say(f"minescan: scanning {len(ms_runs)} run(s)"
+                            f" (~{total_est} probes){eta}...")
+                        runs_ok = 0
+                        first_error = ""
+
+                        def ms_on_hit(hit):
+                            if not alive():
+                                return
+                            ip_port = hit.get("ip", "")
+                            if is_ignored(ip_port):
+                                return
+                            try:
+                                _remember_protocol(ip_port, hit.get("protocol"))
+                            except Exception:
+                                pass
+                            try:
+                                record_server_result(hit, source="minescan")
+                            except Exception:
+                                pass
+                            line = (f"{hit['ip']} | MOTD: {hit['motd']} | Players: "
+                                    f"{hit['players']}/{hit['max_players']} | Version: {hit['version']}")
+                            with lock:
+                                results.append(hit)
+                            try:
+                                USER_LOG_MANAGER.update_from_result(hit)
+                            except Exception:
+                                pass
+                            try:
+                                on_result(hit, line)
+                            except Exception:
+                                pass
+
+                        def ms_on_stats(stats):
+                            if job != self._scan_job_id:
+                                return
+                            try:
+                                att = int(stats.get("attempts", 0) or 0)
+                            except Exception:
+                                att = 0
+                            self.after(0, lambda a=att, s=dict(stats), f=len(results):
+                                       self._minescan_status(job, a, s, f, total_est))
+
+                        for ri, run in enumerate(ms_runs):
+                            if not alive():
+                                break
+                            tag = f"run {ri + 1}/{len(ms_runs)}: " if len(ms_runs) > 1 else ""
+                            say(f"minescan {tag}{len(run['targets'])} target(s) on "
+                                f"port(s) {','.join(str(p) for p in run['ports'])}...")
+                            try:
+                                _, note = run_minescan_streaming(
+                                    run["targets"], run["ports"], rate=minescan_rate,
+                                    timeout=minescan_default_timeout([run], minescan_rate),
+                                    stop_event=stop_event,
+                                    on_hit=ms_on_hit, on_stats=ms_on_stats)
+                                runs_ok += 1
+                                if note:
+                                    minescan_note = f"{minescan_note} {note}".strip()
+                            except ScanStopped:
+                                go_idle()
+                                return
+                            except Exception as exc:
+                                if not first_error:
+                                    first_error = str(exc)
+                                say(f"minescan {tag}failed ({first_error}), continuing")
+                        if not alive():
+                            go_idle()
+                            return
+                        if runs_ok == 0:
+                            if strict_minescan:
+                                say(f"minescan failed: {first_error or 'unknown error'}")
+                                go_idle()
+                                return
+                            say(f"minescan failed ({first_error or 'unknown error'}); "
+                                "falling back...")
+                        else:
+                            skip_python = True
+                if not skip_python and masscan_up:
                     # ---- streaming masscan path: each open port is handed to
                     # the handshake pool (and the GUI) as soon as masscan
                     # reports it, instead of waiting for the whole sweep. ----
@@ -6171,8 +6841,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                     go_idle()
                     return
                 self.after(0, lambda rows=list(self.scan_rows): self._update_version_filter_choices(rows))
-                if _masscan_note_is_partial(masscan_note):
-                    say(f"Scan complete \u2014 masscan stopped early (timeout), results partial. "
+                if _masscan_note_is_partial(masscan_note) or _masscan_note_is_partial(minescan_note):
+                    say(f"Scan complete \u2014 sweep stopped early (timeout), results partial. "
                         f"Minecraft servers: {len(results)}.")
                 else:
                     say(f"Scan complete. Minecraft servers: {len(results)}.")
