@@ -6375,6 +6375,9 @@ class ServersTab(QWidget, QtBaseMixin):
         btn_rescan = QPushButton("Rescan Selected")
         btn_rescan.clicked.connect(self.rescan_selected)
         bar.addWidget(btn_rescan)
+        btn_wl = QPushButton("Recheck Whitelist")
+        btn_wl.clicked.connect(self.recheck_whitelist_selected)
+        bar.addWidget(btn_wl)
         bar.addStretch(1)
         self.count_label = QLabel("")
         bar.addWidget(self.count_label)
@@ -6572,6 +6575,13 @@ class ServersTab(QWidget, QtBaseMixin):
                 self.after(0, lambda: self.set_status(f"Rescan failed: {exc}"))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def recheck_whitelist_selected(self):
+        if not self.tree.selection():
+            q_info(self, "Recheck Whitelist", "Select one or more server rows first.")
+            return
+        self.set_status("Rechecking whitelist for selected server(s)…")
+        check_selected_whitelist(self, self.tree)
 
 
 
