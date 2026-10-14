@@ -3680,14 +3680,21 @@ def parse_masscan_progress(fragment):
         return None
 
 
-def format_stream_status(opened, probed, found, pct=None, rate=None):
+def format_stream_status(opened, probed, found, pct=None, rate=None, total=None):
     """Status-bar text for a live masscan sweep."""
     if pct is None:
-        return f"masscan: {opened} open | handshake: {probed} | Minecraft: {found}"
-    if rate:
-        return (f"masscan: {pct:.0f}% @ {rate}kpps | {opened} open | "
+        text = f"masscan: {opened} open | handshake: {probed} | Minecraft: {found}"
+    elif rate:
+        text = (f"masscan: {pct:.0f}% @ {rate}kpps | {opened} open | "
                 f"handshake: {probed} | Minecraft: {found}")
-    return f"masscan: {pct:.0f}% | {opened} open | handshake: {probed} | Minecraft: {found}"
+    else:
+        text = f"masscan: {pct:.0f}% | {opened} open | handshake: {probed} | Minecraft: {found}"
+    try:
+        if total and int(total) > 0:
+            text += f" | ~{int(total):,} hosts"
+    except Exception:
+        pass
+    return text
 
 
 class ScanStopped(Exception):
@@ -4015,18 +4022,31 @@ def minescan_default_timeout(runs, rate):
     return max(180, int(expected + MINESCAN_OUTPUT_TIMEOUT_MARGIN + 60))
 
 
-def format_minescan_status(stats, found):
+def format_minescan_status(stats, found, total=None):
     """Status-bar text for a live minescan sweep."""
     try:
-        parts = [f"minescan: {stats.get('attempts', 0)} attempts",
-                 f"{stats.get('tcp_open', 0)} open",
+        att = int((stats or {}).get("attempts", 0) or 0)
+    except Exception:
+        att = 0
+    try:
+        total_n = int(total or 0)
+    except Exception:
+        total_n = 0
+    if total_n > 0:
+        parts = [f"minescan: {att:,}/{total_n:,} attempts",
+                 f"{(stats or {}).get('tcp_open', 0)} open",
                  f"Minecraft: {found}"]
-        rate = float(stats.get("rate", 0) or 0)
+    else:
+        parts = [f"minescan: {att:,} attempts",
+                 f"{(stats or {}).get('tcp_open', 0)} open",
+                 f"Minecraft: {found}"]
+    try:
+        rate = float((stats or {}).get("rate", 0) or 0)
         if rate > 0:
             parts.append(f"{rate:.0f}/s")
-        return " | ".join(parts)
     except Exception:
-        return f"minescan: {found} found"
+        pass
+    return " | ".join(parts)
 
 
 def run_minescan_streaming(targets, ports, rate=0, concurrency=MINESCAN_CONCURRENCY,
@@ -6251,12 +6271,12 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         except Exception:
             pass
 
-    def _stream_status(self, job, opened, probed, found, pct, rate):
+    def _stream_status(self, job, opened, probed, found, pct, rate, total=None):
         if job != self._scan_job_id:
             return
         try:
             self.status_label.setText(
-                format_stream_status(opened, probed, found, pct, rate))
+                format_stream_status(opened, probed, found, pct, rate, total))
         except Exception:
             pass
         try:
@@ -6271,7 +6291,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         if job != self._scan_job_id:
             return
         try:
-            self.status_label.setText(format_minescan_status(stats, found))
+            self.status_label.setText(format_minescan_status(stats, found, total_est))
         except Exception:
             pass
         try:
@@ -6661,8 +6681,13 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                     # reports it, instead of waiting for the whole sweep. ----
                     try:
                         ranges, direct = build_masscan_inputs(targets_raw, ports)
+                        try:
+                            ms_hosts = (sum(_masscan_count_hosts(spec, cap=None) for spec in ranges)
+                                        + len(direct))
+                        except Exception:
+                            ms_hosts = 0
                     except Exception as exc:
-                        ranges, direct = [], []
+                        ranges, direct, ms_hosts = [], [], 0
                         if backend.startswith("masscan"):
                             message = str(exc)
                             say(f"masscan target error: {message}")
@@ -6681,8 +6706,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             if job != self._scan_job_id:
                                 return
                             self.after(0, lambda o=opened_n["n"], p=probed_n["n"], f=len(results),
-                                       pct=scan_prog["pct"], rate=scan_prog["rate"]:
-                                self._stream_status(job, o, p, f, pct, rate))
+                                       pct=scan_prog["pct"], rate=scan_prog["rate"], total=ms_hosts:
+                                self._stream_status(job, o, p, f, pct, rate, total))
 
                         def handle_scan_progress(pct, rate):
                             scan_prog["pct"] = pct
@@ -6754,11 +6779,6 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             return
                         eta = _format_masscan_eta(_masscan_estimate_seconds(
                             ranges, ports, masscan_rate, masscan_wait))
-                        try:
-                            ms_hosts = (sum(_masscan_count_hosts(spec, cap=None) for spec in ranges)
-                                        + len(direct))
-                        except Exception:
-                            ms_hosts = 0
                         say(f"masscan: discovering open ports on ~{ms_hosts:,} host(s) (live){eta}...")
                         outcome = "ok"
                         try:
