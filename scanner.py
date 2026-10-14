@@ -860,11 +860,21 @@ def _load_mc_accounts():
         return {"accounts": [], "active_uuid": ""}
 
 def _save_mc_accounts(data):
+    """Persist accounts. Returns True on success — callers must report False
+    loudly (a root-owned/unwritable mc_accounts.json otherwise fails silent
+    and every later action mysteriously 'does nothing')."""
     try:
         with open(MC_ACCOUNTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _mc_save_error(action="save accounts"):
+    return (f"Could not {action}: {MC_ACCOUNTS_FILE} is not writable.\n"
+            f"Usual cause: the file is owned by root (from an old sudo run).\n"
+            f"Fix: sudo chown $USER {MC_ACCOUNTS_FILE}")
 
 def _account_key(account):
     return (account.get("uuid") or account.get("name") or "").strip()
@@ -894,6 +904,7 @@ def get_active_mc_account():
     return accounts[0]
 
 def upsert_mc_accounts(accounts, active_uuid=None):
+    """Merge accounts into storage. Returns (data, saved_ok)."""
     data = _load_mc_accounts()
     existing = {}
     for account in data.get("accounts", []):
@@ -912,8 +923,8 @@ def upsert_mc_accounts(accounts, active_uuid=None):
         data["active_uuid"] = active_uuid
     elif not data.get("active_uuid") and data["accounts"]:
         data["active_uuid"] = data["accounts"][0].get("uuid", "")
-    _save_mc_accounts(data)
-    return data
+    saved = _save_mc_accounts(data)
+    return data, saved
 
 def import_prism_accounts(path=PRISM_ACCOUNTS_PATH):
     """Import accounts from Prism Launcher's accounts.json.
@@ -974,9 +985,10 @@ def import_prism_accounts(path=PRISM_ACCOUNTS_PATH):
             skipped.append((label, "name/UUID did not survive cleanup"))
             continue
         imported.append(account)
+    saved = True
     if imported:
-        upsert_mc_accounts(imported, active_uuid=imported[0].get("uuid"))
-    return imported, skipped
+        _, saved = upsert_mc_accounts(imported, active_uuid=imported[0].get("uuid"))
+    return imported, skipped, saved
 
 def minecraft_sha1_hexdigest(*parts):
     digest = hashlib.sha1()
@@ -5648,7 +5660,7 @@ class AccountTab(QWidget):
                 return
             path = picked
         try:
-            imported, skipped = import_prism_accounts(path)
+            imported, skipped, saved = import_prism_accounts(path)
             self.refresh()
             total = len(_load_mc_accounts().get("accounts", []))
             shown = len(self.tree.get_children())
@@ -5656,6 +5668,9 @@ class AccountTab(QWidget):
             msg = (f"Imported {len(imported)} Prism account(s)"
                    + (f": {names}" if names else "")
                    + f". Stored total: {total}, shown: {shown}.")
+            if not saved:
+                msg += " SAVE FAILED."
+                q_error(self, "Accounts", _mc_save_error("save the imported accounts"))
             if shown < total:
                 msg += " WARNING: table shows fewer than stored — tell me and paste this line."
             if skipped:
@@ -5688,7 +5703,10 @@ class AccountTab(QWidget):
                 "Minecraft Account",
                 "MSA client id (optional; Prism fills this automatically):"
             ) or ""
-        upsert_mc_accounts([account], active_uuid=account.get("uuid"))
+        _, saved = upsert_mc_accounts([account], active_uuid=account.get("uuid"))
+        if not saved:
+            q_error(self, "Accounts", _mc_save_error("add the account"))
+            return
         self.refresh()
 
     def import_tokens(self):
@@ -5714,7 +5732,10 @@ class AccountTab(QWidget):
             if not imported:
                 q_info(dialog, "Import Tokens", "No valid tokens found.")
                 return
-            upsert_mc_accounts(imported)
+            _, saved = upsert_mc_accounts(imported)
+            if not saved:
+                q_error(dialog, "Import Tokens", _mc_save_error("import the tokens"))
+                return
             dialog.accept()
             self.refresh()
             self.set_status(f"Imported {len(imported)} token(s). Probe them to fetch names/UUIDs.")
@@ -5789,7 +5810,9 @@ class AccountTab(QWidget):
             q_info(self, "Accounts", "This account has no UUID yet. Probe it first to fetch its UUID.")
             return
         data["active_uuid"] = account["uuid"]
-        _save_mc_accounts(data)
+        if not _save_mc_accounts(data):
+            q_error(self, "Accounts", _mc_save_error("set the active account"))
+            return
         self.refresh()
 
     def remove_selected(self):
@@ -5806,7 +5829,9 @@ class AccountTab(QWidget):
             data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
         if not data.get("active_uuid") and kept:
             data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
-        _save_mc_accounts(data)
+        if not _save_mc_accounts(data):
+            q_error(self, "Accounts", _mc_save_error("remove the account(s)"))
+            return
         for k in keys:
             self._probe_results.pop(k, None)
         self.refresh()
@@ -5832,7 +5857,9 @@ class AccountTab(QWidget):
             data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
         if not data.get("active_uuid") and kept:
             data["active_uuid"] = next((a.get("uuid", "") for a in kept if a.get("uuid")), "")
-        _save_mc_accounts(data)
+        if not _save_mc_accounts(data):
+            q_error(self, "Accounts", _mc_save_error("remove the failed account(s)"))
+            return
         self._probe_results = {}
         self.refresh()
         self.set_status(f"Removed {len(removed)} failed account(s).")
