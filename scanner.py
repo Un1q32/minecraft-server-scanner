@@ -6146,14 +6146,20 @@ class NetworkScanTab(QtBaseMixin, QWidget):
 
         self.status_label = QLabel("Ready.", self)
         self.progress_bar = QProgressBar(self)
-        self.progress_bar.setMaximumWidth(220)
+        self.progress_bar.setMinimumWidth(130)
+        self.progress_bar.setMaximumWidth(200)
+        try:
+            from PySide6.QtWidgets import QSizePolicy
+            self.progress_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        except Exception:
+            pass
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         status_row = QHBoxLayout()
         status_row.setContentsMargins(8, 0, 8, 8)
-        status_row.addWidget(self.status_label, 1)
-        status_row.addWidget(self.progress_bar, 0)
+        status_row.addWidget(self.progress_bar, 1)
+        status_row.addWidget(self.status_label, 2)
         main.addLayout(status_row)
 
     def _progress_busy(self):
@@ -6773,7 +6779,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         eta = _format_masscan_eta(
                             minescan_estimate_seconds(ms_runs, minescan_rate))
                         say(f"minescan: scanning {len(ms_runs)} run(s)"
-                            f" (~{total_est} probes){eta}...")
+                            f" (~{total_est:,} probes){eta}...")
                         runs_ok = 0
                         first_error = ""
 
@@ -6818,7 +6824,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             if not alive():
                                 break
                             tag = f"run {ri + 1}/{len(ms_runs)}: " if len(ms_runs) > 1 else ""
-                            say(f"minescan {tag}{len(run['targets'])} target(s) on "
+                            say(f"minescan {tag}{len(run['targets'])} target(s) "
+                                f"(~{run['estimate']:,} probes) on "
                                 f"port(s) {','.join(str(p) for p in run['ports'])}...")
                             try:
                                 _, note = run_minescan_streaming(
