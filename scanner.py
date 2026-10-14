@@ -6754,7 +6754,12 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             return
                         eta = _format_masscan_eta(_masscan_estimate_seconds(
                             ranges, ports, masscan_rate, masscan_wait))
-                        say(f"masscan: discovering open ports (live){eta}...")
+                        try:
+                            ms_hosts = (sum(_masscan_count_hosts(spec, cap=None) for spec in ranges)
+                                        + len(direct))
+                        except Exception:
+                            ms_hosts = 0
+                        say(f"masscan: discovering open ports on ~{ms_hosts:,} host(s) (live){eta}...")
                         outcome = "ok"
                         try:
                             _, masscan_note = run_masscan_streaming(
@@ -6787,7 +6792,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                     return
                                 if passwordless or sudo_pw:
                                     try:
-                                        say(f"masscan: discovering open ports with sudo (live){eta}...")
+                                        say(f"masscan: discovering open ports on ~{ms_hosts:,} host(s)"
+                                            f" with sudo (live){eta}...")
                                         _, masscan_note = run_masscan_streaming(
                                             ranges, ports, rate=masscan_rate,
                                             wait=masscan_wait, on_open=handle_open,
@@ -6855,10 +6861,15 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             return
                     else:
                         total_est = sum(int(r.get("estimate", 0) or 0) for r in ms_runs)
+                        try:
+                            total_hosts = sum(_masscan_count_hosts(spec, cap=None)
+                                              for r in ms_runs for spec in r["targets"])
+                        except Exception:
+                            total_hosts = 0
                         eta = _format_masscan_eta(
                             minescan_estimate_seconds(ms_runs, minescan_rate))
                         say(f"minescan: scanning {len(ms_runs)} run(s)"
-                            f" (~{total_est:,} probes){eta}...")
+                            f" (~{total_hosts:,} hosts, ~{total_est:,} probes){eta}...")
                         runs_ok = 0
                         first_error = ""
 
@@ -6903,8 +6914,13 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             if not alive():
                                 break
                             tag = f"run {ri + 1}/{len(ms_runs)}: " if len(ms_runs) > 1 else ""
+                            try:
+                                run_hosts = sum(_masscan_count_hosts(s, cap=None)
+                                                for s in run["targets"])
+                            except Exception:
+                                run_hosts = 0
                             say(f"minescan {tag}{len(run['targets'])} target(s) "
-                                f"(~{run['estimate']:,} probes) on "
+                                f"(~{run_hosts:,} hosts, ~{run['estimate']:,} probes) on "
                                 f"port(s) {','.join(str(p) for p in run['ports'])}...")
                             try:
                                 _, note = run_minescan_streaming(
