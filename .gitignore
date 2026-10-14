@@ -5,6 +5,12 @@ servers.db-wal
 servers.db-shm
 ignore.txt
 saved.txt
+# shared network DB (dbserver.py) - server side and client settings
+.dbserver_token
+netdb.json
+netdb.sqlite3
+netdb.sqlite3-wal
+netdb.sqlite3-shm
 minecraft_servers.json
 user_log.json
 server_monitor_log.json

@@ -9,7 +9,8 @@ Run on a box you port-forward to the public internet:
     python3 dbserver.py --port 8777
 
 The first run generates a random token, saves it (mode 0600) to
-``.dbserver_token`` next to the database, and prints it.  Clients only need
+``.dbserver_token`` next to the database (or picks up a ``token.txt`` you
+placed there yourself), and prints it.  Clients only need
 two fields: the server URL (``http://your-host:8777``) and that token.
 
 Security model (deliberately simple for non-technical users):
@@ -125,21 +126,40 @@ def _utcnow():
 # Token handling
 # --------------------------------------------------------------------------- #
 
-def load_or_create_token(token_file, explicit=None):
-    """Return the shared secret, creating+persisting one on first run."""
-    if explicit:
-        return explicit.strip()
-    env = os.environ.get("DBSERVER_TOKEN", "").strip()
-    if env:
-        return env
-    if token_file and os.path.exists(token_file):
-        try:
-            with open(token_file, "r", encoding="utf-8") as f:
-                tok = f.readline().strip()
+def _read_token_file(path):
+    """First non-empty line of a token file, or None."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                tok = line.strip()
                 if tok:
                     return tok
-        except OSError:
-            pass
+    except OSError:
+        pass
+    return None
+
+
+def load_or_create_token(token_file, explicit=None):
+    """Return the shared secret, creating+persisting one on first run.
+
+    Precedence: --token flag, $DBSERVER_TOKEN, the --token-file value when
+    it exists, token.txt when found (auto-detected, read-only), then the
+    --token-file value with a freshly generated token.
+    Returns (token, source-description).
+    """
+    if explicit:
+        return explicit.strip(), "--token flag"
+    env = os.environ.get("DBSERVER_TOKEN", "").strip()
+    if env:
+        return env, "$DBSERVER_TOKEN"
+    if token_file:
+        tok = _read_token_file(token_file) if os.path.exists(token_file) else None
+        if tok:
+            return tok, token_file
+    if os.path.exists("token.txt"):
+        tok = _read_token_file("token.txt")
+        if tok:
+            return tok, "token.txt"
     tok = secrets.token_urlsafe(32)
     if token_file:
         try:
@@ -153,7 +173,7 @@ def load_or_create_token(token_file, explicit=None):
         except OSError as exc:
             print(f"WARNING: could not persist token to {token_file}: {exc}",
                   file=sys.stderr)
-    return tok
+    return tok, f"{token_file} (generated)"
 
 
 # --------------------------------------------------------------------------- #
@@ -607,7 +627,8 @@ def main(argv=None):
     ap.add_argument("--token", default="",
                     help="Shared secret (else $DBSERVER_TOKEN, else token file).")
     ap.add_argument("--token-file", default=".dbserver_token",
-                    help="File the generated token is stored in (mode 0600).")
+                    help="Token file (mode 0600). A token.txt in the working "
+                         "directory is used when this file is absent.")
     ap.add_argument("--tls-cert", default="", help="PEM chain for https://")
     ap.add_argument("--tls-key", default="", help="PEM private key for https://")
     args = ap.parse_args(argv)
@@ -617,13 +638,13 @@ def main(argv=None):
     except Exception:
         pass
     init_db(args.db)
-    token = load_or_create_token(args.token_file, args.token or None)
-    if not args.token and not os.environ.get("DBSERVER_TOKEN") and os.path.exists(args.token_file):
-        pass  # existing token loaded silently
-    elif not args.token and not os.environ.get("DBSERVER_TOKEN"):
+    token, token_source = load_or_create_token(args.token_file, args.token or None)
+    if token_source.endswith("(generated)"):
         print(f"Generated new shared token (saved to {args.token_file}, mode 0600):")
         print(token)
         print("Give this token to every scanner client together with your server URL.")
+    else:
+        print(f"Using shared token from {token_source}.")
     try:
         st = os.stat(args.token_file)
         if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
