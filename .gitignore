@@ -1,6 +1,9 @@
 # --- Minecraft Server Scanner runtime files (per-machine data, never commit) ---
 shodan_key.txt
 ips.txt
+servers.db
+servers.db-wal
+servers.db-shm
 ignore.txt
 saved.txt
 minecraft_servers.json

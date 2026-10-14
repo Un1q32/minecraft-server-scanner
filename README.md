@@ -82,13 +82,17 @@ The result table has a CRACKED column. Every handshake already detects likely of
 
 ### Lists and logs
 
+- Keeps a local SQLite history (`servers.db`) of every server ever seen via a
+  successful status ping, with first-discovery and last-seen dates plus
+  times-seen count. Every scan records automatically — no manual add step.
+- The Servers tab browses that history (search, rescan, copy, export, add to
+  Saved/Ignore/Monitor, delete).
 - Maintains Saved and Ignore lists with optional reasons.
 - Filters ignored servers from scan workflows.
-- Maintains a global IP Log in the IP Log tab.
+- Maintains a global IP Log in the IP Log tab (legacy `ips.txt`, imported
+  into `servers.db` on first run).
 - Maintains a player log with each player’s latest known server.
 - Copies selected IPs and exports selected result sets.
-
-Network Scan results remain in the scan result table unless they are explicitly added to another list. A network scan does not automatically write every result to ips.txt.
 
 ### Server Monitor
 
@@ -107,7 +111,7 @@ Network Scan results remain in the scan result table unless they are explicitly 
 - Accounts: imports, tests, activates, and removes Minecraft accounts and tokens.
 - Network Scan: scans IPs, ranges, CIDRs, and ASNs across selected ports.
 - Proxies: manages proxies and runs bulk whitelist scans.
-- Servers: loads, scans, filters, checks, and exports text server lists.
+- Servers: browses the automatic servers.db history (first/last seen).
 - Shodan: searches Shodan and scans search results.
 - JSON Search: searches local Shodan JSON or JSONL data and scans matches.
 - Server Monitor: monitors saved servers and records player activity.

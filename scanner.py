@@ -69,6 +69,7 @@ init(autoreset=True)
 
 SHODAN_KEY_PATH = os.path.join(os.getcwd(), "shodan_key.txt")
 GLOBAL_IP_LOG = "ips.txt"
+SERVERS_DB_FILE = "servers.db"
 TIMEOUT = 3
 PROTOCOL_VERSION = 772
 MAX_WORKERS = 100
@@ -115,6 +116,8 @@ MAX_ICON_CACHE_ENTRIES = 512
 
 _CRACKED_CACHE_LOCK = threading.Lock()
 _WHITELIST_LOG_LOCK = threading.Lock()
+_SERVER_DB_LOCK = threading.Lock()
+_SERVER_DB_TAB_INSTANCE = None
 # Throttle for online-mode (Mojang-authenticated) whitelist probes only.
 # Cracked/offline probes never touch this. The lock spaces the *start* of
 # each online probe by WHITELIST_PROBE_DELAY, matching the old serial pacing
@@ -207,6 +210,346 @@ def record_cracked_server(ip_port, message="", extra=None):
         line = f"{ts} | {ip_port} | {message or 'CRACKED'}\n"
         with open(CRACKED_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line)
+    except Exception:
+        pass
+    try:
+        update_server_cracked(ip_port, "Yes", message or "")
+    except Exception:
+        pass
+
+
+# ==================== SERVER HISTORY DB (sqlite) ====================
+# Canonical store of every server ever seen via a successful status ping.
+# All scan paths funnel through ping_server(), which records here, so no
+# manual "add" step is needed. first_seen is set once; last_seen, the
+# latest MOTD/players/version and times_seen update on every re-sight.
+
+def _server_db_connect():
+    import sqlite3
+    con = sqlite3.connect(SERVERS_DB_FILE, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+
+def init_server_db():
+    import sqlite3
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS servers ("
+                " ip_port TEXT PRIMARY KEY,"
+                " host TEXT DEFAULT '',"
+                " port INTEGER DEFAULT 25565,"
+                " motd TEXT DEFAULT '',"
+                " players_online INTEGER DEFAULT 0,"
+                " max_players INTEGER DEFAULT 0,"
+                " version TEXT DEFAULT '',"
+                " protocol INTEGER,"
+                " cracked TEXT DEFAULT '',"
+                " whitelist TEXT DEFAULT '',"
+                " first_seen REAL DEFAULT 0,"
+                " last_seen REAL DEFAULT 0,"
+                " times_seen INTEGER DEFAULT 1,"
+                " last_source TEXT DEFAULT ''"
+                ")"
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen ON servers(last_seen DESC)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_servers_version ON servers(version)")
+            con.commit()
+        finally:
+            con.close()
+    _migrate_ips_txt_to_db()
+
+
+def _migrate_ips_txt_to_db():
+    """One-time import of legacy ips.txt rows so history is not lost."""
+    import sqlite3
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                cur = con.execute("SELECT COUNT(*) FROM servers")
+                if (cur.fetchone() or [0])[0] > 0:
+                    return
+            finally:
+                con.close()
+    except Exception:
+        return
+    if not os.path.exists(GLOBAL_IP_LOG):
+        return
+    try:
+        mtime = os.path.getmtime(GLOBAL_IP_LOG)
+    except Exception:
+        mtime = time.time()
+    rows = []
+    try:
+        with open(GLOBAL_IP_LOG, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    ip, motd, players, version = parse_formatted_line(ln)
+                    ip = get_ip_only(ip)
+                    if not is_valid_ip_port(ip):
+                        continue
+                    online, maximum = 0, 0
+                    if "/" in str(players):
+                        try:
+                            o, m = str(players).split("/", 1)
+                            online, maximum = int(o), int(m)
+                        except Exception:
+                            pass
+                    rows.append((ip, sanitize_motd(motd), online, maximum,
+                                 sanitize_motd(version), mtime, mtime))
+                except Exception:
+                    continue
+    except Exception:
+        return
+    if not rows:
+        return
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                for ip, motd, online, maximum, version, first_seen, last_seen in rows:
+                    try:
+                        host, port = split_host_port(ip)
+                    except Exception:
+                        host, port = ip, 25565
+                    con.execute(
+                        "INSERT OR IGNORE INTO servers"
+                        " (ip_port, host, port, motd, players_online, max_players,"
+                        "  version, first_seen, last_seen, times_seen, last_source)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'ips.txt')",
+                        (ip, host, port, motd, online, maximum, version,
+                         first_seen, last_seen),
+                    )
+                con.commit()
+            finally:
+                con.close()
+    except Exception:
+        pass
+
+
+def record_server_result(result, source="scan"):
+    """Upsert one successful ping_server() result into the history DB."""
+    _ensure_server_db()
+    if not isinstance(result, dict) or not result.get("ip"):
+        return
+    ip_port = result.get("ip")
+    if not is_valid_ip_port(get_ip_only(ip_port)):
+        return
+    now = time.time()
+    try:
+        host, port = split_host_port(ip_port)
+    except Exception:
+        host, port = ip_port, 25565
+    motd = sanitize_motd(result.get("motd", ""))
+    try:
+        online = int(result.get("players", 0))
+    except Exception:
+        online = 0
+    try:
+        maximum = int(result.get("max_players", 0))
+    except Exception:
+        maximum = 0
+    version = sanitize_motd(result.get("version", "") or "")
+    try:
+        protocol = int(result.get("protocol")) if result.get("protocol") is not None else None
+    except Exception:
+        protocol = None
+    cracked = "Yes" if result.get("cracked") else "No"
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            cur = con.execute("SELECT first_seen, times_seen, cracked, whitelist FROM servers WHERE ip_port=?",
+                              (ip_port,))
+            row = cur.fetchone()
+            if row is None:
+                con.execute(
+                    "INSERT INTO servers (ip_port, host, port, motd, players_online,"
+                    " max_players, version, protocol, cracked,"
+                    " first_seen, last_seen, times_seen, last_source)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                    (ip_port, host, port, motd, online, maximum, version,
+                     protocol, cracked, now, now, source),
+                )
+            else:
+                first_seen, times_seen, old_cracked, old_whitelist = row
+                try:
+                    times_seen = int(times_seen or 0) + 1
+                except Exception:
+                    times_seen = 1
+                # Preserve a confirmed cracked/whitelist verdict; only the
+                # status-ping heuristic ("Yes"/"No") refreshes otherwise.
+                keep_cracked = old_cracked or cracked
+                if old_cracked in ("Yes", "Yes (cached)"):
+                    keep_cracked = old_cracked
+                con.execute(
+                    "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
+                    " max_players=?, version=?, protocol=COALESCE(?, protocol),"
+                    " cracked=?, last_seen=?, times_seen=?, last_source=? WHERE ip_port=?",
+                    (host, port, motd, online, maximum, version, protocol,
+                     keep_cracked, now, times_seen, source, ip_port),
+                )
+            con.commit()
+        finally:
+            con.close()
+    _notify_server_db_tab()
+
+
+def update_server_cracked(ip_port, cracked_label, message=""):
+    _ensure_server_db()
+    if not ip_port:
+        return
+    now = time.time()
+    label = (cracked_label or "").strip() or "Yes"
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            cur = con.execute("SELECT first_seen FROM servers WHERE ip_port=?", (ip_port,))
+            if cur.fetchone() is None:
+                try:
+                    host, port = split_host_port(ip_port)
+                except Exception:
+                    host, port = ip_port, 25565
+                con.execute(
+                    "INSERT INTO servers (ip_port, host, port, cracked, first_seen,"
+                    " last_seen, times_seen, last_source) VALUES (?, ?, ?, ?, ?, ?, 1, 'cracked')",
+                    (ip_port, host, port, label, now, now),
+                )
+            else:
+                con.execute("UPDATE servers SET cracked=?, last_seen=? WHERE ip_port=?",
+                            (label, now, ip_port))
+            con.commit()
+        finally:
+            con.close()
+    _notify_server_db_tab()
+
+
+def update_server_whitelist(ip_port, whitelist_label):
+    _ensure_server_db()
+    if not ip_port:
+        return
+    now = time.time()
+    label = (whitelist_label or "").strip()
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            cur = con.execute("SELECT first_seen FROM servers WHERE ip_port=?", (ip_port,))
+            if cur.fetchone() is None:
+                try:
+                    host, port = split_host_port(ip_port)
+                except Exception:
+                    host, port = ip_port, 25565
+                con.execute(
+                    "INSERT INTO servers (ip_port, host, port, whitelist, first_seen,"
+                    " last_seen, times_seen, last_source) VALUES (?, ?, ?, ?, ?, ?, 1, 'whitelist')",
+                    (ip_port, host, port, label, now, now),
+                )
+            else:
+                con.execute("UPDATE servers SET whitelist=?, last_seen=? WHERE ip_port=?",
+                            (label, now, ip_port))
+            con.commit()
+        finally:
+            con.close()
+    _notify_server_db_tab()
+
+
+def query_server_db(search="", limit=10000):
+    _ensure_server_db()
+    """Return list of dicts newest-first, filtered by ip/motd/version substring."""
+    import sqlite3
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            if search:
+                like = f"%{search}%"
+                cur = con.execute(
+                    "SELECT * FROM servers WHERE ip_port LIKE ? OR motd LIKE ?"
+                    " OR version LIKE ? ORDER BY last_seen DESC LIMIT ?",
+                    (like, like, like, limit),
+                )
+            else:
+                cur = con.execute("SELECT * FROM servers ORDER BY last_seen DESC LIMIT ?",
+                                  (limit,))
+            return [dict(r) for r in cur.fetchall()]
+        finally:
+            con.close()
+
+
+def delete_servers_from_db(ip_ports):
+    _ensure_server_db()
+    if not ip_ports:
+        return
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.executemany("DELETE FROM servers WHERE ip_port=?",
+                            [(ip,) for ip in ip_ports])
+            con.commit()
+        finally:
+            con.close()
+    _notify_server_db_tab()
+
+
+def register_server_db_tab(tab):
+    global _SERVER_DB_TAB_INSTANCE
+    _SERVER_DB_TAB_INSTANCE = tab
+
+
+def _notify_server_db_tab():
+    tab = _SERVER_DB_TAB_INSTANCE
+    if tab is None:
+        return
+    try:
+        tab.request_refresh()
+    except Exception:
+        pass
+
+
+def format_db_timestamp(ts):
+    try:
+        ts = float(ts)
+        if ts <= 0:
+            return "-"
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except Exception:
+        return "-"
+
+
+def _ensure_server_db():
+    # Idempotent table creation without the ips.txt migration (safe to call
+    # at any point, including before later-defined helpers exist).
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS servers ("
+                    " ip_port TEXT PRIMARY KEY,"
+                    " host TEXT DEFAULT '',"
+                    " port INTEGER DEFAULT 25565,"
+                    " motd TEXT DEFAULT '',"
+                    " players_online INTEGER DEFAULT 0,"
+                    " max_players INTEGER DEFAULT 0,"
+                    " version TEXT DEFAULT '',"
+                    " protocol INTEGER,"
+                    " cracked TEXT DEFAULT '',"
+                    " whitelist TEXT DEFAULT '',"
+                    " first_seen REAL DEFAULT 0,"
+                    " last_seen REAL DEFAULT 0,"
+                    " times_seen INTEGER DEFAULT 1,"
+                    " last_source TEXT DEFAULT ''"
+                    ")"
+                )
+                con.commit()
+            finally:
+                con.close()
     except Exception:
         pass
 
@@ -1315,6 +1658,12 @@ def run_cracked_verifier_async(entries, callback, progress_cb=None):
                     result, message = None, str(exc)
                 if result is True:
                     record_cracked_server(entry.get("ip"), message, extra=entry)
+                else:
+                    try:
+                        label = "No" if result is False else "Unknown"
+                        update_server_cracked(entry.get("ip"), label, message or "")
+                    except Exception:
+                        pass
                 callback(entry, result, message, False)
                 completed += 1
                 if progress_cb:
@@ -1449,6 +1798,10 @@ def ping_server(entry, proxy=None):
                 'cracked': cracked
             }
             _remember_protocol(result['ip'], result['protocol'])
+            try:
+                record_server_result(result, source="scan")
+            except Exception:
+                pass
             return result
     except:
         return None
@@ -2228,6 +2581,10 @@ def log_whitelist_probe(entry, result, message, account=None):
         with _WHITELIST_LOG_LOCK:
             with open(WHITELIST_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line)
+    except Exception:
+        pass
+    try:
+        update_server_whitelist(entry.get("ip", ""), whitelist_result_label(result, message))
     except Exception:
         pass
 
@@ -5979,622 +6336,243 @@ from PySide6.QtWidgets import (
 
 
 class ServersTab(QWidget, QtBaseMixin):
+    """History of every server ever seen (sqlite servers.db).
+
+    Replaces the old primitive .txt-loader Servers tab. Rows are added
+    automatically by every scan via record_server_result() — no manual step.
+    Shows first discovery + last seen dates, re-scan, and list actions.
+    """
+
+    COLS = ("ip", "motd", "players", "version", "cracked", "whitelist",
+            "first_seen", "last_seen", "times_seen")
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.current_source = None
-        self.servers = []  # list[str] of IP:PORT
-        self.source_rows = []  # list[tuple(ip,motd,players,version)]
-        self._in_ignore = False  # re-entrancy guard
+        self._entries = []  # list[dict] from query_server_db
+        self._refresh_pending = False
         self._build_ui()
-        self._current_scan_ip = None
-        self._scan_row_map = {}
-        self._cracked_job_id = 0
-        self._whitelist_job_id = 0
+        register_server_db_tab(self)
+        self.refresh_from_db()
 
-    def add_ignore(self):
-        sel = self._selected_ips_any()
-        if not sel:
-            q_info(self, "Info", "Select one or more.")
-            return
-        # use the new dialog that offers a "White List" shortcut button
-        reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
-        # If user cancelled (None), do nothing
-        if reason is None:
-            self.set_status("Ignore cancelled.")
-            return
-        for ip in sel:
-            add_to_ignore(ip, reason or "")
-        # remove from self.servers
-        self.servers = [s for s in self.servers if s not in sel]
-        self.refresh_list()
-        self.set_status(f"Added {len(sel)} to ignore.txt")
-
-    def add_saved(self):
-        sel = self._selected_ips_any()
-        if not sel:
-            q_info(self, "Info", "Select one or more.")
-            return
-        reason = q_ask_string(self, "Reason", "Why save? (optional)")
-        for ip in sel:
-            add_to_saved(ip, reason or "")
-        self.set_status(f"Added {len(sel)} to saved.txt")
-
+    # ---- UI ----
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # Splitter: top (source) / middle (results) — replaces PanedWindow
-        splitter = QSplitter(Qt.Vertical, self)
-        root.addWidget(splitter, 1)
+        bar = QHBoxLayout()
+        root.addLayout(bar)
+        bar.addWidget(QLabel("Search:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("ip / motd / version substring")
+        self.search_edit.setMinimumWidth(260)
+        self.search_edit.returnPressed.connect(self.refresh_from_db)
+        bar.addWidget(self.search_edit)
+        btn_search = QPushButton("Search")
+        btn_search.clicked.connect(self.refresh_from_db)
+        bar.addWidget(btn_search)
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.clicked.connect(self.refresh_from_db)
+        bar.addWidget(btn_refresh)
+        btn_rescan = QPushButton("Rescan Selected")
+        btn_rescan.clicked.connect(self.rescan_selected)
+        bar.addWidget(btn_rescan)
+        bar.addStretch(1)
+        self.count_label = QLabel("")
+        bar.addWidget(self.count_label)
 
-        # --- Source area (TOP) ---
-        pane_top = QWidget(splitter)
-        top_layout = QVBoxLayout(pane_top)
-        top_layout.setContentsMargins(8, 8, 8, 8)
-
-        self.src_label = QLabel("Source: (none)", pane_top)
-        top_layout.addWidget(self.src_label)
-
-        middle = QWidget(pane_top)
-        middle_layout = QHBoxLayout(middle)
-        middle_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.addWidget(middle, 1)
-
-        # Source Table
-        source_cols = ["ip", "motd", "players", "version", "cracked"]
-        self.source_tree = ResultTable(middle, columns=source_cols)
-        self.source_tree.setHorizontalHeaderLabels([c.upper() for c in source_cols])
-        _source_widths = {"motd": 240, "players": 120, "version": 120,
-                          "cracked": 90}
-        for i, c in enumerate(source_cols):
-            self.source_tree.setColumnWidth(i, _source_widths.get(c, 170))
-        self.source_tree.setSortingEnabled(True)
-        middle_layout.addWidget(self.source_tree, 1)
-
-        # Right-side button column
-        right = QWidget(middle)
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(8, 0, 0, 0)
-        middle_layout.addWidget(right, 0)
-
-        def _right_btn(label, slot):
-            btn = QPushButton(label, right)
-            btn.clicked.connect(slot)
-            right_layout.addWidget(btn)
-            return btn
-
-        _right_btn("Import .txt", self.load_txt)
-        _right_btn("Copy IP", self.copy_ip)
-        _right_btn("Add to Ignore", self.add_ignore)
-        _right_btn("Add to Saved", self.add_saved)
-        _right_btn("Add to Monitor", self.add_search_selected_to_monitor)
-        sep = QFrame(right)
-        sep.setFrameShape(QFrame.HLine)
-        right_layout.addWidget(sep)
-        _right_btn("Scan Selected", self.scan_selected)
-        _right_btn("Scan All", self.scan_all)
-
-        self.only_players = QCheckBox("Only players > 0", right)
-        self.only_players.setChecked(True)
-        right_layout.addWidget(self.only_players)
-        self.only_cracked = QCheckBox("Only cracked servers", right)
-        self.only_cracked.setChecked(False)
-        right_layout.addWidget(self.only_cracked)
-        self.check_whitelist = QCheckBox("Check whitelist", right)
-        self.check_whitelist.setChecked(False)
-        right_layout.addWidget(self.check_whitelist)
-
-        right_layout.addWidget(QLabel("Version filter:", right))
-        self.version_filter = QComboBox(right)
-        self.version_filter.setEditable(True)
-        self.version_filter.addItems(["All versions"])
-        self.version_filter.setCurrentText("All versions")
-        right_layout.addWidget(self.version_filter)
-        self.version_filter.currentTextChanged.connect(lambda _t: self.refresh_list())
-        if self.version_filter.lineEdit() is not None:
-            self.version_filter.lineEdit().textEdited.connect(lambda _t: self.refresh_list())
-        right_layout.addStretch(1)
-
-        splitter.addWidget(pane_top)
-
-        # --- Results area (MIDDLE) ---
-        pane_mid = QWidget(splitter)
-        mid_layout = QVBoxLayout(pane_mid)
-        mid_layout.setContentsMargins(8, 8, 8, 8)
-        mid_layout.addWidget(QLabel("Results (select to copy/save/ignore):", pane_mid))
-
-        results_cols = ["ip", "motd", "players", "version", "cracked",
-                        "whitelist", "active_players"]
-        self.results_tree = ResultTable(pane_mid, columns=results_cols)
-        self.results_tree.setHorizontalHeaderLabels([c.upper() for c in results_cols])
-        _results_widths = {"motd": 240, "active_players": 240, "players": 130,
-                           "version": 130, "whitelist": 220, "cracked": 90}
-        for i, c in enumerate(results_cols):
-            self.results_tree.setColumnWidth(i, _results_widths.get(c, 170))
-        self.results_tree.setSortingEnabled(True)
-        mid_layout.addWidget(self.results_tree, 1)
+        self.tree = ResultTable(self, columns=list(self.COLS))
+        self.tree.setHorizontalHeaderLabels([c.upper() for c in self.COLS])
+        widths = {"ip": 170, "motd": 260, "players": 110, "version": 120,
+                  "cracked": 90, "whitelist": 180,
+                  "first_seen": 130, "last_seen": 130, "times_seen": 90}
+        for i, c in enumerate(self.COLS):
+            self.tree.setColumnWidth(i, widths.get(c, 150))
+        self.tree.setSortingEnabled(True)
         try:
-            _get_icon_manager().attach_to_tree(self.results_tree)
+            make_table_sortable(self.tree, {
+                "ip": _ip_key,
+                "motd": lambda v: str(v).lower(),
+                "players": _players_key,
+                "version": _version_key,
+                "cracked": lambda v: str(v).lower(),
+                "whitelist": lambda v: str(v).lower(),
+                "first_seen": lambda v: str(v),
+                "last_seen": lambda v: str(v),
+                "times_seen": lambda v: int(str(v)) if str(v).isdigit() else -1,
+            })
         except Exception:
             pass
+        root.addWidget(self.tree, 1)
 
-
-        splitter.addWidget(pane_mid)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-
-        # ------- Footer (pinned) -------
-        footer = QWidget(self)
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(8, 6, 8, 8)
-        root.addWidget(footer)
-
-        def _foot_btn(label, slot):
-            btn = QPushButton(label, footer)
-            btn.clicked.connect(slot)
-            footer_layout.addWidget(btn)
-            return btn
-
-        _foot_btn("Copy IP(s)", self.copy_scan_selected)
-        _foot_btn("Add to Ignore", self.ignore_scan_selected)
-        _foot_btn("Add to Saved", self.save_scan_selected)
-        _foot_btn("Add to Monitor", self.add_scan_selected_to_monitor)
-        _foot_btn("Export Scan…", self.export_scan_results)
-        _foot_btn("Check Whitelist",
-                 lambda: check_selected_whitelist(self, self.results_tree))
-        self.player_search = QLineEdit(footer)
-        self.player_search.setMaximumWidth(180)
-        self.player_search.returnPressed.connect(self.search_players)
-        footer_layout.addWidget(self.player_search)
-        _foot_btn("Find Player", self.search_players)
-
-        self.status_label = QLabel("Ready.", footer)
-        footer_layout.addWidget(self.status_label, 1)
+        footer = QHBoxLayout()
+        root.addLayout(footer)
+        for label, slot in (
+            ("Copy IP(s)", self.copy_selected),
+            ("Add to Saved", self.save_selected),
+            ("Add to Ignore", self.ignore_selected),
+            ("Add to Monitor", self.monitor_selected),
+            ("Delete", self.delete_selected),
+            ("Export…", self.export_all),
+        ):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            footer.addWidget(b)
+        footer.addStretch(1)
+        self.status_label = QLabel("Ready.")
+        root.addWidget(self.status_label)
 
     def set_status(self, msg):
         self.status_label.setText(msg)
 
-    def _update_version_filter_choices(self, rows):
-        choices = collect_version_options(rows)
-        current = self.version_filter.currentText() or "All versions"
-        self.version_filter.blockSignals(True)
-        try:
-            self.version_filter.clear()
-            self.version_filter.addItems(choices)
-            if current not in choices:
-                current = "All versions"
-            self.version_filter.setCurrentText(current)
-        finally:
-            self.version_filter.blockSignals(False)
-
-    def refresh_list(self, items=None):
-        # populate source_tree using parsed rows when available
-        for iid in self.source_tree.get_children():
-            self.source_tree.delete(iid)
-        if items is not None:
-            rows = [(ip, "", "", "") for ip in items]  # explicit override
-        elif self.source_rows:
-            rows = self.source_rows
-        else:
-            rows = [(ip, "", "", "") for ip in self.servers]
-        if items is None and rows and len(rows[0]) >= 4:
-            rows = [row for row in rows
-                    if version_filter_allows(row[3], self.version_filter.currentText())]
-        for row in rows:
-            self.source_tree.insert("", "end", values=row)
-
-    def load_txt(self):
-        path = q_ask_open(self, "Open .txt", "Text files (*.txt);;All files (*.*)")
-        if not path:
+    # ---- data ----
+    def request_refresh(self):
+        if self._refresh_pending:
             return
+        self._refresh_pending = True
         try:
-            rows = []  # (ip,motd,players,version)
-            seen = set()  # prevent duplicates
-            total_lines = 0
-            skipped_ignored = 0
-            skipped_invalid = 0
-            skipped_duplicates = 0
-            with open(path, "r", encoding="utf-8") as f:
-                for ln in f:
-                    total_lines += 1
-                    ln = ln.strip()
-                    if not ln:
-                        continue
-                    # Try to parse full formatted line first
-                    ip, motd, players, version = parse_formatted_line(ln)
-                    ip = get_ip_only(ip)
-                    if not is_valid_ip_port(ip):
-                        skipped_invalid += 1
-                        continue
-                    if is_ignored(ip):
-                        skipped_ignored += 1
-                        continue
-                    if ip in seen:
-                        skipped_duplicates += 1
-                        continue
-                    seen.add(ip)
-                    rows.append((ip, motd, players, version))
-            # update state
-            self.current_source = path
-            self.source_rows = rows
-            self.servers = [ip for (ip, _, _, _) in rows]  # keep scan list intact
-            self._update_version_filter_choices(rows)
-            self.src_label.setText(
-                f"Source: {os.path.basename(path)} ({len(rows)} entries)")
-            self.refresh_list()
-            # Build status message with helpful stats
-            parts = [f"Loaded {len(rows)} entries."]
-            if skipped_duplicates:
-                parts.append(f"{skipped_duplicates} duplicate(s) skipped.")
-            if skipped_invalid:
-                parts.append(f"{skipped_invalid} invalid line(s) skipped.")
-            if skipped_ignored:
-                parts.append(f"{skipped_ignored} ignored (in ignore.txt) skipped.")
-            self.set_status(" ".join(parts))
-        except Exception as e:
-            q_error(self, "Load error", str(e))
+            self.after(0, self.refresh_from_db)
+        except Exception:
+            self._refresh_pending = False
 
-    def _selected_ips_from_tree(self, tree):
-        sel = []
-        for iid in tree.selection():
-            vals = tree.item(iid, "values")
-            if vals:
-                sel.append(vals[0])
-        return sel
+    def refresh_from_db(self):
+        self._refresh_pending = False
+        q = ""
+        try:
+            q = (self.search_edit.text() or "").strip()
+        except Exception:
+            pass
 
-    def _selected_ips_any(self):
+        def work(query=q):
+            try:
+                entries = query_server_db(query)
+            except Exception as exc:
+                self.after(0, lambda: self.set_status(f"DB load failed: {exc}"))
+                return
+            self.after(0, lambda: self._populate(entries))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.set_status("Loading server history…")
+
+    def _populate(self, entries):
+        self._entries = entries
+        for iid in list(self.tree.get_children()):
+            self.tree.delete(iid)
+        for e in entries:
+            players = f"{e.get('players_online', 0)}/{e.get('max_players', 0)}"
+            self.tree.insert("", "end", values=(
+                e.get("ip_port", ""),
+                e.get("motd", "") or "",
+                players,
+                e.get("version", "") or "",
+                e.get("cracked", "") or "",
+                e.get("whitelist", "") or "",
+                format_db_timestamp(e.get("first_seen", 0)),
+                format_db_timestamp(e.get("last_seen", 0)),
+                str(e.get("times_seen", 1)),
+            ))
+        try:
+            self.count_label.setText(f"{len(entries)} server(s)")
+        except Exception:
+            pass
+        self.set_status(f"Tracking {len(entries)} server(s) in servers.db.")
+
+    # ---- selection helpers ----
+    def _selected_ips(self):
         ips = []
-        ips.extend(self._selected_ips_from_tree(self.source_tree))
-        for vals in self._scan_selected_rows():
+        for iid in self.tree.selection():
+            vals = self.tree.item(iid, "values")
             if vals:
                 ips.append(vals[0])
-        seen = []
-        for ip in ips:
-            if ip not in seen:
-                seen.append(ip)
-        return seen
+        return list(dict.fromkeys(ips))
 
-    def copy_ip(self):
-        sel = self._selected_ips_any()
+    def copy_selected(self):
+        sel = self._selected_ips()
         if not sel:
             q_info(self, "Info", "Select one or more.")
             return
         QApplication.clipboard().setText("\n".join(sel))
         self.set_status(f"Copied {len(sel)} IP(s).")
 
-    # Helpers to read selected rows from results tree
-    def _scan_selected_rows(self):
-        out = []
-        for iid in self.results_tree.selection():
-            vals = self.results_tree.item(iid, "values")
-            if vals:
-                out.append(vals)
-        return out
-
-    def copy_scan_selected(self):
-        rows = self._scan_selected_rows()
-        if not rows:
-            q_info(self, "Info", "Select results first.")
+    def save_selected(self):
+        sel = self._selected_ips()
+        if not sel:
+            q_info(self, "Info", "Select one or more.")
             return
-        ips = [row[0] for row in rows]
-        QApplication.clipboard().setText("\n".join(ips))
-        self.set_status(f"Copied {len(ips)} IP(s) from results.")
+        reason = q_ask_string(self, "Reason", "Why save? (optional)")
+        for ip in sel:
+            add_to_saved(ip, reason or "")
+        self.set_status(f"Added {len(sel)} to saved.txt.")
 
-    def ignore_scan_selected(self):
-        rows = self._scan_selected_rows()
-        if not rows:
-            q_info(self, "Info", "Select results first.")
+    def ignore_selected(self):
+        sel = self._selected_ips()
+        if not sel:
+            q_info(self, "Info", "Select one or more.")
             return
         reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
         if reason is None:
             self.set_status("Ignore cancelled.")
             return
-        for ip, *_ in rows:
+        for ip in sel:
             add_to_ignore(ip, reason or "")
-        for iid in list(self.results_tree.selection()):
-            self.results_tree.delete(iid)
-        self.set_status(f"Added {len(rows)} to ignore.txt from results.")
+        self.set_status(f"Added {len(sel)} to ignore.txt.")
 
-    def save_scan_selected(self):
-        rows = self._scan_selected_rows()
-        if not rows:
-            q_info(self, "Info", "Select results first.")
-            return
-        reason = q_ask_string(self, "Reason", "Why save? (optional)")
-        for ip, *_ in rows:
-            add_to_saved(ip, reason or "")
-        self.set_status(f"Added {len(rows)} to saved.txt from results.")
-
-    def add_scan_selected_to_monitor(self):
-        rows = self._scan_selected_rows()
-        if not rows:
-            q_info(self, "Info", "Select results first.")
-            return
-        ips = [row[0] for row in rows]
-        added, invalid, duplicates = add_ips_to_monitor_list(ips)
-        self.set_status(format_monitor_feedback(added, invalid, duplicates))
-
-    def export_scan_results(self):
-        rows = []
-        for iid in self.results_tree.get_children():
-            vals = self.results_tree.item(iid, "values")
-            if vals:
-                rows.append(vals)
-        if not rows:
-            q_info(self, "Info", "No scan results to export.")
-            return
-        # default name uses source file name (if any)
-        if self.current_source:
-            base_name = os.path.splitext(os.path.basename(self.current_source))[0]
-            base = sanitize_query_for_filename(base_name + "_scan")
-        else:
-            base = "servers_scan"
-        path = q_ask_save(self, "Export Servers Scan Results",
-                          "Text files (*.txt)", f"{base}.txt")
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            for row in rows:
-                if not row:
-                    continue
-                ip = row[0]
-                motd = row[1] if len(row) > 1 else ""
-                players = row[2] if len(row) > 2 else "N/A"
-                version = row[3] if len(row) > 3 else "N/A"
-                if "/" in str(players):
-                    online, maximum = str(players).split("/", 1)
-                else:
-                    online, maximum = "N", "A"
-                f.write(format_result_line(ip, motd, online, maximum, version) + "\n")
-        self.set_status(f"Exported {len(rows)} scan rows to {os.path.basename(path)}")
-
-    def search_players(self):
-        query_raw = self.player_search.text() or ""
-        query = query_raw.strip().lower()
-        if not query:
-            self.set_status("Enter a player name to search.")
-            return
-        matches = []
-        for iid in self.results_tree.get_children():
-            vals = self.results_tree.item(iid, "values")
-            if not vals:
-                continue
-            players_text = vals[-1] if vals else ""
-            if isinstance(players_text, str) and query in players_text.lower():
-                matches.append(iid)
-        current_sel = self.results_tree.selection()
-        if current_sel:
-            self.results_tree.selection_remove(current_sel)
-        if matches:
-            self.results_tree.selection_set(matches)
-            self.results_tree.focus(matches[0])
-            self.results_tree.see(matches[0])
-            self.set_status(f"Found {len(matches)} match(es) for '{query_raw.strip()}'.")
-        else:
-            self.set_status(f"No matches for '{query_raw.strip()}'.")
-
-    def _reset_scan_row_map(self):
-        self._scan_row_map = {}
-
-    def _register_scan_row(self, ip, iid):
-        self._scan_row_map[ip] = iid
-
-    def _update_scan_row_cracked(self, ip, text):
-        iid = self._scan_row_map.get(ip)
-        if not iid:
-            return
-        vals = list(self.results_tree.item(iid, "values"))
-        if len(vals) >= 5:
-            vals[4] = text
-            self.results_tree.item(iid, values=vals)
-
-    def _update_scan_row_whitelist(self, ip, text):
-        iid = self._scan_row_map.get(ip)
-        if not iid:
-            return
-        vals = list(self.results_tree.item(iid, "values"))
-        if len(vals) >= 6:
-            vals[5] = text
-            self.results_tree.item(iid, values=vals)
-
-    def _remove_scan_row(self, ip):
-        iid = self._scan_row_map.pop(ip, None)
-        if iid:
-            self.results_tree.delete(iid)
-
-    def _scan(self, items):
-        for iid in self.results_tree.get_children():
-            self.results_tree.delete(iid)
-        self.set_status("Preparing scan...")
-        only_cracked = self.only_cracked.isChecked()
-        check_whitelist = self.check_whitelist.isChecked()
-        # Cracked servers need no account (offline probe, no Mojang auth).
-        account = get_active_mc_account() if check_whitelist else None
-        if only_cracked or check_whitelist:
-            self._reset_scan_row_map()
-            self._cracked_job_id += 1
-            self._whitelist_job_id += 1
-        else:
-            self._scan_row_map.clear()
-        current_job = self._cracked_job_id
-        whitelist_job = self._whitelist_job_id
-        pending_entries = []
-        pending_seen = set()
-        whitelist_entries = []
-        whitelist_seen = set()
-        pending_lock = threading.Lock()
-        discovered_rows = []
-
-        def work():
-            try:
-                total = len(items)
-
-                def on_start(ip):
-                    self._current_scan_ip = ip
-                    self.after(0, lambda ip=ip: self.set_status(
-                        f"Currently scanning: {ip} [0/{total}]"))
-
-                def on_result(r, line):
-                    if not r:
-                        return
-                    discovered_rows.append((r['ip'], r['motd'],
-                                           f"{r['players']}/{r['max_players']}",
-                                           r['version']))
-
-                    if self.only_players.isChecked() and r.get('players', 0) <= 0:
-                        return
-
-                    if only_cracked and should_skip_cracked_probe(r):
-                        return
-                    if not version_filter_allows(r.get("version", ""),
-                                                self.version_filter.currentText()):
-                        return
-
-                    cracked_text = "Yes" if r.get('cracked') else "No"
-                    whitelist_text = "Queued" if check_whitelist else "-"
-                    queue_candidate = None
-                    if only_cracked:
-                        cached = get_cached_cracked_entry(r['ip'])
-                        if cached:
-                            cracked_text = "Yes (cached)"
-                        else:
-                            cracked_text = "Queued"
-                            queue_candidate = r
-
-                    active_players = format_player_list(r.get('players_sample'))
-                    vals = (
-                        r['ip'],
-                        r['motd'],
-                        f"{r['players']}/{r['max_players']}",
-                        r['version'],
-                        cracked_text,
-                        whitelist_text,
-                        active_players
-                    )
-
-                    def add_row(ip=r['ip'], v=vals):
-                        iid = self.results_tree.insert("", "end", values=v)
-                        if only_cracked or check_whitelist:
-                            self._register_scan_row(ip, iid)
-                    self.after(0, add_row)
-
-                    if only_cracked and queue_candidate:
-                        with pending_lock:
-                            ip = queue_candidate['ip']
-                            if ip not in pending_seen:
-                                pending_seen.add(ip)
-                                pending_entries.append(queue_candidate)
-                    if check_whitelist:
-                        with pending_lock:
-                            ip = r['ip']
-                            if ip not in whitelist_seen:
-                                whitelist_seen.add(ip)
-                                whitelist_entries.append(r)
-
-                def on_progress(done, total):
-                    ip = self._current_scan_ip or "…"
-                    self.after(0, lambda d=done, t=total, ip=ip:
-                               self.set_status(f"Currently scanning: {ip} [{d}/{t}]"))
-
-                results, online_lines = scan_servers_gui(
-                    items,
-                    on_start=on_start,
-                    on_result=on_result,
-                    on_progress=on_progress
-                )
-                self.after(0, lambda: self.set_status(
-                    f"Scan complete. Responded: {len(results)}; "
-                    f"With 1+: {len(online_lines)}"))
-
-                if only_cracked:
-                    with pending_lock:
-                        verify_entries = list(pending_entries)
-
-                    def handle_update(entry, result, message, was_cached):
-                        if current_job != self._cracked_job_id:
-                            return
-                        ip = entry.get("ip")
-
-                        def ui():
-                            if was_cached or result is True:
-                                label = "Yes (cached)" if was_cached else "Yes"
-                                self._update_scan_row_cracked(ip, label)
-                            else:
-                                self._remove_scan_row(ip)
-                        self.after(0, ui)
-
-                    def handle_progress(done, total):
-                        if current_job != self._cracked_job_id:
-                            return
-                        if done < total:
-                            self.after(0, lambda d=done, t=total:
-                                       self.set_status(
-                                           f"Verifying cracked servers: {d}/{t}"))
-                        else:
-                            def finish():
-                                remaining = len(self.results_tree.get_children())
-                                self.set_status(
-                                    "Cracked verification complete. "
-                                    f"Showing {remaining} server(s).")
-                            self.after(0, finish)
-                    run_cracked_verifier_async(verify_entries, handle_update,
-                                              progress_cb=handle_progress)
-                if check_whitelist:
-                    with pending_lock:
-                        verify_whitelist = list(whitelist_entries)
-
-                    def handle_whitelist_update(entry, result, message):
-                        if whitelist_job != self._whitelist_job_id:
-                            return
-                        ip = entry.get("ip")
-
-                        def ui():
-                            label = whitelist_result_label(result, message)
-                            self._update_scan_row_whitelist(ip, label)
-                        self.after(0, ui)
-
-                    def handle_whitelist_progress(done, total):
-                        if whitelist_job != self._whitelist_job_id:
-                            return
-                        if done < total:
-                            self.after(0, lambda d=done, t=total:
-                                       self.set_status(
-                                           f"Checking whitelist: {d}/{t}"))
-                        else:
-                            self.after(0, lambda:
-                                       self.set_status(
-                                           "Whitelist check complete for "
-                                           f"{total} server(s)."))
-                    run_whitelist_verifier_async(verify_whitelist, account,
-                                                handle_whitelist_update,
-                                                progress_cb=handle_whitelist_progress)
-                if discovered_rows:
-                    self.after(0, lambda rows=discovered_rows:
-                               self._update_version_filter_choices(rows))
-            except Exception as e:
-                self.after(0, lambda: self.set_status(f"Scan failed: {e}"))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def scan_selected(self):
-        sel = self._selected_ips_any()
+    def monitor_selected(self):
+        sel = self._selected_ips()
         if not sel:
             q_info(self, "Info", "Select one or more.")
             return
-        self._scan(sel)
-
-    def scan_all(self):
-        if not self.servers:
-            q_info(self, "Info", "Load a .txt first.")
-            return
-        self._scan(self.servers)
-
-    def add_search_selected_to_monitor(self):
-        sel = self._selected_ips_any()
-        if not sel:
-            q_info(self, "Info", "Select items first.")
-            return
         added, invalid, duplicates = add_ips_to_monitor_list(sel)
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
+
+    def delete_selected(self):
+        sel = self._selected_ips()
+        if not sel:
+            q_info(self, "Info", "Select one or more.")
+            return
+        delete_servers_from_db(sel)
+        self.set_status(f"Removed {len(sel)} from history.")
+        # refresh happens via _notify_server_db_tab
+
+    def export_all(self):
+        if not self._entries:
+            q_info(self, "Info", "No history to export yet.")
+            return
+        path = q_ask_save(self, "Export Server History",
+                          "Text files (*.txt)", "servers_history.txt")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for e in self._entries:
+                    ip = e.get("ip_port", "")
+                    motd = e.get("motd", "") or ""
+                    online = e.get("players_online", 0)
+                    maximum = e.get("max_players", 0)
+                    version = e.get("version", "") or "N/A"
+                    first = format_db_timestamp(e.get("first_seen", 0))
+                    last = format_db_timestamp(e.get("last_seen", 0))
+                    f.write(f"{format_result_line(ip, motd, online, maximum, version)}"
+                            f" | First seen: {first} | Last seen: {last}\n")
+            self.set_status(f"Exported {len(self._entries)} server(s).")
+        except Exception as exc:
+            q_error(self, "Export", str(exc))
+
+    def rescan_selected(self):
+        sel = self._selected_ips()
+        if not sel:
+            q_info(self, "Info", "Select one or more.")
+            return
+        self.set_status(f"Rescanning {len(sel)} server(s)…")
+
+        def work():
+            try:
+                results, _ = scan_servers_gui(sel)
+                self.after(0, lambda: self.set_status(
+                    f"Rescan complete. Responded: {len(results)}."))
+            except Exception as exc:
+                self.after(0, lambda: self.set_status(f"Rescan failed: {exc}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
 
 
 # ===== Qt port section: qt_monitor (PySide6, 1:1 behavior) =====
@@ -9170,6 +9148,10 @@ class FullAppGUI(QMainWindow):
 # ==================== GUI entry ====================
 def main():  #gone but not forgotten
     import sys
+    try:
+        init_server_db()
+    except Exception:
+        pass
     app = QApplication.instance() or QApplication(sys.argv)
     win = FullAppGUI()
     win.show()
