@@ -22,8 +22,20 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
-import nbtlib
-from nbtlib import Compound, String, Byte
+try:
+    import nbtlib
+    from nbtlib import Compound, String, Byte
+    _NBTLIB_AVAILABLE = True
+except ImportError:
+    # Optional dependency: only needed for Export to servers.dat.
+    nbtlib = None
+    Compound = String = Byte = None
+    _NBTLIB_AVAILABLE = False
+
+
+def _require_nbtlib():
+    if not _NBTLIB_AVAILABLE:
+        raise RuntimeError("nbtlib is not installed (pip install nbtlib) — Export to servers.dat is unavailable")
 
 # Qt (PySide6) UI + threading
 import threading
@@ -5114,6 +5126,7 @@ def backup_or_restore():
             print(f"Backup saved to: {BACKUP_PATH}")
 
 def load_servers():
+    _require_nbtlib()
     if not os.path.exists(SERVERS_DAT_PATH):
         print("servers.dat not found. Creating new one.")
         return nbtlib.File({"servers": nbtlib.List[Compound]()})
@@ -5131,6 +5144,9 @@ def already_exists(server_list, ip):
     return any(entry['ip'] == ip for entry in server_list)
 
 def import_to_minecraft_servers_dat():  # kept original cli flow - whatever?
+    if not _NBTLIB_AVAILABLE:
+        print("nbtlib is not installed (pip install nbtlib) — Export to servers.dat is unavailable.")
+        return
     print("\n=== Minecraft Server List Importer ===")
     backup_or_restore()
     input_file = choose_input_file()
@@ -5175,6 +5191,8 @@ def import_to_minecraft_servers_dat():  # kept original cli flow - whatever?
 
 # GUI-friendly import
 def import_file_to_servers_dat(path, do_backup=True):
+    if not _NBTLIB_AVAILABLE:
+        return False, "nbtlib is not installed (pip install nbtlib) — Export to servers.dat is unavailable."
     if do_backup and not os.path.exists(BACKUP_PATH):
         try:
             if os.path.exists(SERVERS_DAT_PATH):
@@ -10075,6 +10093,7 @@ class ExportTab(QWidget, QtBaseMixin):
         btn_export = QPushButton("Export to servers.dat")
         btn_export.clicked.connect(self.do_import)
         btns.addWidget(btn_export)
+        self.btn_export = btn_export
         btn_restore = QPushButton("Restore Backup")
         btn_restore.clicked.connect(self.restore_backup)
         btns.addWidget(btn_restore)
@@ -10083,6 +10102,17 @@ class ExportTab(QWidget, QtBaseMixin):
         self.status_label = QLabel("Ready.")
         root.addWidget(self.status_label)
         root.addStretch(1)
+        if not _NBTLIB_AVAILABLE:
+            try:
+                self.btn_export.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.status_label.setText(
+                    "nbtlib is not installed (pip install nbtlib) — Export to servers.dat is unavailable."
+                )
+            except Exception:
+                pass
 
     def pick_txt(self):
         path = q_ask_open(
@@ -10094,6 +10124,9 @@ class ExportTab(QWidget, QtBaseMixin):
             self.file_edit.setText(path)
 
     def do_import(self):
+        if not _NBTLIB_AVAILABLE:
+            q_info(self, "Info", "nbtlib is not installed (pip install nbtlib) — Export to servers.dat is unavailable.")
+            return
         path = self.file_edit.text().strip()
         if not path:
             q_info(self, "Info", "Pick a .txt first.")
