@@ -3116,11 +3116,29 @@ def parse_ports(text):
                 ports.append(port)
     return list(dict.fromkeys(ports)) or [25565]
 
-def fetch_asn_prefixes(asn):
-    match = re.fullmatch(r"AS?(\d+)", str(asn).strip(), re.IGNORECASE)
-    if not match:
-        raise ValueError(f"Invalid ASN: {asn}")
-    asn_num = match.group(1)
+def _fetch_asn_prefixes_ripestat(asn_num):
+    """IPv4 prefixes announced by an ASN via RIPEstat (no API key needed)."""
+    url = ("https://stat.ripe.net/data/announced-prefixes/data.json"
+           f"?resource=AS{asn_num}")
+    req = urllib.request.Request(url, headers={"User-Agent": "MC-Scanner"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    prefixes = []
+    for item in ((data.get("data") or {}).get("prefixes") or []):
+        prefix = (item or {}).get("prefix")
+        if not prefix or ":" in prefix:  # IPv4 only
+            continue
+        try:
+            prefixes.append(str(ipaddress.ip_network(prefix.strip(), strict=False)))
+        except ValueError:
+            continue
+    if not prefixes:
+        raise RuntimeError("no IPv4 prefixes in RIPEstat response")
+    return prefixes
+
+
+def _fetch_asn_prefixes_bgpview(asn_num):
+    """IPv4 prefixes announced by an ASN via BGPView (fallback source)."""
     url = f"https://api.bgpview.io/asn/{asn_num}/prefixes"
     req = urllib.request.Request(url, headers={"User-Agent": "MC-Scanner"})
     with urllib.request.urlopen(req, timeout=12) as resp:
@@ -3128,11 +3146,32 @@ def fetch_asn_prefixes(asn):
     prefixes = []
     for item in data.get("data", {}).get("ipv4_prefixes", []) or []:
         prefix = item.get("prefix")
-        if prefix:
-            prefixes.append(prefix)
+        if not prefix:
+            continue
+        try:
+            prefixes.append(str(ipaddress.ip_network(prefix.strip(), strict=False)))
+        except ValueError:
+            continue
     if not prefixes:
-        raise RuntimeError(f"No IPv4 prefixes returned for AS{asn_num}")
+        raise RuntimeError("no IPv4 prefixes in BGPView response")
     return prefixes
+
+
+def fetch_asn_prefixes(asn):
+    match = re.fullmatch(r"(?:AS)?(\d+)", str(asn).strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Invalid ASN: {asn}")
+    asn_num = match.group(1)
+    errors = []
+    try:
+        return _fetch_asn_prefixes_ripestat(asn_num)
+    except Exception as exc:
+        errors.append(f"RIPEstat: {exc}")
+    try:
+        return _fetch_asn_prefixes_bgpview(asn_num)
+    except Exception as exc:
+        errors.append(f"BGPView: {exc}")
+    raise RuntimeError(f"No IPv4 prefixes returned for AS{asn_num} ({'; '.join(errors)})")
 
 def expand_ip_range(start_ip, end_ip, remaining):
     start = ipaddress.ip_address(start_ip.strip())
@@ -3163,7 +3202,7 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
         if len(hosts) >= max_hosts:
             break
         try:
-            if re.match(r"^AS?\d+$", token, re.I):
+            if re.match(r"^(?:AS)?\d+$", token, re.I):
                 for prefix in fetch_asn_prefixes(token):
                     if len(hosts) >= max_hosts:
                         break
@@ -3383,7 +3422,7 @@ def build_masscan_inputs(target_text, ports):
 
     for token in tokens:
         try:
-            if re.match(r"^AS?\d+$", token, re.I):
+            if re.match(r"^(?:AS)?\d+$", token, re.I):
                 try:
                     prefixes = fetch_asn_prefixes(token)
                 except Exception:
@@ -5294,6 +5333,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         top_grid.addWidget(lbl_targets, 0, 0)
         self.targets_text = QPlainTextEdit(top)
         self.targets_text.setMinimumHeight(4 * 18)
+        self.targets_text.setPlaceholderText(
+            "e.g. 1.2.3.4, 10.0.0.0/24, 10.0.1.1-10.0.1.20, AS13737")
         top_grid.addWidget(self.targets_text, 1, 0, 4, 1)
         top_grid.setColumnStretch(0, 1)
 
