@@ -48,6 +48,7 @@ except ImportError as _qt_err:
 
 import base64  
 import io      
+import hmac
 import secrets
 try:
     from PIL import Image
@@ -224,6 +225,16 @@ def record_cracked_server(ip_port, message="", extra=None):
 # manual "add" step is needed. first_seen is set once; last_seen, the
 # latest MOTD/players/version and times_seen update on every re-sight.
 
+def _add_column_if_missing(con, table, column, ddl):
+    """Add a column to an existing local DB without recreating it."""
+    try:
+        existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    except Exception:
+        pass
+
+
 def _server_db_connect():
     import sqlite3
     con = sqlite3.connect(SERVERS_DB_FILE, timeout=10)
@@ -301,9 +312,9 @@ def record_server_result(result, source="scan"):
             if row is None:
                 con.execute(
                     "INSERT INTO servers (ip_port, host, port, motd, players_online,"
-                    " max_players, version, protocol, cracked,"
+                    " max_players, version, protocol, cracked, needs_sync,"
                     " first_seen, last_seen, times_seen, last_source)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?)",
                     (ip_port, host, port, motd, online, maximum, version,
                      protocol, cracked, now, now, source),
                 )
@@ -321,7 +332,8 @@ def record_server_result(result, source="scan"):
                 con.execute(
                     "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
                     " max_players=?, version=?, protocol=COALESCE(?, protocol),"
-                    " cracked=?, last_seen=?, times_seen=?, last_source=? WHERE ip_port=?",
+                    " cracked=?, needs_sync=1, last_seen=?, times_seen=?,"
+                    " last_source=? WHERE ip_port=?",
                     (host, port, motd, online, maximum, version, protocol,
                      keep_cracked, now, times_seen, source, ip_port),
                 )
@@ -352,7 +364,7 @@ def update_server_cracked(ip_port, cracked_label, message=""):
                     (ip_port, host, port, label, now, now),
                 )
             else:
-                con.execute("UPDATE servers SET cracked=?, last_seen=? WHERE ip_port=?",
+                con.execute("UPDATE servers SET cracked=?, needs_sync=1, last_seen=? WHERE ip_port=?",
                             (label, now, ip_port))
             con.commit()
         finally:
@@ -381,7 +393,7 @@ def update_server_whitelist(ip_port, whitelist_label):
                     (ip_port, host, port, label, now, now),
                 )
             else:
-                con.execute("UPDATE servers SET whitelist=?, last_seen=? WHERE ip_port=?",
+                con.execute("UPDATE servers SET whitelist=?, needs_sync=1, last_seen=? WHERE ip_port=?",
                             (label, now, ip_port))
             con.commit()
         finally:
@@ -474,15 +486,293 @@ def _ensure_server_db():
                     " first_seen REAL DEFAULT 0,"
                     " last_seen REAL DEFAULT 0,"
                     " times_seen INTEGER DEFAULT 1,"
-                    " last_source TEXT DEFAULT ''"
+                    " last_source TEXT DEFAULT '',"
+                    " needs_sync INTEGER DEFAULT 1"
                     ")"
                 )
+                _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
                 con.commit()
             finally:
                 con.close()
     except Exception:
         pass
 
+
+# ==================== SHARED NETWORK DB (dbserver.py) ====================
+# Optional central server shared between multiple scanner clients.
+# The Servers tab's "Sync DB" button uploads this client's dirty rows
+# (needs_sync=1, set automatically on every sighting) and merges back rows
+# other clients found. Downloads use a last_sync watermark in netdb.json.
+# Auth: shared token (URL + token are the only setup). Requests are signed
+# with HMAC-SHA256 so the token itself never travels on the wire; the
+# server also accepts plain Bearer for curl debugging. Run dbserver.py on
+# a port-forwarded box; see its docstring for details.
+
+NETDB_CONFIG_FILE = "netdb.json"
+NETDB_TIMEOUT = 30
+NETDB_MAX_UPLOAD = 20000
+
+
+def netdb_load_config():
+    try:
+        with open(NETDB_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"url": "", "token": "", "last_sync": 0.0}
+    except Exception:
+        return {"url": "", "token": "", "last_sync": 0.0}
+    return {
+        "url": str(data.get("url", "") or "").strip().rstrip("/"),
+        "token": str(data.get("token", "") or "").strip(),
+        "last_sync": float(data.get("last_sync", 0) or 0),
+    }
+
+
+def netdb_save_config(url, token, last_sync=0.0):
+    try:
+        with open(NETDB_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"url": (url or "").strip().rstrip("/"),
+                       "token": (token or "").strip(),
+                       "last_sync": float(last_sync or 0)}, f, indent=2)
+    except Exception:
+        pass
+
+
+def _netdb_auth_headers(method, path, body, token):
+    """HMAC auth headers; token never sent, only the signature."""
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    body_hash = hashlib.sha256(body or b"").hexdigest()
+    msg = "\n".join([method.upper(), path, ts, nonce, body_hash])
+    sig = hmac.new(token.encode("utf-8"), msg.encode("utf-8"),
+                   hashlib.sha256).hexdigest()
+    return {"X-Auth-Timestamp": ts, "X-Auth-Nonce": nonce,
+            "Authorization": f"HMAC {sig}"}
+
+
+def _netdb_request(url, token, method="GET", payload=None, timeout=None):
+    """One authenticated JSON request. Returns parsed dict. Raises on error."""
+    timeout = timeout or NETDB_TIMEOUT
+    body = b""
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    headers = {"User-Agent": "MC-Scanner",
+               "Content-Type": "application/json"}
+    headers.update(_netdb_auth_headers(method, path, body, token))
+    req = urllib.request.Request(url, data=body if method != "GET" else None,
+                                 headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            if resp.status == 429:
+                raise ConnectionError("server throttled us (too many bad logins?)")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise ConnectionError("rejected: wrong token?")
+        if exc.code == 429:
+            raise ConnectionError("throttled: too many failed logins, wait a minute")
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            detail = ""
+        raise ConnectionError(f"HTTP {exc.code}{(': ' + detail) if detail else ''}")
+
+
+def netdb_collect_dirty():
+    """Rows needing upload (needs_sync=1). Returns (rows, watermark).
+
+    watermark is the max last_seen collected; only rows at or below it get
+    their flag cleared after a successful upload, so sightings that land
+    mid-sync stay dirty for the next run.
+    """
+    _ensure_server_db()
+    import sqlite3
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            try:
+                cur = con.execute("SELECT * FROM servers WHERE needs_sync=1"
+                                  " ORDER BY last_seen ASC LIMIT ?",
+                                  (NETDB_MAX_UPLOAD,))
+                rows = [dict(r) for r in cur.fetchall()]
+            except Exception:
+                # Column missing on some legacy DB: fall back to everything.
+                cur = con.execute("SELECT * FROM servers ORDER BY last_seen ASC"
+                                  " LIMIT ?", (NETDB_MAX_UPLOAD,))
+                rows = [dict(r) for r in cur.fetchall()]
+            watermark = 0.0
+            for r in rows:
+                try:
+                    watermark = max(watermark, float(r.get("last_seen", 0) or 0))
+                except Exception:
+                    pass
+            return rows, watermark
+        finally:
+            con.close()
+
+
+def netdb_mark_synced(watermark):
+    """Clear the dirty flag on rows uploaded (i.e. unchanged since collect)."""
+    _ensure_server_db()
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            try:
+                con.execute("UPDATE servers SET needs_sync=0 WHERE needs_sync=1"
+                            " AND last_seen <= ?", (watermark,))
+                con.commit()
+            except Exception:
+                pass
+        finally:
+            con.close()
+
+
+def netdb_merge_remote(servers, upload_watermark=0.0):
+    """Merge downloaded rows into the local DB. Returns (inserted, updated).
+
+    Merged-in rows are already on the server so they arrive clean
+    (needs_sync=0) -- unless the row changed locally mid-sync
+    (last_seen past the upload watermark), in which case it stays dirty.
+    """
+    _ensure_server_db()
+    if not servers:
+        return 0, 0
+    inserted = updated = 0
+    try:
+        upload_watermark = float(upload_watermark or 0)
+    except Exception:
+        upload_watermark = 0.0
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            for raw in servers:
+                if not isinstance(raw, dict):
+                    continue
+                ip_port = str(raw.get("ip_port", "")).strip()
+                if not is_valid_ip_port(get_ip_only(ip_port)):
+                    continue
+                try:
+                    host, port = split_host_port(ip_port)
+                except Exception:
+                    host, port = ip_port, 25565
+                r_first = float(raw.get("first_seen", 0) or 0)
+                r_last = float(raw.get("last_seen", 0) or 0)
+                try:
+                    r_times = int(raw.get("times_seen", 1) or 1)
+                except Exception:
+                    r_times = 1
+                cur = con.execute("SELECT motd, players_online, max_players, version,"
+                                  " protocol, cracked, whitelist, first_seen, last_seen,"
+                                  " times_seen, last_source FROM servers WHERE ip_port=?",
+                                  (ip_port,))
+                old = cur.fetchone()
+                if old is None:
+                    con.execute(
+                        "INSERT INTO servers (ip_port, host, port, motd, players_online,"
+                        " max_players, version, protocol, cracked, whitelist,"
+                        " first_seen, last_seen, times_seen, last_source, needs_sync)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                        (ip_port, host, port,
+                         sanitize_motd(raw.get("motd", "")),
+                         int(raw.get("players_online", 0) or 0),
+                         int(raw.get("max_players", 0) or 0),
+                         sanitize_motd(raw.get("version", "") or ""),
+                         raw.get("protocol"), str(raw.get("cracked", "") or ""),
+                         str(raw.get("whitelist", "") or ""),
+                         r_first or r_last, r_last or r_first, max(1, r_times),
+                         str(raw.get("last_source", "") or "netdb")))
+                    inserted += 1
+                    continue
+                (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
+                 o_first, o_last, o_times, o_src) = old
+                try:
+                    o_first = float(o_first or 0)
+                except Exception:
+                    o_first = 0.0
+                try:
+                    o_last = float(o_last or 0)
+                except Exception:
+                    o_last = 0.0
+                try:
+                    o_times = int(o_times or 1)
+                except Exception:
+                    o_times = 1
+                remote_newer = r_last > o_last
+                first_seen = min(o_first, r_first) if (o_first and r_first) \
+                    else (o_first or r_first)
+                last_seen = max(o_last, r_last)
+                if remote_newer:
+                    motd = sanitize_motd(raw.get("motd", ""))
+                    online = int(raw.get("players_online", 0) or 0)
+                    maximum = int(raw.get("max_players", 0) or 0)
+                    version = sanitize_motd(raw.get("version", "") or "")
+                    protocol = raw.get("protocol")
+                    src = str(raw.get("last_source", "") or "netdb")
+                else:
+                    motd, online, maximum = o_motd, o_on, o_max
+                    version, protocol = o_ver, o_proto
+                    src = o_src
+                if o_cracked in ("Yes", "Yes (cached)"):
+                    cracked = o_cracked
+                elif remote_newer and raw.get("cracked"):
+                    cracked = str(raw.get("cracked"))
+                else:
+                    cracked = o_cracked or str(raw.get("cracked", "") or "")
+                if remote_newer and raw.get("whitelist"):
+                    whitelist = str(raw.get("whitelist"))
+                else:
+                    whitelist = o_wl or str(raw.get("whitelist", "") or "")
+                times_seen = max(o_times, r_times) + (1 if remote_newer else 0)
+                # Keep the row dirty if it changed locally after we collected
+                # the upload batch (its new sighting still needs uploading).
+                still_dirty = 1 if o_last > upload_watermark else 0
+                con.execute(
+                    "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
+                    " max_players=?, version=?, protocol=COALESCE(?, protocol),"
+                    " cracked=?, whitelist=?, first_seen=?, last_seen=?,"
+                    " times_seen=?, last_source=?, needs_sync=? WHERE ip_port=?",
+                    (host, port, motd, online, maximum, version, protocol,
+                     cracked, whitelist, first_seen, last_seen, times_seen,
+                     src, still_dirty, ip_port))
+                updated += 1
+            con.commit()
+        finally:
+            con.close()
+    _notify_server_db_tab()
+    return inserted, updated
+
+
+def netdb_sync_once(url, token, timeout=None):
+    """Bidirectional sync. Returns summary dict. Raises ConnectionError."""
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        raise ConnectionError("enter the shared-DB URL and token first")
+    cfg = netdb_load_config()
+    since = cfg.get("last_sync", 0) or 0
+    dirty_rows, watermark = netdb_collect_dirty()
+    resp = _netdb_request(url + "/api/sync", token, method="POST",
+                          payload={"servers": dirty_rows, "since": since},
+                          timeout=timeout)
+    # Upload accepted: clear flags (only rows unchanged since collect)...
+    netdb_mark_synced(watermark)
+    # ...then merge what the others found.
+    remote = resp.get("servers", []) if isinstance(resp, dict) else []
+    inserted, updated = netdb_merge_remote(remote, watermark)
+    now = float(resp.get("now", time.time()) or time.time())
+    netdb_save_config(url, token, now)
+    return {"uploaded": len(dirty_rows),
+            "merged_on_server": int(resp.get("merged", 0) or 0),
+            "downloaded": len(remote),
+            "inserted": inserted, "updated": updated,
+            "total_remote": int(resp.get("total", 0) or 0),
+            "now": now}
 
 ICON_ENABLED = True           
 ICON_SIZE = 24                
@@ -6233,6 +6523,42 @@ class ServersTab(QWidget, QtBaseMixin):
         self.count_label = QLabel("")
         bar.addWidget(self.count_label)
 
+        # ---- shared network DB row: paste URL + token once, then Sync DB ----
+        netbar = QHBoxLayout()
+        root.addLayout(netbar)
+        netbar.addWidget(QLabel("Shared DB:"))
+        self.netdb_url_edit = QLineEdit()
+        self.netdb_url_edit.setPlaceholderText("http://host:8777")
+        self.netdb_url_edit.setMinimumWidth(200)
+        netbar.addWidget(self.netdb_url_edit, 2)
+        self.netdb_token_edit = QLineEdit()
+        self.netdb_token_edit.setPlaceholderText("paste shared token")
+        try:
+            self.netdb_token_edit.setEchoMode(QLineEdit.Password)
+        except Exception:
+            pass
+        self.netdb_token_edit.setMinimumWidth(180)
+        netbar.addWidget(self.netdb_token_edit, 2)
+        self.netdb_sync_btn = QPushButton("Sync DB")
+        self.netdb_sync_btn.setToolTip(
+            "Upload this client's new sightings, download other clients' "
+            "servers, and refresh last-seen dates both ways.")
+        self.netdb_sync_btn.clicked.connect(self.sync_netdb)
+        netbar.addWidget(self.netdb_sync_btn)
+        try:
+            cfg = netdb_load_config()
+            if cfg.get("url"):
+                self.netdb_url_edit.setText(cfg["url"])
+            if cfg.get("token"):
+                self.netdb_token_edit.setText(cfg["token"])
+            if cfg.get("last_sync"):
+                self.netdb_sync_btn.setToolTip(
+                    "Last sync: " + format_db_timestamp(cfg["last_sync"])
+                    + ". Upload new sightings, download other clients' "
+                    "servers, refresh last-seen dates both ways.")
+        except Exception:
+            pass
+
         self.tree = ResultTable(self, columns=list(self.COLS))
         self.tree.setHorizontalHeaderLabels([c.upper() for c in self.COLS])
         widths = {"ip": 170, "motd": 260, "players": 110, "version": 120,
@@ -6433,6 +6759,71 @@ class ServersTab(QWidget, QtBaseMixin):
             return
         self.set_status("Rechecking whitelist for selected server(s)…")
         check_selected_whitelist(self, self.tree)
+
+    def sync_netdb(self):
+        try:
+            url = (self.netdb_url_edit.text() or "").strip().rstrip("/")
+        except Exception:
+            url = ""
+        try:
+            token = (self.netdb_token_edit.text() or "").strip()
+        except Exception:
+            token = ""
+        if not url or not token:
+            q_info(self, "Shared DB",
+                   "Paste the shared-DB URL (e.g. http://host:8777) and the "
+                   "shared token first. Ask whoever runs dbserver.py for them.")
+            return
+        # Persist immediately so a restart keeps the setup (normie-friendly).
+        try:
+            netdb_save_config(url, token, netdb_load_config().get("last_sync", 0))
+        except Exception:
+            pass
+        try:
+            self.netdb_sync_btn.setEnabled(False)
+        except Exception:
+            pass
+        self.set_status("Syncing shared DB… (uploading new sightings, downloading…)")
+
+        def work(u=url, t=token):
+            try:
+                summary = netdb_sync_once(u, t)
+            except Exception as exc:
+                self.after(0, lambda: self._netdb_sync_failed(str(exc)))
+                return
+            self.after(0, lambda: self._netdb_sync_done(summary))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _netdb_sync_failed(self, err):
+        try:
+            self.netdb_sync_btn.setEnabled(True)
+        except Exception:
+            pass
+        self.set_status(f"Shared-DB sync failed: {err}")
+        q_error(self, "Shared DB", f"Sync failed:\n{err}")
+
+    def _netdb_sync_done(self, summary):
+        try:
+            self.netdb_sync_btn.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            cfg = netdb_load_config()
+            if cfg.get("last_sync"):
+                self.netdb_sync_btn.setToolTip(
+                    "Last sync: " + format_db_timestamp(cfg["last_sync"])
+                    + ". Upload new sightings, download other clients' "
+                    "servers, refresh last-seen dates both ways.")
+        except Exception:
+            pass
+        self.refresh_from_db()
+        self.set_status(
+            f"Shared-DB sync: ↑{summary.get('uploaded', 0)} uploaded "
+            f"({summary.get('merged_on_server', 0)} new for server), "
+            f"↓{summary.get('downloaded', 0)} downloaded "
+            f"({summary.get('inserted', 0)} new, {summary.get('updated', 0)} "
+            f"refreshed). Server holds {summary.get('total_remote', 0)}.")
 
 # ===== Qt port section: qt_monitor (PySide6, 1:1 behavior) =====
 """PySide6 port of ServerMonitorTab (scanner.py lines 6350-6737)."""
