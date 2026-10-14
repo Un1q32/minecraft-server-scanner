@@ -22,7 +22,6 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
-from colorama import init, Fore, Style
 import nbtlib
 from nbtlib import Compound, String, Byte
 
@@ -81,8 +80,6 @@ try:
     _CRYPTO_AVAILABLE = True
 except Exception:
     _CRYPTO_AVAILABLE = False
-
-init(autoreset=True)
 
 SHODAN_KEY_PATH = os.path.join(os.getcwd(), "shodan_key.txt")
 SERVERS_DB_FILE = "servers.db"
@@ -1871,7 +1868,7 @@ def save_shodan_results(servers, filepath):
             f.write(line + "\n")
 
     if skipped_ignored:
-        print(Fore.YELLOW + f"Skipped {skipped_ignored} ignored entrie(s).")
+        print(f"Skipped {skipped_ignored} ignored entrie(s).")
 
 def read_servers(file):
     entries = []
