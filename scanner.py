@@ -955,7 +955,7 @@ def import_prism_accounts(path=PRISM_ACCOUNTS_PATH):
             access_token = raw.get("accessToken")
             token_source = "Prism accessToken"
         refresh_token = (msa.get("refresh_token") or raw.get("refreshToken") or "")
-        if not name or not profile_id:
+        if not (name or "").strip() or not (profile_id or "").strip():
             skipped.append((label, "no name/UUID in Prism profile — launch the account in Prism once"))
             continue
         if not access_token and not refresh_token:
@@ -969,8 +969,10 @@ def import_prism_accounts(path=PRISM_ACCOUNTS_PATH):
         account["msa_client_id"] = (msa.get("client_id") or raw.get("msa-client-id")
                                     or raw.get("msaClientId") or "")
         # Strip empties so merging can't blank a good stored token.
-        # (name/uuid are guaranteed truthy here, so nothing needed is lost.)
         account = {k: v for k, v in account.items() if v not in ("", None)}
+        if not account.get("name") or not account.get("uuid"):
+            skipped.append((label, "name/UUID did not survive cleanup"))
+            continue
         imported.append(account)
     if imported:
         upsert_mc_accounts(imported, active_uuid=imported[0].get("uuid"))
@@ -5648,7 +5650,14 @@ class AccountTab(QWidget):
         try:
             imported, skipped = import_prism_accounts(path)
             self.refresh()
-            msg = f"Imported {len(imported)} Prism account(s)."
+            total = len(_load_mc_accounts().get("accounts", []))
+            shown = len(self.tree.get_children())
+            names = ", ".join(a.get("name", "?") for a in imported[:5])
+            msg = (f"Imported {len(imported)} Prism account(s)"
+                   + (f": {names}" if names else "")
+                   + f". Stored total: {total}, shown: {shown}.")
+            if shown < total:
+                msg += " WARNING: table shows fewer than stored — tell me and paste this line."
             if skipped:
                 detail = "; ".join(f"{label}: {reason}" for label, reason in skipped[:5])
                 if len(skipped) > 5:
