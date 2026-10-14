@@ -66,6 +66,18 @@ try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.serialization import load_der_public_key
     from cryptography.hazmat.backends import default_backend
+    try:
+        # cryptography >= ~44: CFB8 lives here; the old location emits a
+        # CryptographyDeprecationWarning (and will be removed in 49.0.0).
+        from cryptography.hazmat.decrepit.ciphers.modes import CFB8 as _CFB8
+    except ImportError:
+        _CFB8 = None
+
+    def _cfb8(iv):
+        if _CFB8 is not None:
+            return _CFB8(iv)
+        return modes.CFB8(iv)
+
     _CRYPTO_AVAILABLE = True
 except Exception:
     _CRYPTO_AVAILABLE = False
@@ -2169,12 +2181,12 @@ class EncryptedSocket:
         self.sock = sock
         self.decryptor = Cipher(
             algorithms.AES(shared_secret),
-            modes.CFB8(shared_secret),
+            _cfb8(shared_secret),
             backend=backend
         ).decryptor()
         self.encryptor = Cipher(
             algorithms.AES(shared_secret),
-            modes.CFB8(shared_secret),
+            _cfb8(shared_secret),
             backend=backend
         ).encryptor()
 
@@ -9684,8 +9696,10 @@ class JSONTab(QWidget, QtBaseMixin):
         self.scan_tree.clearSelection()
         if matches:
             self.scan_tree.select_rows(matches)
-            self.scan_tree.setCurrentCell(matches[0], 0)
-            self.scan_tree.scrollToItem(self.scan_tree.item(matches[0], 0))
+            r0 = self.scan_tree.row_index(matches[0])
+            if r0 >= 0:
+                self.scan_tree.setCurrentCell(r0, 0)
+                self.scan_tree.scroll_to(matches[0])
             self.set_status(f"Found {len(matches)} match(es) for '{query_raw.strip()}'.")
         else:
             self.set_status(f"No matches for '{query_raw.strip()}'.")

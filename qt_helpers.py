@@ -323,6 +323,99 @@ class ResultTable(QTableWidget):
     def clear(self):
         self.clear_contents()
 
+    def clear_rows(self):
+        """Remove all data rows, keep columns/headers (Tk-port compat)."""
+        self.clear_contents()
+
+    def add_row(self, values):
+        """Append one row; returns the iid (Tk-port compat)."""
+        return self.insert("", "end", values=values)
+
+    def row_index(self, key):
+        """QTableWidget row number for an iid or a row number (else -1).
+
+        The ported tabs mix both conventions, so every key-based helper
+        accepts either.
+        """
+        try:
+            if isinstance(key, bool):
+                return -1
+            if isinstance(key, int):
+                return int(key) if 0 <= int(key) < len(self._iids) else -1
+            return self._row_of(key)
+        except Exception:
+            return -1
+
+    def row_values(self, key):
+        """Values tuple for an iid or row number (() when unknown)."""
+        try:
+            r = self.row_index(key)
+            if r < 0:
+                return ()
+            return tuple(self._values.get(self._iids[r], ()))
+        except Exception:
+            return ()
+
+    def set_cell(self, key, column, value):
+        """Set one cell by iid or row number (column name or index)."""
+        try:
+            r = self.row_index(key)
+            if r < 0:
+                return
+            self.set(self._iids[r], column, value)
+        except Exception:
+            pass
+
+    def remove_rows(self, keys):
+        """Delete rows given as iids and/or row numbers."""
+        try:
+            iids = []
+            for k in keys or []:
+                r = self.row_index(k)
+                if r >= 0:
+                    iids.append(self._iids[r])
+            if iids:
+                self.delete(*iids)
+        except Exception:
+            pass
+
+    def selected_rows(self):
+        """Values tuples for the currently selected rows, top to bottom."""
+        try:
+            return [tuple(self._values.get(i, ())) for i in self.selection()]
+        except Exception:
+            return []
+
+    def select_rows(self, keys):
+        """Select rows given as iids and/or row numbers."""
+        try:
+            iids = []
+            for k in keys or []:
+                r = self.row_index(k)
+                if r >= 0:
+                    iids.append(self._iids[r])
+            self.selection_set(iids)
+        except Exception:
+            pass
+
+    def get_all_rows(self):
+        """Values tuples for every row, top to bottom."""
+        try:
+            return [tuple(self._values.get(i, ())) for i in list(self._iids)]
+        except Exception:
+            return []
+
+    def scroll_to(self, key):
+        """Scroll so the row for an iid/row number is visible."""
+        try:
+            r = self.row_index(key)
+            if r >= 0:
+                it = QTableWidget.item(self, r, 0)
+                if it is not None:
+                    self.scrollToItem(it)
+        except Exception:
+            pass
+
     def get_children(self, item=""):
         return list(self._iids)
 
@@ -380,6 +473,13 @@ class ResultTable(QTableWidget):
 
     # -- values -------------------------------------------------------
     def item(self, iid, option=None, **kw):
+        # Native QTableWidget.item(row, column) stays available alongside
+        # the Treeview-compatible item(iid[, "values"]) form.
+        if isinstance(iid, int) and isinstance(option, int) and not kw:
+            try:
+                return QTableWidget.item(self, iid, option)
+            except Exception:
+                return None
         if "values" in kw:
             vals = tuple("" if v is None else str(v) for v in (kw["values"] or ()))
             n = len(self._columns)
