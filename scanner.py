@@ -1,6 +1,10 @@
 # === Minecraft Scanner by Cev-API ===
 
-import shodan
+try:
+    import shodan
+except ImportError:
+    # Optional dependency: everything except Shodan search works without it.
+    shodan = None
 import codecs
 import socket
 import struct
@@ -1735,13 +1739,10 @@ def get_user_query():
     return full_query
 
 def search_shodan(query, api_key):
-    api = shodan.Shodan(api_key)
-    try:
-        results = api.search(query)
-        return results.get('matches', [])
-    except shodan.APIError as e:
-        # Let caller decide how to handle (invalid key, rate limit, etc.)
-        raise
+    if shodan is None:
+        raise RuntimeError(
+            "Shodan search needs the 'shodan' package (pip install shodan).")
+    return shodan.Shodan(api_key).search(query).get('matches', [])
 
 
 def parse_description_from_raw(data_string):
@@ -6541,105 +6542,10 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 skip_python = False
                 masscan_note = ""
                 minescan_note = ""
-                # Auto order: masscan first (when up), then minescan, then
-                # Python. Strict minescan skips masscan via use_masscan=False.
-                if minescan_up and not masscan_up:
-                    # ---- minescan path (msrustmod-style): webscan already did
-                    # TCP + Minecraft handshake per hit, so results stream
-                    # straight to the table/DB with no second pool. ----
-                    try:
-                        ms_runs, ms_warnings = build_minescan_inputs(
-                            targets_raw, ports, max_hosts)
-                    except Exception as exc:
-                        ms_runs, ms_warnings = [], [str(exc)]
-                    for w in ms_warnings[:5]:
-                        say(f"minescan: {w}")
-                    if not ms_runs:
-                        if strict_minescan:
-                            say("minescan: no valid targets to scan.")
-                            go_idle()
-                            return
-                    else:
-                        total_est = sum(int(r.get("estimate", 0) or 0) for r in ms_runs)
-                        eta = _format_masscan_eta(
-                            minescan_estimate_seconds(ms_runs, minescan_rate))
-                        say(f"minescan: scanning {len(ms_runs)} run(s)"
-                            f" (~{total_est} probes){eta}...")
-                        runs_ok = 0
-                        first_error = ""
-
-                        def ms_on_hit(hit):
-                            if not alive():
-                                return
-                            ip_port = hit.get("ip", "")
-                            if is_ignored(ip_port):
-                                return
-                            try:
-                                _remember_protocol(ip_port, hit.get("protocol"))
-                            except Exception:
-                                pass
-                            try:
-                                record_server_result(hit, source="minescan")
-                            except Exception:
-                                pass
-                            line = (f"{hit['ip']} | MOTD: {hit['motd']} | Players: "
-                                    f"{hit['players']}/{hit['max_players']} | Version: {hit['version']}")
-                            with lock:
-                                results.append(hit)
-                            try:
-                                USER_LOG_MANAGER.update_from_result(hit)
-                            except Exception:
-                                pass
-                            try:
-                                on_result(hit, line)
-                            except Exception:
-                                pass
-
-                        def ms_on_stats(stats):
-                            if job != self._scan_job_id:
-                                return
-                            try:
-                                att = int(stats.get("attempts", 0) or 0)
-                            except Exception:
-                                att = 0
-                            self.after(0, lambda a=att, s=dict(stats), f=len(results):
-                                       self._minescan_status(job, a, s, f, total_est))
-
-                        for ri, run in enumerate(ms_runs):
-                            if not alive():
-                                break
-                            tag = f"run {ri + 1}/{len(ms_runs)}: " if len(ms_runs) > 1 else ""
-                            say(f"minescan {tag}{len(run['targets'])} target(s) on "
-                                f"port(s) {','.join(str(p) for p in run['ports'])}...")
-                            try:
-                                _, note = run_minescan_streaming(
-                                    run["targets"], run["ports"], rate=minescan_rate,
-                                    timeout=minescan_default_timeout([run], minescan_rate),
-                                    stop_event=stop_event,
-                                    on_hit=ms_on_hit, on_stats=ms_on_stats)
-                                runs_ok += 1
-                                if note:
-                                    minescan_note = f"{minescan_note} {note}".strip()
-                            except ScanStopped:
-                                go_idle()
-                                return
-                            except Exception as exc:
-                                if not first_error:
-                                    first_error = str(exc)
-                                say(f"minescan {tag}failed ({first_error}), continuing")
-                        if not alive():
-                            go_idle()
-                            return
-                        if runs_ok == 0:
-                            if strict_minescan:
-                                say(f"minescan failed: {first_error or 'unknown error'}")
-                                go_idle()
-                                return
-                            say(f"minescan failed ({first_error or 'unknown error'}); "
-                                "falling back...")
-                        else:
-                            skip_python = True
+                masscan_tried = False
+                masscan_failed = False
                 if not skip_python and masscan_up:
+                    masscan_tried = True
                     # ---- streaming masscan path: each open port is handed to
                     # the handshake pool (and the GUI) as soon as masscan
                     # reports it, instead of waiting for the whole sweep. ----
@@ -6799,6 +6705,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                 hs_executor.shutdown(wait=True)
                             except Exception:
                                 pass
+                            masscan_failed = True
                             targets = [t for t in expand_scan_targets(targets_raw, ports, max_hosts=max_hosts)
                                        if t not in submitted]
                         else:
@@ -6806,6 +6713,104 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                 hs_executor.shutdown(wait=True)
                             except Exception:
                                 pass
+                            skip_python = True
+                # Auto chain by outcome: masscan first; if it never ran or
+                # fell back, minescan gets its turn before Python.
+                if minescan_up and not skip_python and (masscan_failed or not masscan_tried):
+                    # ---- minescan path (msrustmod-style): webscan already did
+                    # TCP + Minecraft handshake per hit, so results stream
+                    # straight to the table/DB with no second pool. ----
+                    try:
+                        ms_runs, ms_warnings = build_minescan_inputs(
+                            targets_raw, ports, max_hosts)
+                    except Exception as exc:
+                        ms_runs, ms_warnings = [], [str(exc)]
+                    for w in ms_warnings[:5]:
+                        say(f"minescan: {w}")
+                    if not ms_runs:
+                        if strict_minescan:
+                            say("minescan: no valid targets to scan.")
+                            go_idle()
+                            return
+                    else:
+                        total_est = sum(int(r.get("estimate", 0) or 0) for r in ms_runs)
+                        eta = _format_masscan_eta(
+                            minescan_estimate_seconds(ms_runs, minescan_rate))
+                        say(f"minescan: scanning {len(ms_runs)} run(s)"
+                            f" (~{total_est} probes){eta}...")
+                        runs_ok = 0
+                        first_error = ""
+
+                        def ms_on_hit(hit):
+                            if not alive():
+                                return
+                            ip_port = hit.get("ip", "")
+                            if is_ignored(ip_port):
+                                return
+                            try:
+                                _remember_protocol(ip_port, hit.get("protocol"))
+                            except Exception:
+                                pass
+                            try:
+                                record_server_result(hit, source="minescan")
+                            except Exception:
+                                pass
+                            line = (f"{hit['ip']} | MOTD: {hit['motd']} | Players: "
+                                    f"{hit['players']}/{hit['max_players']} | Version: {hit['version']}")
+                            with lock:
+                                results.append(hit)
+                            try:
+                                USER_LOG_MANAGER.update_from_result(hit)
+                            except Exception:
+                                pass
+                            try:
+                                on_result(hit, line)
+                            except Exception:
+                                pass
+
+                        def ms_on_stats(stats):
+                            if job != self._scan_job_id:
+                                return
+                            try:
+                                att = int(stats.get("attempts", 0) or 0)
+                            except Exception:
+                                att = 0
+                            self.after(0, lambda a=att, s=dict(stats), f=len(results):
+                                       self._minescan_status(job, a, s, f, total_est))
+
+                        for ri, run in enumerate(ms_runs):
+                            if not alive():
+                                break
+                            tag = f"run {ri + 1}/{len(ms_runs)}: " if len(ms_runs) > 1 else ""
+                            say(f"minescan {tag}{len(run['targets'])} target(s) on "
+                                f"port(s) {','.join(str(p) for p in run['ports'])}...")
+                            try:
+                                _, note = run_minescan_streaming(
+                                    run["targets"], run["ports"], rate=minescan_rate,
+                                    timeout=minescan_default_timeout([run], minescan_rate),
+                                    stop_event=stop_event,
+                                    on_hit=ms_on_hit, on_stats=ms_on_stats)
+                                runs_ok += 1
+                                if note:
+                                    minescan_note = f"{minescan_note} {note}".strip()
+                            except ScanStopped:
+                                go_idle()
+                                return
+                            except Exception as exc:
+                                if not first_error:
+                                    first_error = str(exc)
+                                say(f"minescan {tag}failed ({first_error}), continuing")
+                        if not alive():
+                            go_idle()
+                            return
+                        if runs_ok == 0:
+                            if strict_minescan:
+                                say(f"minescan failed: {first_error or 'unknown error'}")
+                                go_idle()
+                                return
+                            say(f"minescan failed ({first_error or 'unknown error'}); "
+                                "falling back...")
+                        else:
                             skip_python = True
                 if not skip_python:
                     if targets is None:
@@ -8521,6 +8526,13 @@ class ShodanTab(QWidget, QtBaseMixin):
 
     # ---------- search ----------
     def do_search(self):
+        if shodan is None:
+            self.set_status("Shodan search needs the 'shodan' package (pip install shodan).")
+            q_error(self, "Shodan",
+                    "The 'shodan' package is not installed.\n"
+                    "Run: pip install shodan\n"
+                    "Everything else in the scanner works without it.")
+            return
         q = self.query_edit.text().strip()
         full_query = f"minecraft {q}" if q else "minecraft"
 
@@ -10219,7 +10231,6 @@ class FullAppGUI(QMainWindow):
         self.nb = nb
 
         # Tabs
-        self.shodan_tab = ShodanTab(nb)
         self.network_tab = NetworkScanTab(nb)
         self.json_tab = JSONTab(nb)
         self.servers_tab = ServersTab(nb)
@@ -10228,10 +10239,10 @@ class FullAppGUI(QMainWindow):
         self.ignore_tab = IgnoreTab(nb)
         self.user_log_tab = UserLogTab(nb)
         self.account_tab = AccountTab(nb)
-        self.monitor_tab = ServerMonitorTab(nb)
         self.proxy_tab = ProxyTab(nb)
+        self.monitor_tab = ServerMonitorTab(nb)
+        self.shodan_tab = ShodanTab(nb)
 
-        nb.addTab(self.shodan_tab, "Shodan")
         nb.addTab(self.network_tab, "Network Scan")
         nb.addTab(self.json_tab, "JSON Search")
         nb.addTab(self.servers_tab, "Servers")
@@ -10242,6 +10253,7 @@ class FullAppGUI(QMainWindow):
         nb.addTab(self.account_tab, "Accounts")
         nb.addTab(self.proxy_tab, "Proxies")
         nb.addTab(self.monitor_tab, "Server Monitor")
+        nb.addTab(self.shodan_tab, "Shodan")
 
         USER_LOG_MANAGER.attach_tab(self.user_log_tab)
 

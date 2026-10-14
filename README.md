@@ -126,13 +126,13 @@ The result table has a CRACKED column. Every handshake already detects likely of
 - Network Scan: scans IPs, ranges, CIDRs, and ASNs across selected ports.
 - Proxies: manages proxies and runs bulk whitelist scans.
 - Servers: browses the automatic servers.db history (first/last seen).
-- Shodan: searches Shodan and scans search results.
 - JSON Search: searches local Shodan JSON or JSONL data and scans matches.
 - Server Monitor: monitors saved servers and records player activity.
 - Export to MC: writes text lists to Minecraft’s servers.dat.
 - Saved: manages saved servers.
 - Ignore: manages ignored servers and scans the complete list for whitelist status.
 - Player Log: searches and exports discovered player records.
+- Shodan: searches Shodan and scans search results (needs the optional shodan package).
 
 ## Shared network DB (`dbserver.py`)
 
@@ -166,7 +166,7 @@ Traffic is plain HTTP so setup stays trivial; pass `--tls-cert/--tls-key`
 - Windows.
 - Python 3.10 or newer.
 - PySide6 for the Qt GUI (`pip install PySide6`).
-- A valid Shodan API key for Shodan searches.
+- A valid Shodan API key for Shodan searches (optional; the shodan package itself is optional too — `pip install shodan` only if you use that tab).
 - The cryptography package for authenticated whitelist probes.
 - Network access for Shodan, Minecraft status probes, account services, and ASN prefix lookup.
 - Optional: masscan for fast Network Scan discovery (requires root/Administrator + Npcap on Windows). Without it, the scanner falls back to the Python backend.
