@@ -751,6 +751,34 @@ def netdb_merge_remote(servers, upload_watermark=0.0):
     return inserted, updated
 
 
+def netdb_get_credentials():
+    """(url, token) for auto-sync: live Servers-tab fields first, else file.
+
+    Returns ("", "") when the user never entered anything anywhere.
+    """
+    url = token = ""
+    try:
+        tab = _SERVER_DB_TAB_INSTANCE
+        if tab is not None:
+            try:
+                url = (tab.netdb_url_edit.text() or "").strip()
+            except Exception:
+                pass
+            try:
+                token = (tab.netdb_token_edit.text() or "").strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if url and token:
+        return url.rstrip("/"), token
+    try:
+        cfg = netdb_load_config()
+        return cfg.get("url", ""), cfg.get("token", "")
+    except Exception:
+        return "", ""
+
+
 def netdb_sync_once(url, token, timeout=None):
     """Bidirectional sync. Returns summary dict. Raises ConnectionError."""
     url = (url or "").strip().rstrip("/")
@@ -6411,6 +6439,52 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         self._progress_idle()
         self.set_status("Scan stopped.")
 
+    def _maybe_autosync_netdb(self, job):
+        """Sync the shared DB after a scan when credentials are entered.
+
+        Reads the Servers tab's live URL/token fields (falling back to the
+        saved netdb.json) and syncs in the background without disturbing a
+        newer scan.
+        """
+        try:
+            url, token = netdb_get_credentials()
+        except Exception:
+            return
+        if not url or not token:
+            return
+
+        def work(url=url, token=token, job=job):
+            try:
+                summary = netdb_sync_once(url, token)
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda e=err, j=job: self._netdb_autosync_failed(j, e))
+                return
+            self.after(0, lambda s=summary, j=job: self._netdb_autosync_done(j, s))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _netdb_autosync_failed(self, job, err):
+        if job != self._scan_job_id:
+            return
+        try:
+            self.status_label.setText(f"Scan complete. Shared-DB auto-sync failed: {err}")
+        except Exception:
+            pass
+
+    def _netdb_autosync_done(self, job, summary):
+        if job != self._scan_job_id:
+            return
+        try:
+            self.status_label.setText(
+                f"Scan complete. Shared-DB auto-sync: "
+                f"\u2191{summary.get('uploaded', 0)} uploaded, "
+                f"\u2193{summary.get('downloaded', 0)} downloaded "
+                f"({summary.get('inserted', 0)} new). "
+                f"Server holds {summary.get('total_remote', 0)}.")
+        except Exception:
+            pass
+
     def scan_targets(self):
         try:
             max_hosts_raw = int(self.max_hosts_edit.text().strip() or NETWORK_SCAN_MAX_HOSTS)
@@ -6894,6 +6968,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         f"Minecraft servers: {len(results)}.")
                 else:
                     say(f"Scan complete. Minecraft servers: {len(results)}.")
+                self._maybe_autosync_netdb(job)
                 if not (check_cracked or check_whitelist):
                     go_idle()
 
