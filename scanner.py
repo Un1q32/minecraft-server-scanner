@@ -3677,7 +3677,14 @@ class ScanStopped(Exception):
 # arrives; webscan already did the Minecraft handshake, so no second pool
 # is needed.
 
-MINESCAN_CONCURRENCY = 10000
+MINESCAN_CONCURRENCY = 500  # same as msrustmod (threads)
+MINESCAN_RETRIES = 1  # same as msrustmod (webscan default)
+# Default minescan handshake rate (full TCP+Minecraft handshakes/sec from
+# this host). Deliberately gentle: burst rates trip target-side flood
+# protection and servers get MISSED (a /24 at 10k/s = 254 SYNs in ~25ms,
+# then a minutes-long block). The masscan "Rate (pps)" box counts cheap SYN
+# packets, not full handshakes, so its default must never apply here.
+MINESCAN_DEFAULT_RATE = 200
 MINESCAN_CONNECT_TIMEOUT = 3
 MINESCAN_MINECRAFT_TIMEOUT = 5
 MINESCAN_MAX_HOSTS = 1000000  # cap for *expanded* targets only (native ranges stream)
@@ -3995,6 +4002,7 @@ def format_minescan_status(stats, found):
 
 
 def run_minescan_streaming(targets, ports, rate=0, concurrency=MINESCAN_CONCURRENCY,
+                           retries=MINESCAN_RETRIES,
                            connect_timeout=MINESCAN_CONNECT_TIMEOUT,
                            minecraft_timeout=MINESCAN_MINECRAFT_TIMEOUT,
                            protocol_version=PROTOCOL_VERSION, timeout=None,
@@ -4042,6 +4050,7 @@ def run_minescan_streaming(targets, ports, rate=0, concurrency=MINESCAN_CONCURRE
            "--output", "ndjson",
            "--concurrency", str(max(1, min(int(concurrency), 100000))),
            "--rate", str(rate),
+           "--retries", str(max(0, min(int(retries), 10))),
            "--connect-timeout", str(max(1, min(int(connect_timeout), 120))),
            "--minecraft-timeout", str(max(1, min(int(minecraft_timeout), 120))),
            "--protocol-version", str(int(protocol_version))]
@@ -5870,6 +5879,10 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         return _TextVarAdapter(self.masscan_wait_edit)
 
     @property
+    def minescan_rate_var(self):
+        return _TextVarAdapter(self.minescan_rate_edit)
+
+    @property
     def masscan_status_var(self):
         return _TextVarAdapter(self.masscan_status_label)
 
@@ -5969,6 +5982,18 @@ class NetworkScanTab(QtBaseMixin, QWidget):
             self.masscan_wait_edit.setText("")
         self.masscan_wait_edit.setMaximumWidth(60)
         bb.addWidget(self.masscan_wait_edit)
+        ms_rate_label = QLabel("MS rate:", backend_bar)
+        ms_rate_label.setToolTip(
+            "Minescan handshakes/sec. Keep low: burst rates trip target "
+            "flood protection and servers get missed.")
+        bb.addWidget(ms_rate_label)
+        self.minescan_rate_edit = QLineEdit(backend_bar)
+        try:
+            self.minescan_rate_edit.setText(str(MINESCAN_DEFAULT_RATE))
+        except Exception:
+            self.minescan_rate_edit.setText("")
+        self.minescan_rate_edit.setMaximumWidth(70)
+        bb.addWidget(self.minescan_rate_edit)
         self.masscan_status_label = QLabel(backend_bar)
         try:
             self.masscan_status_label.setText(masscan_status_line())
@@ -6405,7 +6430,12 @@ class NetworkScanTab(QtBaseMixin, QWidget):
         except ValueError:
             scan_rate = MASSCAN_DEFAULT_RATE
         masscan_rate = scan_rate
-        minescan_rate = scan_rate
+        try:
+            minescan_rate = int((self.minescan_rate_edit.text() or "").strip()
+                                or MINESCAN_DEFAULT_RATE)
+        except ValueError:
+            minescan_rate = MINESCAN_DEFAULT_RATE
+        minescan_rate = max(1, minescan_rate)
         try:
             masscan_wait = int((self.masscan_wait_edit.text() or "").strip() or MASSCAN_DEFAULT_WAIT)
         except ValueError:
@@ -6656,7 +6686,13 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             stop_stream_quietly()
                             return
                         except PermissionError:
-                            if sudo_available() and ranges:
+                            if auto and minescan_up:
+                                # No point interrogating the user for sudo when
+                                # an unprivileged backend is ready to go.
+                                say("masscan needs privileges; trying minescan instead...")
+                                masscan_failed = True
+                                outcome = "fallback"
+                            elif sudo_available() and ranges:
                                 say("masscan needs root; trying sudo...")
                                 passwordless = sudo_noninteractive_ok()
                                 sudo_pw = None
