@@ -2287,6 +2287,10 @@ def format_player_list(sample):
 PACKET_LENGTH_LIMIT_LOGIN = 100000
 DEFAULT_STATUS_PROTOCOL = 773
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+# Fixed login name for offline (no-account) probes: a real-looking username
+# so servers don't reject odd characters, and random names stay out of their
+# console. It is still redacted to "[name]" in our own logs/DB.
+OFFLINE_PROBE_NAME = "karkat"
 
 def recv_varint(sock):
     value = 0
@@ -2789,7 +2793,7 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                 login_start = build_authenticated_login_start(account, current_protocol)
                 login_name = (account.get("name") or "Player")[:16] or "Player"
             else:
-                login_name = "Player" + str(random.randint(1000, 9999))
+                login_name = OFFLINE_PROBE_NAME
                 login_start = build_login_start(login_name, current_protocol)
             sock = None
             compression_threshold = -1
@@ -2882,7 +2886,7 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                         if "whitelist" in low or "white list" in low or "not whitelisted" in low:
                             msg = f"WHITELISTED ({reason})"
                             if not mojang_used and not saw_encryption:
-                                msg += " [offline-mode, no Mojang auth used]"
+                                msg += " [offline-mode]"
                             return True, append_mod_warning(msg, mod_warning), "done"
                         if "throttl" in low:
                             return None, append_mod_warning(f"Connection throttled, retry later ({reason})", mod_warning), "done"
@@ -2904,13 +2908,13 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                                 break
                         msg = f"Not Whitelisted ({reason})"
                         if not mojang_used and not saw_encryption:
-                            msg += " [offline-mode, no Mojang auth used]"
+                            msg += " [offline-mode]"
                         return False, append_mod_warning(msg, extra_warning), "done"
 
                     if packet_id == 0x02:
                         if saw_encryption:
                             return False, append_mod_warning("Not Whitelisted (login accepted)", mod_warning), "done"
-                        msg = f"Not Whitelisted (offline login accepted as {login_name}) [offline-mode, no Mojang auth used]"
+                        msg = "Not Whitelisted (offline login accepted) [offline-mode]"
                         return False, append_mod_warning(msg, mod_warning), "done"
 
                     if packet_id == 0x04:
@@ -2921,13 +2925,13 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                             warn = append_mod_warning(warn, mod_warning_text(loader, channel))
                         msg = f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)"
                         if not mojang_used and not saw_encryption:
-                            msg += " [offline-mode, no Mojang auth used]"
+                            msg += " [offline-mode]"
                         return False, append_mod_warning(msg, warn), "done"
 
                     if packet_id == 0x05:
                         msg = "Not Whitelisted (entered configuration; no immediate whitelist kick)"
                         if not mojang_used and not saw_encryption:
-                            msg += " [offline-mode, no Mojang auth used]"
+                            msg += " [offline-mode]"
                         return False, append_mod_warning(msg, mod_warning), "done"
 
             except socket.timeout:
@@ -2978,8 +2982,8 @@ def whitelist_login_showed_offline(message):
     configuration stage without encryption. Auth rejections, throttles,
     timeouts and version mismatches never carry the marker."""
     low = (message or "").lower()
-    return ("[offline-mode, no mojang auth used]" in low
-            or "offline login accepted as" in low)
+    return ("[offline-mode" in low
+            or "offline login accepted" in low)
 
 
 def _probe_whitelist_entry(entry, account, proxy=None):
@@ -3045,24 +3049,59 @@ def whitelist_result_label(result, message):
             label = f"{label} {warn_suffix}"
     return label
 
-def log_whitelist_probe(entry, result, message, account=None):
+def redact_probe_names(text, name=None, uuid=None):
+    """Replace the probe account's name with "[name]" and its UUID with
+    "[uuid]" wherever they appear.
+
+    A server sees the account name in Login Start and can quote it back in
+    kick/disconnect text. Nothing else about the text is changed.
+    """
+    s = text or ""
+    for tok, repl in ((name, "[name]"), (uuid, "[uuid]")):
+        t = str(tok or "").strip()
+        if len(t) >= 3:
+            try:
+                s = re.sub(re.escape(t), repl, s, flags=re.IGNORECASE)
+            except Exception:
+                continue
+    return s
+
+def whitelist_db_label(result, message, name=None, uuid=None):
+    """Whitelist label stored in servers.db.
+
+    Same text as the live label (whitelist_result_label), with the probe
+    account's name replaced by "[name]" and its UUID by "[uuid]".
+    """
+    return redact_probe_names(whitelist_result_label(result, message), name, uuid)
+
+def log_whitelist_probe(entry, result, message, account=None, scrub=None):
+    account = account if isinstance(account, dict) else {}
+    name = account.get("name", "")
+    uuid = account.get("uuid", "")
+    if isinstance(scrub, (list, tuple)) and len(scrub) == 2:
+        name = scrub[0] or name
+        uuid = scrub[1] or uuid
+    # Offline (no-account) probes log in as OFFLINE_PROBE_NAME; redact that
+    # too, but leave the log's account field empty when no account was used.
+    redact_name = name or OFFLINE_PROBE_NAME
+    account_name = "[name]" if name else ""
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         ip = entry.get("ip", "")
         protocol = entry.get("protocol", "")
         version = sanitize_motd(entry.get("version", ""))
-        account_name = (account or {}).get("name", "")
-        token_source = (account or {}).get("token_source", "")
+        token_source = account.get("token_source", "")
         if result is True:
             status = "WHITELIST"
         elif result is False:
             status = "NOT_WHITELISTED"
         else:
             status = "UNKNOWN"
+        body = redact_probe_names(minecraft_text_component_to_plain(message or ""), redact_name, uuid)
         line = (
             f"{ts} | {ip} | protocol={protocol} | version={version} | "
             f"account={account_name} | token={token_source} | {status} | "
-            f"{minecraft_text_component_to_plain(message or '')}\n"
+            f"{body}\n"
         )
         with _WHITELIST_LOG_LOCK:
             with open(WHITELIST_LOG_FILE, "a", encoding="utf-8") as f:
@@ -3070,7 +3109,7 @@ def log_whitelist_probe(entry, result, message, account=None):
     except Exception:
         pass
     try:
-        update_server_whitelist(entry.get("ip", ""), whitelist_result_label(result, message))
+        update_server_whitelist(entry.get("ip", ""), whitelist_db_label(result, message, redact_name, uuid))
     except Exception:
         pass
 
@@ -3322,7 +3361,9 @@ def run_bulk_whitelist_verifier_async(entries, accounts, proxies, callback, prog
                             excluded.add(key)
                         continue
                     break
-            log_whitelist_probe(entry, result, message, account=account_used)
+            log_whitelist_probe(entry, result, message, account=account_used,
+                                scrub=((account_used or {}).get("name"),
+                                       (account_used or {}).get("uuid")))
             try:
                 callback(entry, result, message, account_used, proxy)
             except Exception:
