@@ -52,6 +52,11 @@ Protocol
 
       {"servers": [...deltas...], "now": T, "merged": M, "total": N}
 
+  Clients that know the seq protocol pass ``since_seq`` instead (and for
+  ``GET``, ``?since_seq=N``): every insert/change bumps the row's ``seq``,
+  so paging ``seq > since_seq`` can never miss rows that arrived with old
+  ``last_seen`` timestamps. Replies carry ``"has_seq": true``.
+
 Row shape (mirrors the client's ``servers.db``)::
 
     {"ip_port": "1.2.3.4:25565", "host": "1.2.3.4", "port": 25565,
@@ -107,7 +112,8 @@ SCHEMA = (
     " first_seen REAL DEFAULT 0,"
     " last_seen REAL DEFAULT 0,"
     " times_seen INTEGER DEFAULT 1,"
-    " last_source TEXT DEFAULT ''"
+    " last_source TEXT DEFAULT '',"
+    " seq INTEGER DEFAULT 0"
     ")"
 )
 
@@ -187,12 +193,30 @@ def db_connect(db_path):
     return con
 
 
+def _add_column_if_missing(con, column, ddl):
+    try:
+        existing = {row[1] for row in con.execute("PRAGMA table_info(servers)")}
+        if column not in existing:
+            con.execute(f"ALTER TABLE servers ADD COLUMN {column} {ddl}")
+    except Exception:
+        pass
+
+
 def init_db(db_path):
     con = db_connect(db_path)
     try:
         con.execute(SCHEMA)
         con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen "
                     "ON servers(last_seen DESC)")
+        # Transport cursor for sync: every insert/change gets a fresh seq, so
+        # clients page by seq (not wall-clock) and can never miss rows that
+        # arrived with old last_seen timestamps.
+        _add_column_if_missing(con, "seq", "INTEGER DEFAULT 0")
+        try:
+            con.execute("UPDATE servers SET seq=rowid WHERE seq IS NULL OR seq=0")
+        except Exception:
+            pass
+        con.execute("CREATE INDEX IF NOT EXISTS idx_servers_seq ON servers(seq ASC)")
         con.commit()
     finally:
         con.close()
@@ -288,8 +312,10 @@ def merge_row(con, row):
         con.execute(
             "INSERT INTO servers (ip_port, host, port, motd, players_online,"
             " max_players, version, protocol, cracked, whitelist,"
-            " first_seen, last_seen, times_seen, last_source)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " first_seen, last_seen, times_seen, last_source,"
+            " seq)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM servers))",
             (row["ip_port"], row["host"], row["port"], row["motd"],
              row["players_online"], row["max_players"], row["version"],
              row["protocol"], row["cracked"], row["whitelist"],
@@ -350,7 +376,8 @@ def merge_row(con, row):
     con.execute(
         "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
         " max_players=?, version=?, protocol=?, cracked=?, whitelist=?,"
-        " first_seen=?, last_seen=?, times_seen=?, last_source=?"
+        " first_seen=?, last_seen=?, times_seen=?, last_source=?,"
+        " seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM servers)"
         " WHERE ip_port=?",
         (row["host"], row["port"], motd, online, maximum, version, protocol,
          cracked, whitelist, first_seen, last_seen, times_seen, src,
@@ -542,6 +569,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             qs = parse_qs(parsed.query or "")
             try:
+                since_seq = (qs.get("since_seq") or [None])[0]
+                since_seq = None if since_seq is None else int(since_seq)
+            except Exception:
+                since_seq = None
+            try:
                 since = float((qs.get("since") or ["0"])[0])
             except Exception:
                 since = 0.0
@@ -554,14 +586,20 @@ class Handler(BaseHTTPRequestHandler):
                 con = db_connect(self.server.db_path)
                 try:
                     con.row_factory = sqlite3.Row
-                    cur = con.execute(
-                        "SELECT * FROM servers WHERE last_seen > ?"
-                        " ORDER BY last_seen ASC LIMIT ?", (since, limit))
+                    if since_seq is not None:
+                        cur = con.execute(
+                            "SELECT * FROM servers WHERE seq > ?"
+                            " ORDER BY seq ASC LIMIT ?", (since_seq, limit))
+                    else:
+                        cur = con.execute(
+                            "SELECT * FROM servers WHERE last_seen > ?"
+                            " ORDER BY last_seen ASC LIMIT ?", (since, limit))
                     rows = [dict(r) for r in cur.fetchall()]
                     total = con.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
                 finally:
                     con.close()
-            self._send_json(200, {"servers": rows, "now": _utcnow(), "total": total})
+            self._send_json(200, {"servers": rows, "now": _utcnow(), "total": total,
+                                  "has_seq": True})
             return
         self._send_json(404, {"error": "not found"})
 
@@ -589,6 +627,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "bad 'servers' list"})
             return
         try:
+            since_seq = payload.get("since_seq", None)
+            since_seq = None if since_seq is None else int(since_seq)
+        except Exception:
+            since_seq = None
+        try:
             since = float(payload.get("since", 0) or 0)
         except Exception:
             since = 0.0
@@ -607,16 +650,23 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                 con.commit()
                 con.row_factory = sqlite3.Row
-                cur = con.execute(
-                    "SELECT * FROM servers WHERE last_seen > ?"
-                    " ORDER BY last_seen ASC LIMIT ?",
-                    (since, MAX_SERVERS_PER_RESPONSE))
+                if since_seq is not None:
+                    cur = con.execute(
+                        "SELECT * FROM servers WHERE seq > ?"
+                        " ORDER BY seq ASC LIMIT ?",
+                        (since_seq, MAX_SERVERS_PER_RESPONSE))
+                else:
+                    cur = con.execute(
+                        "SELECT * FROM servers WHERE last_seen > ?"
+                        " ORDER BY last_seen ASC LIMIT ?",
+                        (since, MAX_SERVERS_PER_RESPONSE))
                 deltas = [dict(r) for r in cur.fetchall()]
                 total = con.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
             finally:
                 con.close()
         self._send_json(200, {"servers": deltas, "now": _utcnow(),
-                              "merged": merged, "total": total})
+                              "merged": merged, "total": total,
+                              "has_seq": True})
 
 
 def main(argv=None):

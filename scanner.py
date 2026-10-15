@@ -556,22 +556,28 @@ def netdb_load_config():
         with open(NETDB_CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"url": "", "token": "", "last_sync": 0.0}
+            return {"url": "", "token": "", "last_sync": 0.0, "last_seq": 0}
     except Exception:
-        return {"url": "", "token": "", "last_sync": 0.0}
+        return {"url": "", "token": "", "last_sync": 0.0, "last_seq": 0}
+    try:
+        last_seq = int(data.get("last_seq", 0) or 0)
+    except Exception:
+        last_seq = 0
     return {
         "url": str(data.get("url", "") or "").strip().rstrip("/"),
         "token": str(data.get("token", "") or "").strip(),
         "last_sync": float(data.get("last_sync", 0) or 0),
+        "last_seq": max(0, last_seq),
     }
 
 
-def netdb_save_config(url, token, last_sync=0.0):
+def netdb_save_config(url, token, last_sync=0.0, last_seq=0):
     try:
         with open(NETDB_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({"url": (url or "").strip().rstrip("/"),
                        "token": (token or "").strip(),
-                       "last_sync": float(last_sync or 0)}, f, indent=2)
+                       "last_sync": float(last_sync or 0),
+                       "last_seq": int(last_seq or 0)}, f, indent=2)
     except Exception:
         pass
 
@@ -860,11 +866,14 @@ def netdb_sync_once(url, token, timeout=None):
         raise ConnectionError("enter the shared-DB URL and token first")
     cfg = netdb_load_config()
     since = cfg.get("last_sync", 0) or 0
+    last_seq = cfg.get("last_seq", 0) or 0
 
-    def post(servers, cursor):
+    def post(servers, cursor, cursor_seq=None):
+        payload = {"servers": servers, "since": cursor}
+        if cursor_seq is not None:
+            payload["since_seq"] = cursor_seq
         return _netdb_request(url + "/api/sync", token, method="POST",
-                              payload={"servers": servers, "since": cursor},
-                              timeout=timeout)
+                              payload=payload, timeout=timeout)
 
     # --- upload: batch until clean (flags of uncollected rows stay set) ---
     uploaded = 0
@@ -888,15 +897,19 @@ def netdb_sync_once(url, token, timeout=None):
             break
 
     # --- download: page until drained (empty upload, advancing cursor) ---
-    # Rows are keyed by ip_port across pages: ties on the boundary timestamp
-    # re-fetch (server uses strict >) but never double-merge, and pages that
-    # add nothing new end the loop even when full (pathological ties).
+    # Preferred: seq cursor (unique per change, immune to old-timestamp
+    # stragglers and boundary ties). Legacy servers without has_seq fall
+    # back to the timestamp cursor with ip dedup. since_seq is always sent;
+    # old servers simply ignore the unknown field.
     remote_by_ip: dict = {}
-    cursor = since
     total_remote = 0
     now = time.time()
+    use_seq = False
+    new_seq = last_seq
+    cursor_seq = last_seq
+    cursor = since
     for _ in range(NETDB_MAX_ROUNDS):
-        resp = post([], cursor)
+        resp = post([], cursor, cursor_seq)
         try:
             total_remote = int(resp.get("total", 0) or 0)
         except Exception:
@@ -905,25 +918,46 @@ def netdb_sync_once(url, token, timeout=None):
             now = float(resp.get("now", now) or now)
         except Exception:
             pass
+        if isinstance(resp, dict) and resp.get("has_seq"):
+            use_seq = True
         batch = resp.get("servers", []) if isinstance(resp, dict) else []
         if not batch:
             break
         fresh = 0
-        top = cursor
+        top_ts = cursor
+        top_seq = cursor_seq
         for r in batch:
             if not isinstance(r, dict):
                 continue
-            try:
-                ts = float(r.get("last_seen", 0) or 0)
-            except Exception:
-                ts = 0.0
-            if ts > top:
-                top = ts
+            if use_seq:
+                try:
+                    sq = int(r.get("seq", 0) or 0)
+                except Exception:
+                    sq = 0
+                if sq > top_seq:
+                    top_seq = sq
+            else:
+                try:
+                    ts = float(r.get("last_seen", 0) or 0)
+                except Exception:
+                    ts = 0.0
+                if ts > top_ts:
+                    top_ts = ts
             ip = str(r.get("ip_port", "") or "")
             if ip and ip not in remote_by_ip:
                 fresh += 1
             if ip:
                 remote_by_ip[ip] = r
+        if use_seq:
+            # seq is unique per change: advance exactly, no overlap possible.
+            if top_seq <= cursor_seq:
+                break
+            cursor_seq = top_seq
+            if top_seq > new_seq:
+                new_seq = top_seq
+            if len(batch) < NETDB_PAGE_SIZE or fresh == 0:
+                break
+            continue
         if len(batch) < NETDB_PAGE_SIZE or fresh == 0:
             break
         # Advance past this page. Back off 1ms only when the top timestamp
@@ -931,10 +965,10 @@ def netdb_sync_once(url, token, timeout=None):
         # unique tops advance exactly with zero re-fetch.
         try:
             ties = sum(1 for r in batch if isinstance(r, dict)
-                       and float(r.get("last_seen", 0) or 0) == top)
+                       and float(r.get("last_seen", 0) or 0) == top_ts)
         except Exception:
             ties = 0
-        nxt = top - 0.001 if ties > 1 else top
+        nxt = top_ts - 0.001 if ties > 1 else top_ts
         if nxt <= cursor:
             break
         cursor = nxt
@@ -942,7 +976,7 @@ def netdb_sync_once(url, token, timeout=None):
 
     # ...then merge what the others found.
     inserted, updated = netdb_merge_remote(remote_all, last_watermark)
-    netdb_save_config(url, token, now)
+    netdb_save_config(url, token, now, new_seq if use_seq else last_seq)
     return {"uploaded": uploaded,
             "merged_on_server": merged_on_server,
             "downloaded": len(remote_all),
