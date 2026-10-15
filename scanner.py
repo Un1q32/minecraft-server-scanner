@@ -5729,7 +5729,7 @@ from PySide6.QtCore import Qt, QTimer
 
 
 
-class AccountTab(QWidget):
+class AccountTab(QtBaseMixin, QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._probe_results = {}   # account key -> (ok, message)
@@ -5737,18 +5737,6 @@ class AccountTab(QWidget):
         self.status_text = "Ready."
         self._build_ui()
         self.refresh()
-
-    # -- helpers provided locally (contract assumes QtBaseMixin provides
-    # -- after()/set_status(); defined here so the file is standalone) --
-    def after(self, ms, func):
-        QTimer.singleShot(int(ms), func)
-
-    def set_status(self, msg):
-        self.status_text = msg
-        try:
-            self.status_label.setText(msg)
-        except Exception:
-            pass
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
