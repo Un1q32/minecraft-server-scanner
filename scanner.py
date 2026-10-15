@@ -4008,18 +4008,18 @@ class ScanStopped(Exception):
 
 
 # ==================== MINESCAN BACKEND ====================
-# Phase 1 alternative based on msrustmod (~/Downloads/msrustmod): the Rust
-# `webscan` binary (~/Downloads/minescan, `cargo build --release`) does
-# unprivileged async TCP + Minecraft Server List Ping and streams NDJSON
-# hits on stdout plus an "Attempts: … | TCP Open: … | Minecraft: …" progress
-# line on stderr. No root, no sudo, no raw sockets — unlike masscan.
+# Unprivileged alternative to masscan: the companion Rust `webscan` scanner
+# (`cargo build --release`) does unprivileged async TCP + Minecraft Server
+# List Ping and streams NDJSON hits on stdout plus an
+# "Attempts: … | TCP Open: … | Minecraft: …" progress line on stderr.
+# No root, no sudo, no raw sockets — unlike masscan.
 #
 # Like the masscan path, each hit is handed to the table/DB the moment it
 # arrives; webscan already did the Minecraft handshake, so no second pool
 # is needed.
 
-MINESCAN_CONCURRENCY = 500  # same as msrustmod (threads)
-MINESCAN_RETRIES = 1  # same as msrustmod (webscan default)
+MINESCAN_CONCURRENCY = 500  # webscan default (threads)
+MINESCAN_RETRIES = 1  # webscan default
 # Default minescan handshake rate (full TCP+Minecraft handshakes/sec from
 # this host). Deliberately gentle: burst rates trip target-side flood
 # protection and servers get MISSED (a /24 at 10k/s = 254 SYNs in ~25ms,
@@ -4060,7 +4060,6 @@ def locate_minescan_binary(override=""):
         # scanner.py and it is picked up with zero configuration.
         candidates.append(os.path.join(here, "webscan"))
     candidates += [
-        os.path.expanduser("~/Downloads/minescan/target/release/webscan"),
         os.path.abspath(os.path.join("minescan", "target", "release", "webscan")),
         os.path.abspath("webscan"),
     ]
@@ -4094,8 +4093,8 @@ def is_minescan_available(override=""):
 def minescan_status_line(override=""):
     exe = locate_minescan_binary(override)
     if not exe:
-        return ("minescan: webscan binary not found (cargo build --release "
-                "in ~/Downloads/minescan, or set WEBSCAN_BIN)")
+        return ("minescan: webscan binary not found (build it with "
+                "`cargo build --release` from the webscan source, or set WEBSCAN_BIN)")
     if not is_minescan_available(override):
         return f"minescan: {exe} (--help check failed)"
     return f"minescan: {exe} (unprivileged async, no sudo needed)"
@@ -4179,7 +4178,7 @@ def parse_minescan_stats(segment):
 
 
 def build_minescan_inputs(target_text, ports, max_hosts=MINESCAN_MAX_HOSTS):
-    """Convert GUI target text into webscan runs (mirrors msrustmod).
+    """Convert GUI target text into webscan runs.
 
     IPs/CIDRs/ASN prefixes stream natively (never expanded, never capped);
     dash ranges, hostnames and ip:port entries expand to IPs (bounded by
@@ -4374,8 +4373,8 @@ def run_minescan_streaming(targets, ports, rate=0, concurrency=MINESCAN_CONCURRE
     exe = exe or locate_minescan_binary()
     if not exe:
         raise FileNotFoundError(
-            "webscan binary not found. Build it with `cargo build --release` in "
-            "~/Downloads/minescan (binary: target/release/webscan) or set WEBSCAN_BIN.")
+            "webscan binary not found. Build it with `cargo build --release` from "
+            "the webscan source (binary: target/release/webscan) or set WEBSCAN_BIN.")
     ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
     targets = [t for t in (targets or []) if t]
     if not targets:
@@ -6873,8 +6872,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 masscan_up = use_masscan and is_masscan_available()
                 minescan_up = use_minescan and is_minescan_available()
                 if strict_minescan and not minescan_up:
-                    say("minescan/webscan not found; build it (cargo build --release in "
-                        "~/Downloads/minescan), set WEBSCAN_BIN, or use another backend.")
+                    say("minescan/webscan not found; build it (`cargo build --release` "
+                        "from the webscan source), set WEBSCAN_BIN, or use another backend.")
                     go_idle()
                     return
                 if strict_masscan and not masscan_up:
@@ -7160,7 +7159,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                 if auto and not masscan_up and not minescan_up:
                     say("masscan/minescan not found; Python scan...")
                 if minescan_up and not skip_python and (masscan_failed or not masscan_tried):
-                    # ---- minescan path (msrustmod-style): webscan already did
+                    # ---- minescan path: webscan already did
                     # TCP + Minecraft handshake per hit, so results stream
                     # straight to the table/DB with no second pool. ----
                     try:

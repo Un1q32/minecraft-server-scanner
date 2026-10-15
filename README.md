@@ -40,9 +40,10 @@ The Backend selector controls port discovery:
 - `masscan (fast SYN + handshake)`: requires masscan and fails clearly when it is missing or unprivileged instead of falling back.
 - `Python (handshake only)`: original ThreadPool handshake scan, no helpers.
 
-The minescan backend is the Rust `webscan` scanner: drop the built binary
-next to `scanner.py` (as `webscan`), or `cargo build --release` in
-`~/Downloads/minescan`, or point `WEBSCAN_BIN` at it. Targets (IPs, CIDRs,
+The minescan backend is the companion Rust `webscan` scanner: drop the built
+binary next to `scanner.py` (as `webscan`), build it with
+`cargo build --release` from the webscan source (binary:
+`target/release/webscan`), or point `WEBSCAN_BIN` at it. Targets (IPs, CIDRs,
 ASN prefixes) stream to it natively; hits arrive with MOTD/players/version
 already known, so no second handshake pool is needed. It scans at a
 deliberate 500 concurrent connections with 1 retry per host (tunable via
