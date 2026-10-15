@@ -2971,6 +2971,17 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
             continue
         return result, message
 
+def whitelist_login_showed_offline(message):
+    """True when a whitelist probe message proves the server accepted an
+    offline-mode (no Mojang auth) login: Login Success without encryption,
+    a decision kick without encryption, or a progressed login-plugin /
+    configuration stage without encryption. Auth rejections, throttles,
+    timeouts and version mismatches never carry the marker."""
+    low = (message or "").lower()
+    return ("[offline-mode, no mojang auth used]" in low
+            or "offline login accepted as" in low)
+
+
 def _probe_whitelist_entry(entry, account, proxy=None):
     ip = entry.get("ip")
     if not ip:
@@ -2985,7 +2996,22 @@ def _probe_whitelist_entry(entry, account, proxy=None):
     except Exception:
         protocol = None
     version_hint = entry.get("version", "") or ""
-    return whitelist_login_probe(host, port, account=account, protocol=protocol, proxy=proxy, version_hint=version_hint)
+    result, message = whitelist_login_probe(host, port, account=account, protocol=protocol, proxy=proxy, version_hint=version_hint)
+    if whitelist_login_showed_offline(message):
+        # The server let an offline login through: by definition cracked,
+        # even when the status-ping heuristic said otherwise. Record it in
+        # the DB + cracked cache (extra=None so cached MOTD/version survive)
+        # and flag the entry so result tables refresh the live row.
+        try:
+            record_cracked_server(ip, "CRACKED (offline login accepted during whitelist check)")
+        except Exception:
+            pass
+        try:
+            if isinstance(entry, dict):
+                entry["offline_accepted"] = True
+        except Exception:
+            pass
+    return result, message
 
 def whitelist_result_label(result, message):
     if result is True:
@@ -3089,10 +3115,15 @@ def check_selected_whitelist(parent, tree):
     def on_update(entry, result, message):
         label = whitelist_result_label(result, message)
         ip = entry.get("ip")
+        cracked = bool(entry.get("offline_accepted"))
         for iid in tree.get_children(""):
             vals = tree.item(iid, "values")
             if vals and vals[columns.index("ip")] == ip:
-                parent.after(0, lambda i=iid, v=label: tree.set(i, "whitelist", v))
+                def _apply(i=iid, v=label, c=cracked):
+                    tree.set(i, "whitelist", v)
+                    if c and "cracked" in columns:
+                        tree.set(i, "cracked", "Yes")
+                parent.after(0, _apply)
                 break
     def progress(done, total):
         parent.after(0, lambda: setattr(parent, "_whitelist_manual_status", f"Whitelist check: {done}/{total}"))
@@ -7273,8 +7304,15 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         label = whitelist_result_label(result, message)
-                        self.after(0, lambda ip=entry.get("ip"), label=label:
-                                   self._update_scan_row_whitelist(ip, label))
+                        ip = entry.get("ip")
+                        cracked = bool(entry.get("offline_accepted"))
+
+                        def ui():
+                            self._update_scan_row_whitelist(ip, label)
+                            if cracked:
+                                self._update_scan_row_cracked(ip, "Yes")
+
+                        self.after(0, ui)
 
                     def handle_progress(done, total):
                         if whitelist_job != self._whitelist_job_id:
@@ -9398,10 +9436,13 @@ class ShodanTab(QWidget, QtBaseMixin):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         ip = entry.get("ip")
+                        cracked = bool(entry.get("offline_accepted"))
 
                         def ui():
                             label = whitelist_result_label(result, message)
                             self._update_scan_row_whitelist(ip, label)
+                            if cracked:
+                                self._update_scan_row_cracked(ip, "Yes")
 
                         self.after(0, ui)
 
@@ -10050,10 +10091,13 @@ class JSONTab(QWidget, QtBaseMixin):
                         if whitelist_job != self._whitelist_job_id:
                             return
                         ip = entry.get("ip")
+                        cracked = bool(entry.get("offline_accepted"))
 
                         def ui():
                             label = whitelist_result_label(result, message)
                             self._update_scan_row_whitelist(ip, label)
+                            if cracked:
+                                self._update_scan_row_cracked(ip, "Yes")
                         self.after(0, ui)
 
                     def handle_whitelist_progress(done, total):
@@ -10385,10 +10429,19 @@ class ReasonFileTab(QWidget, QtBaseMixin):
         def update(entry, result, message):
             ip = entry.get("ip")
             label = whitelist_result_label(result, message)
+            cracked = bool(entry.get("offline_accepted"))
             for iid in self.tree.get_children(""):
                 values = self.tree.item(iid, "values")
                 if values and values[0] == ip:
-                    self.after(0, lambda i=iid, v=label: self.tree.set(i, "whitelist", v))
+                    def _apply(i=iid, v=label, c=cracked):
+                        self.tree.set(i, "whitelist", v)
+                        try:
+                            cols = list(self.tree["columns"])
+                        except Exception:
+                            cols = []
+                        if c and "cracked" in cols:
+                            self.tree.set(i, "cracked", "Yes")
+                    self.after(0, _apply)
                     break
 
         def progress(done, total):
