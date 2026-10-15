@@ -10644,7 +10644,6 @@ class FullAppGUI(QMainWindow):
         self.shodan_tab = ShodanTab(nb)
 
         nb.addTab(self.network_tab, "Network Scan")
-        nb.addTab(self.json_tab, "JSON Search")
         nb.addTab(self.servers_tab, "Servers")
         nb.addTab(self.import_tab, "Export To MC")
         nb.addTab(self.saved_tab, "Saved List")
@@ -10654,6 +10653,7 @@ class FullAppGUI(QMainWindow):
         nb.addTab(self.proxy_tab, "Proxies")
         nb.addTab(self.monitor_tab, "Server Monitor")
         nb.addTab(self.shodan_tab, "Shodan")
+        nb.addTab(self.json_tab, "JSON Search")
 
         USER_LOG_MANAGER.attach_tab(self.user_log_tab)
 
