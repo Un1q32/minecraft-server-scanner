@@ -425,9 +425,12 @@ def update_server_whitelist(ip_port, whitelist_label):
     _notify_server_db_tab()
 
 
-def query_server_db(search="", limit=10000):
+def query_server_db(search="", limit=None):
     _ensure_server_db()
-    """Return list of dicts newest-first, filtered by ip/motd/version substring."""
+    """Return list of dicts newest-first, filtered by ip/motd/version substring.
+
+    limit=None (default) returns everything: the history DB is uncapped.
+    """
     import sqlite3
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
@@ -435,14 +438,21 @@ def query_server_db(search="", limit=10000):
             con.row_factory = sqlite3.Row
             if search:
                 like = f"%{search}%"
-                cur = con.execute(
-                    "SELECT * FROM servers WHERE ip_port LIKE ? OR motd LIKE ?"
-                    " OR version LIKE ? ORDER BY last_seen DESC LIMIT ?",
-                    (like, like, like, limit),
-                )
+                base = ("SELECT * FROM servers WHERE ip_port LIKE ? OR motd LIKE ?"
+                        " OR version LIKE ? ORDER BY last_seen DESC")
+                args: tuple = (like, like, like)
             else:
-                cur = con.execute("SELECT * FROM servers ORDER BY last_seen DESC LIMIT ?",
-                                  (limit,))
+                base = "SELECT * FROM servers ORDER BY last_seen DESC"
+                args = ()
+            if limit:
+                try:
+                    limit = max(1, int(limit))
+                except Exception:
+                    limit = None
+            if limit:
+                cur = con.execute(base + " LIMIT ?", args + (limit,))
+            else:
+                cur = con.execute(base, args)
             return [dict(r) for r in cur.fetchall()]
         finally:
             con.close()
@@ -535,6 +545,10 @@ def _ensure_server_db():
 NETDB_CONFIG_FILE = "netdb.json"
 NETDB_TIMEOUT = 30
 NETDB_MAX_UPLOAD = 20000
+# Matches dbserver.py's MAX_SERVERS_PER_RESPONSE: one /api/sync reply carries
+# at most this many rows, so big first-sync downloads page through it.
+NETDB_PAGE_SIZE = 50000
+NETDB_MAX_ROUNDS = 500
 
 
 def netdb_load_config():
@@ -641,15 +655,31 @@ def netdb_collect_dirty():
             con.close()
 
 
-def netdb_mark_synced(watermark):
-    """Clear the dirty flag on rows uploaded (i.e. unchanged since collect)."""
+def netdb_mark_synced(ip_ports, watermark):
+    """Clear the dirty flag on uploaded rows (i.e. unchanged since collect).
+
+    Matched by identity (ip_port), not just timestamp: rows sharing the
+    batch's max last_seen that were never uploaded must stay dirty.
+    """
     _ensure_server_db()
+    if not ip_ports:
+        return
+    try:
+        watermark = float(watermark or 0)
+    except Exception:
+        watermark = 0.0
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
             try:
-                con.execute("UPDATE servers SET needs_sync=0 WHERE needs_sync=1"
-                            " AND last_seen <= ?", (watermark,))
+                ids = list(dict.fromkeys(str(ip) for ip in ip_ports if ip))
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    con.execute(
+                        "UPDATE servers SET needs_sync=0 WHERE needs_sync=1"
+                        " AND last_seen <= ? AND ip_port IN (%s)"
+                        % ",".join("?" * len(chunk)),
+                        (watermark, *chunk))
                 con.commit()
             except Exception:
                 pass
@@ -657,17 +687,20 @@ def netdb_mark_synced(watermark):
             con.close()
 
 
-def netdb_merge_remote(servers, upload_watermark=0.0):
+def netdb_merge_remote(servers, upload_watermark=None):
     """Merge downloaded rows into the local DB. Returns (inserted, updated).
 
     Merged-in rows are already on the server so they arrive clean
     (needs_sync=0) -- unless the row changed locally mid-sync
-    (last_seen past the upload watermark), in which case it stays dirty.
+    (last_seen past the upload watermark), in which case it stays dirty,
+    or no upload ran at all, in which case a pre-existing dirty flag is
+    preserved rather than wiped.
     """
     _ensure_server_db()
     if not servers:
         return 0, 0
     inserted = updated = 0
+    no_upload = upload_watermark is None
     try:
         upload_watermark = float(upload_watermark or 0)
     except Exception:
@@ -693,12 +726,12 @@ def netdb_merge_remote(servers, upload_watermark=0.0):
                     r_times = 1
                 cur = con.execute("SELECT motd, players_online, max_players, version,"
                                   " protocol, cracked, whitelist, first_seen, last_seen,"
-                                  " times_seen, last_source FROM servers WHERE ip_port=?",
+                                  " times_seen, last_source, needs_sync FROM servers WHERE ip_port=?",
                                   (ip_port,))
                 old = cur.fetchone()
                 if old is None:
-                    con.execute(
-                        "INSERT INTO servers (ip_port, host, port, motd, players_online,"
+                    cur = con.execute(
+                        "INSERT OR IGNORE INTO servers (ip_port, host, port, motd, players_online,"
                         " max_players, version, protocol, cracked, whitelist,"
                         " first_seen, last_seen, times_seen, last_source, needs_sync)"
                         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
@@ -711,10 +744,17 @@ def netdb_merge_remote(servers, upload_watermark=0.0):
                          str(raw.get("whitelist", "") or ""),
                          r_first or r_last, r_last or r_first, max(1, r_times),
                          str(raw.get("last_source", "") or "netdb")))
-                    inserted += 1
+                    if cur.rowcount:
+                        inserted += 1
+                    else:
+                        # Appeared locally mid-sync (concurrent rescan won the
+                        # race): keep it dirty so its sighting uploads next.
+                        con.execute("UPDATE servers SET needs_sync=1 WHERE ip_port=?",
+                                    (ip_port,))
+                        updated += 1
                     continue
                 (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
-                 o_first, o_last, o_times, o_src) = old
+                 o_first, o_last, o_times, o_src, o_dirty) = old
                 try:
                     o_first = float(o_first or 0)
                 except Exception:
@@ -755,7 +795,14 @@ def netdb_merge_remote(servers, upload_watermark=0.0):
                 times_seen = max(o_times, r_times) + (1 if remote_newer else 0)
                 # Keep the row dirty if it changed locally after we collected
                 # the upload batch (its new sighting still needs uploading).
-                still_dirty = 1 if o_last > upload_watermark else 0
+                # With no upload phase, preserve whatever flag is there.
+                if no_upload:
+                    try:
+                        still_dirty = 1 if int(o_dirty or 0) else 0
+                    except Exception:
+                        still_dirty = 0
+                else:
+                    still_dirty = 1 if o_last > upload_watermark else 0
                 con.execute(
                     "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
                     " max_players=?, version=?, protocol=COALESCE(?, protocol),"
@@ -801,29 +848,106 @@ def netdb_get_credentials():
 
 
 def netdb_sync_once(url, token, timeout=None):
-    """Bidirectional sync. Returns summary dict. Raises ConnectionError."""
+    """Bidirectional sync, no row caps. Returns summary dict. Raises ConnectionError.
+
+    Uploads loop in NETDB_MAX_UPLOAD batches until no dirty rows remain;
+    downloads page through /api/sync until the server has nothing newer than
+    our watermark, so arbitrarily large DBs sync completely (just in rounds).
+    """
     url = (url or "").strip().rstrip("/")
     token = (token or "").strip()
     if not url or not token:
         raise ConnectionError("enter the shared-DB URL and token first")
     cfg = netdb_load_config()
     since = cfg.get("last_sync", 0) or 0
-    dirty_rows, watermark = netdb_collect_dirty()
-    resp = _netdb_request(url + "/api/sync", token, method="POST",
-                          payload={"servers": dirty_rows, "since": since},
-                          timeout=timeout)
-    # Upload accepted: clear flags (only rows unchanged since collect)...
-    netdb_mark_synced(watermark)
+
+    def post(servers, cursor):
+        return _netdb_request(url + "/api/sync", token, method="POST",
+                              payload={"servers": servers, "since": cursor},
+                              timeout=timeout)
+
+    # --- upload: batch until clean (flags of uncollected rows stay set) ---
+    uploaded = 0
+    merged_on_server = 0
+    last_watermark = None
+    for _ in range(NETDB_MAX_ROUNDS):
+        dirty_rows, watermark = netdb_collect_dirty()
+        if not dirty_rows:
+            break
+        last_watermark = watermark
+        resp = post(dirty_rows, since)
+        try:
+            merged_on_server += int(resp.get("merged", 0) or 0)
+        except Exception:
+            pass
+        # Upload accepted: clear flags (only rows unchanged since collect)...
+        netdb_mark_synced([r.get("ip_port") for r in dirty_rows
+                           if isinstance(r, dict)], watermark)
+        uploaded += len(dirty_rows)
+        if len(dirty_rows) < NETDB_MAX_UPLOAD:
+            break
+
+    # --- download: page until drained (empty upload, advancing cursor) ---
+    # Rows are keyed by ip_port across pages: ties on the boundary timestamp
+    # re-fetch (server uses strict >) but never double-merge, and pages that
+    # add nothing new end the loop even when full (pathological ties).
+    remote_by_ip: dict = {}
+    cursor = since
+    total_remote = 0
+    now = time.time()
+    for _ in range(NETDB_MAX_ROUNDS):
+        resp = post([], cursor)
+        try:
+            total_remote = int(resp.get("total", 0) or 0)
+        except Exception:
+            pass
+        try:
+            now = float(resp.get("now", now) or now)
+        except Exception:
+            pass
+        batch = resp.get("servers", []) if isinstance(resp, dict) else []
+        if not batch:
+            break
+        fresh = 0
+        top = cursor
+        for r in batch:
+            if not isinstance(r, dict):
+                continue
+            try:
+                ts = float(r.get("last_seen", 0) or 0)
+            except Exception:
+                ts = 0.0
+            if ts > top:
+                top = ts
+            ip = str(r.get("ip_port", "") or "")
+            if ip and ip not in remote_by_ip:
+                fresh += 1
+            if ip:
+                remote_by_ip[ip] = r
+        if len(batch) < NETDB_PAGE_SIZE or fresh == 0:
+            break
+        # Advance past this page. Back off 1ms only when the top timestamp
+        # is shared (a later page may still hold unseen rows with it);
+        # unique tops advance exactly with zero re-fetch.
+        try:
+            ties = sum(1 for r in batch if isinstance(r, dict)
+                       and float(r.get("last_seen", 0) or 0) == top)
+        except Exception:
+            ties = 0
+        nxt = top - 0.001 if ties > 1 else top
+        if nxt <= cursor:
+            break
+        cursor = nxt
+    remote_all = list(remote_by_ip.values())
+
     # ...then merge what the others found.
-    remote = resp.get("servers", []) if isinstance(resp, dict) else []
-    inserted, updated = netdb_merge_remote(remote, watermark)
-    now = float(resp.get("now", time.time()) or time.time())
+    inserted, updated = netdb_merge_remote(remote_all, last_watermark)
     netdb_save_config(url, token, now)
-    return {"uploaded": len(dirty_rows),
-            "merged_on_server": int(resp.get("merged", 0) or 0),
-            "downloaded": len(remote),
+    return {"uploaded": uploaded,
+            "merged_on_server": merged_on_server,
+            "downloaded": len(remote_all),
             "inserted": inserted, "updated": updated,
-            "total_remote": int(resp.get("total", 0) or 0),
+            "total_remote": total_remote,
             "now": now}
 
 ICON_ENABLED = True           
