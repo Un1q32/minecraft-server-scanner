@@ -259,6 +259,91 @@ def _add_column_if_missing(con, table, column, ddl):
         pass
 
 
+# Player-name tracking: every server keeps two lists, stored as JSON arrays.
+# players_now  = names in the latest status-ping player sample (currently online).
+# players_ever = union of every name ever seen in a sample (stays after logout).
+PLAYERS_EVER_MAX = 500  # cap per server; samples only hold ~12 names per sighting
+PLAYER_NAME_MAX_LEN = 32  # Minecraft names are <= 16 chars; allow extra headroom
+
+
+def _clean_player_name(name):
+    """One server-reported name -> cleaned string, or "" to drop."""
+    try:
+        cleaned = sanitize_motd(name)
+    except Exception:
+        return ""
+    if len(cleaned) > PLAYER_NAME_MAX_LEN:
+        cleaned = cleaned[:PLAYER_NAME_MAX_LEN].strip()
+    return cleaned
+
+
+def _sample_names(sample):
+    """Status-ping sample -> sorted unique names.
+
+    Accepts ping_server's [(uuid, name)] tuples or plain name strings.
+    Sorted for deterministic storage/merging; never raises.
+    """
+    try:
+        names = []
+        for item in sample or []:
+            try:
+                if isinstance(item, (list, tuple)):
+                    raw = item[1] if len(item) > 1 else ""
+                else:
+                    raw = item
+                cleaned = _clean_player_name(raw)
+                if cleaned:
+                    names.append(cleaned)
+            except Exception:
+                continue
+        return sorted(set(names), key=str.lower)
+    except Exception:
+        return []
+
+
+def _decode_player_list(value):
+    """Stored JSON (or raw list) -> sorted unique names. Never raises."""
+    try:
+        if isinstance(value, str):
+            parsed = json.loads(value) if value.strip() else []
+        else:
+            parsed = value
+        if not isinstance(parsed, list):
+            return []
+        names = [_clean_player_name(n) for n in parsed]
+        return sorted({n for n in names if n}, key=str.lower)
+    except Exception:
+        return []
+
+
+def _encode_player_list(names):
+    try:
+        return json.dumps(sorted({n for n in (names or []) if n}, key=str.lower),
+                          ensure_ascii=False)
+    except Exception:
+        return "[]"
+
+
+def _merge_player_lists(old, new):
+    """Union of two name lists, capped. Never raises.
+
+    Established (old) names always win: newcomers only fill remaining
+    slots, so a flood of junk names can never evict names already known.
+    """
+    try:
+        old_list = _decode_player_list(old)
+        new_list = _decode_player_list(new)
+        seen = set(old_list)
+        merged = list(old_list)
+        for name in sorted(set(new_list) - seen, key=str.lower):
+            if len(merged) >= PLAYERS_EVER_MAX:
+                break
+            merged.append(name)
+        return merged
+    except Exception:
+        return []
+
+
 def _server_db_connect():
     import sqlite3
     con = sqlite3.connect(SERVERS_DB_FILE, timeout=10)
@@ -288,12 +373,16 @@ def init_server_db():
                 " last_seen REAL DEFAULT 0,"
                 " times_seen INTEGER DEFAULT 1,"
                 " last_source TEXT DEFAULT '',"
-                " needs_sync INTEGER DEFAULT 1"
+                " needs_sync INTEGER DEFAULT 1,"
+                " players_now TEXT DEFAULT '[]',"
+                " players_ever TEXT DEFAULT '[]'"
                 ")"
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen ON servers(last_seen DESC)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_servers_version ON servers(version)")
             _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
+            _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
+            _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
             con.commit()
         finally:
             con.close()
@@ -327,23 +416,32 @@ def record_server_result(result, source="scan"):
     except Exception:
         protocol = None
     cracked = "Yes" if result.get("cracked") else "No"
+    # Player-name lists: the live sample is the current roster; the union of
+    # every sample ever seen stays after logout. Minescan hits carry no
+    # sample (webscan doesn't report one), so they must not blank the list
+    # a previous full ping established — only full pings refresh it.
+    sample_names = _sample_names(result.get("players_sample"))
+    has_sample = source != "minescan"
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            cur = con.execute("SELECT first_seen, times_seen, cracked, whitelist FROM servers WHERE ip_port=?",
+            cur = con.execute("SELECT first_seen, times_seen, cracked, whitelist, players_now, players_ever FROM servers WHERE ip_port=?",
                               (ip_port,))
             row = cur.fetchone()
             if row is None:
                 con.execute(
                     "INSERT INTO servers (ip_port, host, port, motd, players_online,"
                     " max_players, version, protocol, cracked, needs_sync,"
-                    " first_seen, last_seen, times_seen, last_source)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?)",
+                    " first_seen, last_seen, times_seen, last_source,"
+                    " players_now, players_ever)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?)",
                     (ip_port, host, port, motd, online, maximum, version,
-                     protocol, cracked, now, now, source),
+                     protocol, cracked, now, now, source,
+                     _encode_player_list(sample_names if has_sample else []),
+                     _encode_player_list(sample_names)),
                 )
             else:
-                first_seen, times_seen, old_cracked, old_whitelist = row
+                first_seen, times_seen, old_cracked, old_whitelist, old_now, old_ever = row
                 try:
                     times_seen = int(times_seen or 0) + 1
                 except Exception:
@@ -353,13 +451,17 @@ def record_server_result(result, source="scan"):
                 keep_cracked = old_cracked or cracked
                 if old_cracked in ("Yes", "Yes (cached)"):
                     keep_cracked = old_cracked
+                now_json = (_encode_player_list(sample_names) if has_sample
+                            else (old_now if old_now else "[]"))
+                ever_json = _encode_player_list(
+                    _merge_player_lists(old_ever, sample_names))
                 con.execute(
                     "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
                     " max_players=?, version=?, protocol=COALESCE(?, protocol),"
                     " cracked=?, needs_sync=1, last_seen=?, times_seen=?,"
-                    " last_source=? WHERE ip_port=?",
+                    " last_source=?, players_now=?, players_ever=? WHERE ip_port=?",
                     (host, port, motd, online, maximum, version, protocol,
-                     keep_cracked, now, times_seen, source, ip_port),
+                     keep_cracked, now, times_seen, source, now_json, ever_json, ip_port),
                 )
             con.commit()
         finally:
@@ -439,8 +541,9 @@ def query_server_db(search="", limit=None):
             if search:
                 like = f"%{search}%"
                 base = ("SELECT * FROM servers WHERE ip_port LIKE ? OR motd LIKE ?"
-                        " OR version LIKE ? ORDER BY last_seen DESC")
-                args: tuple = (like, like, like)
+                        " OR version LIKE ? OR players_now LIKE ?"
+                        " OR players_ever LIKE ? ORDER BY last_seen DESC")
+                args: tuple = (like, like, like, like, like)
             else:
                 base = "SELECT * FROM servers ORDER BY last_seen DESC"
                 args = ()
@@ -521,10 +624,14 @@ def _ensure_server_db():
                     " last_seen REAL DEFAULT 0,"
                     " times_seen INTEGER DEFAULT 1,"
                     " last_source TEXT DEFAULT '',"
-                    " needs_sync INTEGER DEFAULT 1"
+                    " needs_sync INTEGER DEFAULT 1,"
+                    " players_now TEXT DEFAULT '[]',"
+                    " players_ever TEXT DEFAULT '[]'"
                     ")"
                 )
                 _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
+                _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
+                _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
                 con.commit()
             finally:
                 con.close()
@@ -732,15 +839,17 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     r_times = 1
                 cur = con.execute("SELECT motd, players_online, max_players, version,"
                                   " protocol, cracked, whitelist, first_seen, last_seen,"
-                                  " times_seen, last_source, needs_sync FROM servers WHERE ip_port=?",
+                                  " times_seen, last_source, needs_sync, players_now,"
+                                  " players_ever FROM servers WHERE ip_port=?",
                                   (ip_port,))
                 old = cur.fetchone()
                 if old is None:
                     cur = con.execute(
                         "INSERT OR IGNORE INTO servers (ip_port, host, port, motd, players_online,"
                         " max_players, version, protocol, cracked, whitelist,"
-                        " first_seen, last_seen, times_seen, last_source, needs_sync)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                        " first_seen, last_seen, times_seen, last_source, needs_sync,"
+                        " players_now, players_ever)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                         (ip_port, host, port,
                          sanitize_motd(raw.get("motd", "")),
                          int(raw.get("players_online", 0) or 0),
@@ -749,7 +858,9 @@ def netdb_merge_remote(servers, upload_watermark=None):
                          raw.get("protocol"), str(raw.get("cracked", "") or ""),
                          str(raw.get("whitelist", "") or ""),
                          r_first or r_last, r_last or r_first, max(1, r_times),
-                         str(raw.get("last_source", "") or "netdb")))
+                         str(raw.get("last_source", "") or "netdb"),
+                         _encode_player_list(_decode_player_list(raw.get("players_now"))),
+                         _encode_player_list(_decode_player_list(raw.get("players_ever")))))
                     if cur.rowcount:
                         inserted += 1
                     else:
@@ -760,7 +871,7 @@ def netdb_merge_remote(servers, upload_watermark=None):
                         updated += 1
                     continue
                 (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
-                 o_first, o_last, o_times, o_src, o_dirty) = old
+                 o_first, o_last, o_times, o_src, o_dirty, o_now, o_ever) = old
                 try:
                     o_first = float(o_first or 0)
                 except Exception:
@@ -799,6 +910,13 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 else:
                     whitelist = o_wl or str(raw.get("whitelist", "") or "")
                 times_seen = max(o_times, r_times) + (1 if remote_newer else 0)
+                # Player lists: current roster follows the newer sighting; the
+                # ever-seen list is the union of both sides (capped).
+                r_now = _decode_player_list(raw.get("players_now"))
+                r_ever = _decode_player_list(raw.get("players_ever"))
+                now_names = r_now if remote_newer else _decode_player_list(o_now)
+                ever_names = _merge_player_lists(
+                    _merge_player_lists(o_ever, o_now), _merge_player_lists(r_ever, r_now))
                 # Keep the row dirty if it changed locally after we collected
                 # the upload batch (its new sighting still needs uploading).
                 # With no upload phase, preserve whatever flag is there.
@@ -813,10 +931,12 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
                     " max_players=?, version=?, protocol=COALESCE(?, protocol),"
                     " cracked=?, whitelist=?, first_seen=?, last_seen=?,"
-                    " times_seen=?, last_source=?, needs_sync=? WHERE ip_port=?",
+                    " times_seen=?, last_source=?, needs_sync=?,"
+                    " players_now=?, players_ever=? WHERE ip_port=?",
                     (host, port, motd, online, maximum, version, protocol,
                      cracked, whitelist, first_seen, last_seen, times_seen,
-                     src, still_dirty, ip_port))
+                     src, still_dirty, _encode_player_list(now_names),
+                     _encode_player_list(ever_names), ip_port))
                 updated += 1
             con.commit()
         finally:
@@ -7891,7 +8011,7 @@ class ServersTab(QWidget, QtBaseMixin):
     """
 
     COLS = ("ip", "motd", "players", "version", "cracked", "whitelist",
-            "first_seen", "last_seen", "times_seen")
+            "online_names", "seen_names", "first_seen", "last_seen", "times_seen")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -7910,7 +8030,7 @@ class ServersTab(QWidget, QtBaseMixin):
         root.addLayout(bar)
         bar.addWidget(QLabel("Search:"))
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("ip / motd / version substring")
+        self.search_edit.setPlaceholderText("ip / motd / version / player substring")
         self.search_edit.setMinimumWidth(260)
         self.search_edit.returnPressed.connect(self.refresh_from_db)
         bar.addWidget(self.search_edit)
@@ -7969,7 +8089,8 @@ class ServersTab(QWidget, QtBaseMixin):
         self.tree = ResultTable(self, columns=list(self.COLS))
         self.tree.setHorizontalHeaderLabels([c.upper() for c in self.COLS])
         widths = {"ip": 170, "motd": 260, "players": 110, "version": 120,
-                  "cracked": 90, "whitelist": 180,
+                  "cracked": 90, "whitelist": 180, "online_names": 200,
+                  "seen_names": 200,
                   "first_seen": 130, "last_seen": 130, "times_seen": 90}
         for i, c in enumerate(self.COLS):
             self.tree.setColumnWidth(i, widths.get(c, 150))
@@ -7982,6 +8103,8 @@ class ServersTab(QWidget, QtBaseMixin):
                 "version": _version_key,
                 "cracked": lambda v: str(v).lower(),
                 "whitelist": lambda v: str(v).lower(),
+                "online_names": lambda v: str(v).lower(),
+                "seen_names": lambda v: str(v).lower(),
                 "first_seen": lambda v: str(v),
                 "last_seen": lambda v: str(v),
                 "times_seen": lambda v: int(str(v)) if str(v).isdigit() else -1,
@@ -8046,6 +8169,14 @@ class ServersTab(QWidget, QtBaseMixin):
             self.tree.delete(iid)
         for e in entries:
             players = f"{e.get('players_online', 0)}/{e.get('max_players', 0)}"
+            try:
+                online_names = ", ".join(_decode_player_list(e.get("players_now"))) or "-"
+            except Exception:
+                online_names = "-"
+            try:
+                seen_names = ", ".join(_decode_player_list(e.get("players_ever"))) or "-"
+            except Exception:
+                seen_names = "-"
             self.tree.insert("", "end", values=(
                 e.get("ip_port", ""),
                 e.get("motd", "") or "",
@@ -8053,6 +8184,8 @@ class ServersTab(QWidget, QtBaseMixin):
                 e.get("version", "") or "",
                 e.get("cracked", "") or "",
                 e.get("whitelist", "") or "",
+                online_names,
+                seen_names,
                 format_db_timestamp(e.get("first_seen", 0)),
                 format_db_timestamp(e.get("last_seen", 0)),
                 str(e.get("times_seen", 1)),

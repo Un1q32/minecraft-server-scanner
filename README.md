@@ -109,8 +109,12 @@ The result table has a CRACKED column. Every handshake already detects likely of
 - Keeps a local SQLite history (`servers.db`) of every server ever seen via a
   successful status ping, with first-discovery and last-seen dates plus
   times-seen count. Every scan records automatically — no manual add step.
+- Each server also keeps two player-name lists from status-ping samples:
+  players online now (latest sample) and everyone ever seen (union of all
+  samples, kept after logout, capped at 500 names per server).
 - The Servers tab browses that history (search, rescan, copy, export, add to
-  Saved/Ignore/Monitor, delete).
+  Saved/Ignore/Monitor, delete). Search also matches player names, so you
+  can find every server a player has been seen on.
 - The Servers tab can sync that history with a shared network DB
   (`dbserver.py`): one Sync DB button uploads your new sightings and
   downloads other clients' servers, refreshing last-seen dates both ways.
@@ -161,7 +165,9 @@ Multiple scanner clients can pool their finds through one central server:
 
 Each sync uploads the servers this client has seen since its last sync and
 downloads everything other clients added, merging first-seen (oldest wins)
-and last-seen/MOTD/players/version (newest wins) on both sides. A confirmed
+and last-seen/MOTD/players/version (newest wins) on both sides. Player lists
+merge too: currently-online follows the newer sighting, ever-seen is the
+union of both sides. A confirmed
 cracked verdict is never downgraded by a re-sight.
 
 Security: every `/api/*` endpoint requires auth — unauthenticated reads and

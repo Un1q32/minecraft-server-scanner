@@ -63,13 +63,16 @@ Row shape (mirrors the client's ``servers.db``)::
      "motd": "...", "players_online": 3, "max_players": 20,
      "version": "1.21", "protocol": 767, "cracked": "Yes/No",
      "whitelist": "...", "first_seen": 123.0, "last_seen": 456.0,
-     "times_seen": 2, "last_source": "scan"}
+     "times_seen": 2, "last_source": "scan",
+     "players_now": ["Alice"], "players_ever": ["Alice", "Bob"]}
 
 Merge rule (both directions): ``first_seen`` = oldest non-zero,
 ``last_seen`` = newest, mutable display fields (motd/players/version/...)
 come from whichever side saw the server most recently, and a confirmed
 cracked verdict (``Yes`` / ``Yes (cached)``) is never downgraded by a plain
 status ping.  ``times_seen`` = max + 1 when the incoming sighting is newer.
+``players_now`` follows the newer sighting; ``players_ever`` is the union
+of both sides (capped at 500 names per server).
 
 Stdlib only -- no pip dependencies.
 """
@@ -113,9 +116,14 @@ SCHEMA = (
     " last_seen REAL DEFAULT 0,"
     " times_seen INTEGER DEFAULT 1,"
     " last_source TEXT DEFAULT '',"
+    " players_now TEXT DEFAULT '[]',"
+    " players_ever TEXT DEFAULT '[]',"
     " seq INTEGER DEFAULT 0"
     ")"
 )
+
+PLAYERS_EVER_MAX = 500  # per-server cap on the ever-seen name list
+PLAYER_NAME_MAX_LEN = 32
 
 _db_lock = threading.Lock()
 _nonce_lock = threading.Lock()
@@ -212,6 +220,8 @@ def init_db(db_path):
         # clients page by seq (not wall-clock) and can never miss rows that
         # arrived with old last_seen timestamps.
         _add_column_if_missing(con, "seq", "INTEGER DEFAULT 0")
+        _add_column_if_missing(con, "players_now", "TEXT DEFAULT '[]'")
+        _add_column_if_missing(con, "players_ever", "TEXT DEFAULT '[]'")
         try:
             con.execute("UPDATE servers SET seq=rowid WHERE seq IS NULL OR seq=0")
         except Exception:
@@ -226,6 +236,58 @@ def _clamp_str(value, limit):
     s = "" if value is None else str(value)
     s = re.sub(r"\s+", " ", s.replace("\r", " ").replace("\n", " ")).strip()
     return s[:limit]
+
+
+def _clean_player_name(value):
+    try:
+        s = "" if value is None else str(value)
+        s = re.sub(r"\s+", " ", s.replace("\r", " ").replace("\n", " ")).strip()
+        return s[:PLAYER_NAME_MAX_LEN].strip()
+    except Exception:
+        return ""
+
+
+def _clean_player_list(value):
+    """Incoming players_now/players_ever (list or JSON string) -> JSON string.
+
+    Sorted, unique, capped. Never raises.
+    """
+    try:
+        if isinstance(value, str):
+            parsed = json.loads(value) if value.strip() else []
+        else:
+            parsed = value
+        if not isinstance(parsed, list):
+            return "[]"
+        names = sorted({_clean_player_name(n) for n in parsed} -
+                       {""}, key=str.lower)
+        return json.dumps(names[:PLAYERS_EVER_MAX], ensure_ascii=False)
+    except Exception:
+        return "[]"
+
+
+def _merge_player_lists(old, new):
+    """Union of two stored JSON lists, capped. Never raises.
+
+    Established (old) names always win: newcomers only fill remaining
+    slots, so a flood of junk names can never evict names already known.
+    """
+    try:
+        old_list = json.loads(old or "[]")
+        new_list = json.loads(new or "[]")
+        if not isinstance(old_list, list):
+            old_list = []
+        if not isinstance(new_list, list):
+            new_list = []
+        seen = set(old_list)
+        merged = list(old_list)
+        for name in sorted(set(new_list) - seen, key=str.lower):
+            if len(merged) >= PLAYERS_EVER_MAX:
+                break
+            merged.append(name)
+        return _clean_player_list(merged)
+    except Exception:
+        return "[]"
 
 
 def sanitize_row(raw):
@@ -298,6 +360,8 @@ def sanitize_row(raw):
         "last_seen": last_seen,
         "times_seen": min(times_seen, 1000000000),
         "last_source": _clamp_str(raw.get("last_source", ""), 64),
+        "players_now": _clean_player_list(raw.get("players_now")),
+        "players_ever": _clean_player_list(raw.get("players_ever")),
     }
 
 
@@ -305,7 +369,8 @@ def merge_row(con, row):
     """Upsert one sanitized row. Returns True if it created/advanced state."""
     cur = con.execute(
         "SELECT motd, players_online, max_players, version, protocol,"
-        " cracked, whitelist, first_seen, last_seen, times_seen, last_source"
+        " cracked, whitelist, first_seen, last_seen, times_seen, last_source,"
+        " players_now, players_ever"
         " FROM servers WHERE ip_port=?", (row["ip_port"],))
     old = cur.fetchone()
     if old is None:
@@ -313,18 +378,20 @@ def merge_row(con, row):
             "INSERT INTO servers (ip_port, host, port, motd, players_online,"
             " max_players, version, protocol, cracked, whitelist,"
             " first_seen, last_seen, times_seen, last_source,"
+            " players_now, players_ever,"
             " seq)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
             " (SELECT COALESCE(MAX(seq), 0) + 1 FROM servers))",
             (row["ip_port"], row["host"], row["port"], row["motd"],
              row["players_online"], row["max_players"], row["version"],
              row["protocol"], row["cracked"], row["whitelist"],
              row["first_seen"] or row["last_seen"] or _utcnow(),
              row["last_seen"] or row["first_seen"] or _utcnow(),
-             row["times_seen"], row["last_source"]))
+             row["times_seen"], row["last_source"],
+             row["players_now"], row["players_ever"]))
         return True
     (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
-     o_first, o_last, o_times, o_src) = old
+     o_first, o_last, o_times, o_src, o_now, o_ever) = old
     try:
         o_first = float(o_first or 0)
     except Exception:
@@ -368,20 +435,27 @@ def merge_row(con, row):
     times_seen = max(o_times, row["times_seen"])
     if incoming_newer:
         times_seen += 1
+    # Player lists: current roster follows the newer sighting; ever-seen is
+    # the union of both sides (capped). Fold each side's current roster into
+    # its ever list first, so no observed name is ever lost.
+    now = row["players_now"] if incoming_newer else (o_now or "[]")
+    ever = _merge_player_lists(
+        _merge_player_lists(o_ever, o_now), _merge_player_lists(row["players_ever"], row["players_now"]))
     if (motd, online, maximum, version, protocol, cracked, whitelist,
-            first_seen, last_seen, times_seen, src) == (
+            first_seen, last_seen, times_seen, src, now, ever) == (
             o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
-            o_first, o_last, o_times, o_src):
+            o_first, o_last, o_times, o_src, o_now, o_ever):
         return False
     con.execute(
         "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
         " max_players=?, version=?, protocol=?, cracked=?, whitelist=?,"
         " first_seen=?, last_seen=?, times_seen=?, last_source=?,"
+        " players_now=?, players_ever=?,"
         " seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM servers)"
         " WHERE ip_port=?",
         (row["host"], row["port"], motd, online, maximum, version, protocol,
          cracked, whitelist, first_seen, last_seen, times_seen, src,
-         row["ip_port"]))
+         now, ever, row["ip_port"]))
     return True
 
 
