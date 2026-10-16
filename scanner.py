@@ -3246,22 +3246,25 @@ def open_whitelist_log_file(parent=None):
         if parent is not None:
             q_error(parent, "Whitelist Log", f"Could not open log: {exc}")
 
-def check_selected_whitelist(parent, tree):
+def check_selected_whitelist(parent, tree, progress_cb=None):
     """Manually probe the currently selected result rows.
 
     Cracked (offline-mode) servers are checked without any Minecraft account;
     online-mode servers rotate across all stored accounts for Mojang auth.
     (Qt port: identical logic, QMessageBox via qt_helpers.)
+
+    progress_cb(done, total), when given, runs on the GUI thread per tick.
+    Returns the number of queued entries.
     """
     account = None
     selected = tree.selection()
     if not selected:
         q_info(parent, "Check Whitelist", "Select one or more server rows first.")
-        return
+        return 0
     columns = list(tree["columns"])
     if "whitelist" not in columns:
         q_info(parent, "Check Whitelist", "This result view has no whitelist column.")
-        return
+        return 0
     entries = []
     for iid in selected:
         values = tree.item(iid, "values")
@@ -3270,7 +3273,7 @@ def check_selected_whitelist(parent, tree):
             entries.append({"ip": row["ip"], "version": row.get("version", ""), "protocol": row.get("protocol")})
             tree.set(iid, "whitelist", "Queued")
     if not entries:
-        return
+        return 0
     def on_update(entry, result, message):
         label = whitelist_result_label(result, message)
         ip = entry.get("ip")
@@ -3285,8 +3288,16 @@ def check_selected_whitelist(parent, tree):
                 parent.after(0, _apply)
                 break
     def progress(done, total):
-        parent.after(0, lambda: setattr(parent, "_whitelist_manual_status", f"Whitelist check: {done}/{total}"))
+        def ui(d=done, t=total):
+            setattr(parent, "_whitelist_manual_status", f"Whitelist check: {d}/{t}")
+            if progress_cb is not None:
+                try:
+                    progress_cb(d, t)
+                except Exception:
+                    pass
+        parent.after(0, ui)
     run_whitelist_verifier_async(entries, account, on_update, progress_cb=progress)
+    return len(entries)
 
 def check_selected_cracked(parent, tree):
     """Manually probe the currently selected result rows for offline-mode.
@@ -8018,6 +8029,9 @@ class ServersTab(QWidget, QtBaseMixin):
         self._entries = []  # list[dict] from query_server_db
         self._refresh_pending = False
         self._sync_note = ""   # last shared-DB sync summary, kept in the status
+        self._op_note = ""     # last rescan/recheck summary, kept in the status
+        self._op_active = False  # a rescan/recheck is running (ticks own the status)
+        self._op_progress = ""   # latest "done/total" text, kept across refreshes
         self._build_ui()
         register_server_db_tab(self)
         self.refresh_from_db()
@@ -8127,8 +8141,37 @@ class ServersTab(QWidget, QtBaseMixin):
             b.clicked.connect(slot)
             footer.addWidget(b)
         footer.addStretch(1)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimumWidth(130)
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        footer.addWidget(self.progress_bar)
         self.status_label = QLabel("Ready.")
         root.addWidget(self.status_label)
+
+    def _progress_set(self, done, total):
+        """Determinate bar tick (worker threads must marshal via after())."""
+        try:
+            total = int(total)
+            if total <= 0:
+                self.progress_bar.setRange(0, 0)
+            else:
+                done = max(0, min(int(done), total))
+                self.progress_bar.setRange(0, total)
+                self.progress_bar.setValue(done)
+            self.progress_bar.setVisible(True)
+        except Exception:
+            pass
+
+    def _progress_idle(self):
+        try:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(False)
+        except Exception:
+            pass
 
     def set_status(self, msg):
         self.status_label.setText(msg)
@@ -8197,6 +8240,10 @@ class ServersTab(QWidget, QtBaseMixin):
         status = f"Tracking {len(entries)} server(s) in servers.db."
         if self._sync_note:
             status += " | " + self._sync_note
+        if self._op_note:
+            status += " | " + self._op_note
+        if self._op_active and self._op_progress:
+            status += " | " + self._op_progress
         self.set_status(status)
 
     # ---- selection helpers ----
@@ -8280,21 +8327,43 @@ class ServersTab(QWidget, QtBaseMixin):
         except Exception as exc:
             q_error(self, "Export", str(exc))
 
+    def _op_done(self, msg):
+        """Finish a rescan/recheck: bar away, summary kept across refreshes."""
+        self._op_active = False
+        self._op_progress = ""
+        self._op_note = msg
+        self._progress_idle()
+        self.set_status(msg)
+
+    def _op_tick(self, msg):
+        """One done/total tick: bar forward, text kept across refreshes."""
+        self._op_progress = msg
+        self.set_status(msg)
+
     def rescan_selected(self):
         sel = self._selected_ips()
         if not sel:
             q_info(self, "Info", "Select one or more.")
             return
-        self.set_status(f"Rescanning {len(sel)} server(s)…")
+        self._op_note = ""
+        self._op_active = True
+        self._progress_set(0, len(sel))
+        self._op_tick(f"Rescanning: 0/{len(sel)}")
+
+        def on_progress(done, total):
+            def ui(d=done, t=total):
+                self._progress_set(d, t)
+                self._op_tick(f"Rescanning: {d}/{t}")
+            self.after(0, ui)
 
         def work():
             try:
-                results, _ = scan_servers_gui(sel)
-                self.after(0, lambda: self.set_status(
-                    f"Rescan complete. Responded: {len(results)}."))
+                results, _ = scan_servers_gui(sel, on_progress=on_progress)
+                msg = f"Rescan complete. Responded: {len(results)}."
+                self.after(0, lambda msg=msg: self._op_done(msg))
             except Exception as exc:
                 err = str(exc)
-                self.after(0, lambda err=err: self.set_status(f"Rescan failed: {err}"))
+                self.after(0, lambda err=err: self._op_done(f"Rescan failed: {err}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -8302,8 +8371,22 @@ class ServersTab(QWidget, QtBaseMixin):
         if not self.tree.selection():
             q_info(self, "Recheck Whitelist", "Select one or more server rows first.")
             return
-        self.set_status("Rechecking whitelist for selected server(s)…")
-        check_selected_whitelist(self, self.tree)
+        self._op_note = ""
+        self._op_active = True
+
+        def on_progress(done, total):
+            self._progress_set(done, total)
+            if done >= total:
+                self._op_done(f"Whitelist recheck complete for {total} server(s).")
+            else:
+                self._op_tick(f"Checking whitelist: {done}/{total}")
+
+        queued = check_selected_whitelist(self, self.tree, progress_cb=on_progress)
+        if queued:
+            self._progress_set(0, queued)
+            self._op_tick(f"Checking whitelist: 0/{queued}")
+        else:
+            self._op_done("Nothing to recheck.")
 
     def sync_netdb(self):
         try:
