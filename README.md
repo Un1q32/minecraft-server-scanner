@@ -24,6 +24,8 @@ Minecraft Server Scanner is a Windows desktop application that discovers, checks
 
 The Network Scan tab accepts individual IPv4 addresses, CIDR ranges, explicit IPv4 ranges such as 192.0.2.1-192.0.2.20, and ASNs such as AS13335 or 13335 — any mix of them, separated by commas, spaces, semicolons or newlines (spaced ranges like `192.0.2.1 - 192.0.2.20` work too). Every range is swept; the masscan backend passes them all through natively while the Python backend enumerates them within the Max hosts cap.
 
+Anything listed in `exclude.conf` (same folder as the scanner) is carved out of every search on every backend: searching `1.0.0.0/8` while `1.5.0.0/16` is excluded sweeps the `/8` minus that `/16`, and `0.0.0.0/0` searches skip all of it. Entries may be CIDRs (short form like `165.160/16` works), `start-end` ranges, or single IPs, with `#` comments. The file is re-read whenever it changes, so edits apply without restarting; the status line shows how many entries are loaded.
+
 ASN scanning resolves announced IPv4 prefixes through BGPView, expands the prefixes within the configured host limit, and scans the configured ports. The scan supports multiple ports and protects the application with a maximum-host limit.
 
 #### masscan backend (fast)

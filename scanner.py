@@ -6,6 +6,7 @@ except ImportError:
     # Optional dependency: everything except Shodan search works without it.
     shodan = None
 import codecs
+import bisect
 import socket
 import struct
 import json
@@ -102,6 +103,7 @@ SERVERS_DAT_PATH = os.path.expandvars(r"%APPDATA%\.minecraft\servers.dat")
 BACKUP_PATH = SERVERS_DAT_PATH + ".bak"
 
 IGNORE_FILE = "ignore.txt"
+EXCLUDE_FILE = "exclude.conf"
 SAVED_FILE = "saved.txt"
 DEFAULT_JSONL_FILE = "minecraft_servers.json"
 USER_LOG_FILE = "user_log.json"
@@ -3659,9 +3661,66 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
     def add_host(host):
         if len(hosts) >= max_hosts:
             return
-        if host not in seen:
+        if host not in seen and not _target_is_excluded(host):
             seen.add(host)
             hosts.append(host)
+
+    def add_int_hosts(lo, hi, skip):
+        """Emit usable hosts in [lo, hi], jumping over exclude.conf blocks."""
+        cur = lo
+        while cur <= hi and len(hosts) < max_hosts:
+            try:
+                cur = _next_allowed_host(cur, hi)
+            except Exception:
+                pass
+            if cur is None or cur > hi:
+                break
+            if cur not in skip:
+                add_host(str(ipaddress.ip_address(cur)))
+            cur += 1
+
+    def add_cidr_hosts(spec):
+        """Enumerate hosts of a CIDR minus exclude.conf (skipped, not spent).
+
+        Piece boundaries from carving are ordinary hosts; only the user's
+        own network/broadcast addresses keep hosts() semantics.
+        """
+        try:
+            net = ipaddress.ip_network(spec, strict=False)
+        except ValueError:
+            return
+        if net.version != 4:
+            return
+        try:
+            subs = subtract_excludes_from_spec(spec)
+        except Exception:
+            subs = [spec]
+        skip = set()
+        try:
+            if net.num_addresses > 2:
+                skip = {int(net.network_address), int(net.broadcast_address)}
+        except Exception:
+            pass
+        for sub in subs or [spec]:
+            if len(hosts) >= max_hosts:
+                break
+            try:
+                rng = _spec_int_range(sub)
+            except Exception:
+                continue
+            if rng is None:
+                continue
+            add_int_hosts(rng[0], rng[1], skip)
+
+    def add_dash_hosts(token):
+        """Enumerate a start-end range, jumping over exclude.conf blocks."""
+        try:
+            rng = _spec_int_range(token)
+        except Exception:
+            rng = None
+        if rng is None:
+            return
+        add_int_hosts(rng[0], rng[1], set())
 
     tokens = _split_target_tokens(target_text)
 
@@ -3673,28 +3732,13 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
                 for prefix in fetch_asn_prefixes(token):
                     if len(hosts) >= max_hosts:
                         break
-                    try:
-                        net = ipaddress.ip_network(prefix, strict=False)
-                    except ValueError:
-                        continue
-                    for ip in net.hosts():
-                        add_host(str(ip))
-                        if len(hosts) >= max_hosts:
-                            break
+                    add_cidr_hosts(prefix)
                 continue
             if "-" in token and "/" not in token:
-                left, right = token.split("-", 1)
-                for ip in expand_ip_range(left, right, max_hosts - len(hosts)):
-                    add_host(ip)
+                add_dash_hosts(token)
                 continue
             if "/" in token:
-                net = ipaddress.ip_network(token, strict=False)
-                if net.version != 4:
-                    continue
-                for ip in net.hosts():
-                    add_host(str(ip))
-                    if len(hosts) >= max_hosts:
-                        break
+                add_cidr_hosts(token)
                 continue
             host, explicit_port = split_host_port(token) if ":" in token else (token, None)
             ipaddress.ip_address(host)
@@ -3709,7 +3753,8 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
         else:
             for port in ports:
                 targets.append(f"{host}:{port}")
-    return [target for target in dict.fromkeys(targets) if not is_ignored(target)]
+    return [target for target in dict.fromkeys(targets)
+            if not is_ignored(target) and not _target_is_excluded(target)]
 
 
 # ==================== MASSCAN BACKEND ====================
@@ -3790,6 +3835,249 @@ def _split_target_tokens(target_text):
         line = line.split("#", 1)[0]
         tokens.extend([p for p in re.split(r"[,;\s]+", line.strip()) if p])
     return tokens
+
+
+# ==================== EXCLUDE.CONF (do-not-scan ranges) ====================
+# Anything listed in exclude.conf is carved out of every search, on every
+# backend: searching 1.0.0.0/8 with 1.5.0.0/16 excluded sweeps the /8 minus
+# that /16 (works for 0.0.0.0/0 too). Entries may be CIDRs (short form like
+# "165.160/16" is accepted), dash ranges ("a-b") or single IPs; '#' starts
+# a comment and unparseable prose lines are ignored. The file is re-read
+# whenever it changes, so edits apply without restarting.
+
+_EXCLUDE_CACHE = {"key": None, "nets": [], "starts": [], "intervals": [],
+                  "entries": 0}
+
+
+def _normalize_short_cidr(token):
+    """'165.160/16' -> '165.160.0.0/16'. None when not short-CIDR-shaped."""
+    try:
+        m = re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){0,2})/(\d{1,2})",
+                         (token or "").strip())
+        if not m:
+            return None
+        parts = m.group(1).split(".")
+        while len(parts) < 4:
+            parts.append("0")
+        return str(ipaddress.ip_network(
+            f"{'.'.join(parts)}/{m.group(2)}", strict=False))
+    except Exception:
+        return None
+
+
+def _parse_exclude_token(token):
+    """One exclude.conf token -> list[IPv4Network]. Never raises."""
+    try:
+        t = (token or "").strip()
+        if not t:
+            return []
+        if "/" in t:
+            try:
+                net = ipaddress.ip_network(t, strict=False)
+            except ValueError:
+                norm = _normalize_short_cidr(t)
+                if not norm:
+                    return []
+                try:
+                    net = ipaddress.ip_network(norm, strict=False)
+                except ValueError:
+                    return []
+            return [net] if net.version == 4 else []
+        if "-" in t:
+            left, right = t.split("-", 1)
+            try:
+                start = ipaddress.ip_address(left.strip())
+                end = ipaddress.ip_address(right.strip())
+            except ValueError:
+                return []
+            if start.version != 4 or end.version != 4 or int(end) < int(start):
+                return []
+            return list(ipaddress.summarize_address_range(start, end))
+        try:
+            addr = ipaddress.ip_address(t)
+        except ValueError:
+            return []
+        if addr.version != 4:
+            return []
+        return [ipaddress.ip_network(f"{addr}/32")]
+    except Exception:
+        return []
+
+
+def _load_exclude_state():
+    """Parse exclude.conf (cached by mtime+size). Never raises."""
+    global _EXCLUDE_CACHE
+    try:
+        st = os.stat(EXCLUDE_FILE)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and _EXCLUDE_CACHE.get("key") == key:
+        return _EXCLUDE_CACHE
+    nets, entries = [], 0
+    if key is not None:
+        try:
+            with open(EXCLUDE_FILE, "r", encoding="utf-8",
+                      errors="replace") as f:
+                raw = f.read()
+            for token in _split_target_tokens(raw):
+                parsed = _parse_exclude_token(token)
+                if parsed:
+                    entries += 1
+                    nets.extend(parsed)
+        except Exception:
+            nets, entries = [], 0
+    try:
+        collapsed = list(ipaddress.collapse_addresses(nets)) if nets else []
+    except Exception:
+        collapsed = list(nets)
+    intervals, starts = [], []
+    try:
+        for net in collapsed:
+            s, e = int(net.network_address), int(net.broadcast_address)
+            if intervals and s <= intervals[-1][1] + 1:
+                intervals[-1][1] = max(intervals[-1][1], e)
+            else:
+                intervals.append([s, e])
+        intervals = [(s, e) for s, e in intervals]
+        starts = [s for s, _ in intervals]
+    except Exception:
+        intervals, starts = [], []
+    _EXCLUDE_CACHE = {"key": key, "nets": collapsed, "starts": starts,
+                      "intervals": intervals, "entries": entries}
+    return _EXCLUDE_CACHE
+
+
+def is_excluded_ip(ip_str):
+    """True when the IPv4 address falls inside exclude.conf. Never raises."""
+    try:
+        addr = ipaddress.ip_address(str(ip_str).strip())
+        if addr.version != 4:
+            return False
+        n = int(addr)
+    except Exception:
+        return False
+    try:
+        state = _load_exclude_state()
+        intervals, starts = state["intervals"], state["starts"]
+    except Exception:
+        return False
+    try:
+        i = bisect.bisect_right(starts, n) - 1
+        return i >= 0 and n <= intervals[i][1]
+    except Exception:
+        return False
+
+
+def _target_is_excluded(target):
+    """'ip' or 'ip:port' covered by exclude.conf. Never raises."""
+    try:
+        t = (target or "").strip()
+        if not t:
+            return False
+        host = t.rsplit(":", 1)[0] if (t.count(":") == 1 and "." in t) else t
+        return is_excluded_ip(host)
+    except Exception:
+        return False
+
+
+def _spec_int_range(spec):
+    """'IP'/'CIDR'/'start-end' -> (start_int, end_int), IPv4 only, else None."""
+    try:
+        s = (spec or "").strip()
+        if "/" in s:
+            net = ipaddress.ip_network(s, strict=False)
+            if net.version != 4:
+                return None
+            return (int(net.network_address), int(net.broadcast_address))
+        if "-" in s:
+            left, right = s.split("-", 1)
+            start = ipaddress.ip_address(left.strip())
+            end = ipaddress.ip_address(right.strip())
+            if (start.version != 4 or end.version != 4
+                    or int(end) < int(start)):
+                return None
+            return (int(start), int(end))
+        addr = ipaddress.ip_address(s)
+        if addr.version != 4:
+            return None
+        return (int(addr), int(addr))
+    except Exception:
+        return None
+
+
+def subtract_excludes_from_spec(spec):
+    """Range spec minus exclude.conf -> minimal list of CIDR/IP strings.
+
+    '1.0.0.0/8' with '1.5.0.0/16' excluded returns the /8 carved into CIDRs
+    that skip the /16; a fully excluded spec returns []. A lone IP keeps its
+    plain form. Returns [spec] unchanged when nothing is excluded or the
+    spec is unparseable. Never raises.
+    """
+    try:
+        spec = (spec or "").strip()
+        if not spec:
+            return []
+        rng = _spec_int_range(spec)
+        if rng is None:
+            return []
+        lo, hi = rng
+        intervals = _load_exclude_state()["intervals"]
+        if not intervals:
+            return [spec]
+        if lo == hi:
+            return [] if is_excluded_ip(spec) else [spec]
+        gaps, cur = [], lo
+        for (es, ee) in intervals:
+            if ee < cur:
+                continue
+            if es > hi:
+                break
+            if es > cur:
+                gaps.append((cur, min(es - 1, hi)))
+            cur = ee + 1
+            if cur > hi:
+                break
+        if cur <= hi:
+            gaps.append((cur, hi))
+        out = []
+        for (a, b) in gaps:
+            try:
+                out.extend(str(n) for n in ipaddress.summarize_address_range(
+                    ipaddress.ip_address(a), ipaddress.ip_address(b)))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _next_allowed_host(cur, hi):
+    """First int in [cur, hi] not covered by exclude.conf, or None."""
+    try:
+        state = _load_exclude_state()
+        intervals, starts = state["intervals"], state["starts"]
+    except Exception:
+        return cur if cur <= hi else None
+    try:
+        while cur <= hi:
+            i = bisect.bisect_right(starts, cur) - 1
+            if i >= 0 and cur <= intervals[i][1]:
+                cur = intervals[i][1] + 1
+                continue
+            return cur
+        return None
+    except Exception:
+        return cur if cur <= hi else None
+
+
+def exclude_summary():
+    """'' or ' (exclude.conf: N entries)' for status lines. Never raises."""
+    try:
+        n = int(_load_exclude_state().get("entries", 0) or 0)
+    except Exception:
+        n = 0
+    return f" (exclude.conf: {n} entr{'y' if n == 1 else 'ies'})" if n else ""
 
 
 def _masscan_estimate_probes(masscan_targets, ports):
@@ -3876,13 +4164,22 @@ def build_masscan_inputs(target_text, ports):
         spec = spec.strip()
         if not spec or spec in seen_range:
             return
-        if _masscan_count_hosts(spec, cap=None) <= 0:
-            return
-        seen_range.add(spec)
-        masscan_targets.append(spec)
+        try:
+            subs = subtract_excludes_from_spec(spec)
+        except Exception:
+            subs = [spec]
+        for sub in subs:
+            sub = (sub or "").strip()
+            if not sub or sub in seen_range:
+                continue
+            if _masscan_count_hosts(sub, cap=None) <= 0:
+                continue
+            seen_range.add(sub)
+            masscan_targets.append(sub)
 
     def add_direct(ip_port):
-        if ip_port not in direct_targets and not is_ignored(ip_port):
+        if (ip_port not in direct_targets and not is_ignored(ip_port)
+                and not _target_is_excluded(ip_port)):
             direct_targets.append(ip_port)
 
     tokens = _split_target_tokens(target_text)
@@ -4024,7 +4321,8 @@ def parse_masscan_json_text(raw):
                     continue
                 if ip and 1 <= port <= 65535:
                     found.append(f"{ip}:{port}")
-    return [t for t in dict.fromkeys(found) if not is_ignored(t)]
+    return [t for t in dict.fromkeys(found)
+            if not is_ignored(t) and not _target_is_excluded(t)]
 
 
 _MASSCAN_DISCOVERED_RE = re.compile(r"Discovered\s+open\s+port\s+(\d{1,5})/(\w+)\s+on\s+(\S+)")
@@ -4326,11 +4624,23 @@ def build_minescan_inputs(target_text, ports, max_hosts=MINESCAN_MAX_HOSTS):
     foreign = {}  # off-list port -> [ips]
     expanded_total = 0
     warnings = []
+    excluded_hosts = 0
 
     def add_range(spec):
+        nonlocal excluded_hosts
         if spec and spec not in seen_range:
-            seen_range.add(spec)
-            ranges.append(spec)
+            try:
+                before = _masscan_count_hosts(spec, cap=None)
+                subs = subtract_excludes_from_spec(spec)
+                after = sum(_masscan_count_hosts(s, cap=None) for s in subs)
+                if after < before:
+                    excluded_hosts += before - after
+            except Exception:
+                subs = [spec]
+            for sub in subs:
+                if sub not in seen_range:
+                    seen_range.add(sub)
+                    ranges.append(sub)
 
     for token in _split_target_tokens(target_text):
         try:
@@ -4348,9 +4658,9 @@ def build_minescan_inputs(target_text, ports, max_hosts=MINESCAN_MAX_HOSTS):
                         continue
                     if net.version != 4:
                         continue
-                    if str(net) not in seen_range:
-                        seen_range.add(str(net))
-                        ranges.append(str(net))
+                    before_ranges = len(ranges)
+                    add_range(str(net))
+                    if len(ranges) > before_ranges:
                         n += 1
                 warnings.append(f"ASN {token}: {n} prefix(es) stream to minescan")
                 continue
@@ -4377,6 +4687,9 @@ def build_minescan_inputs(target_text, ports, max_hosts=MINESCAN_MAX_HOSTS):
                     if expanded_total >= max_hosts:
                         warnings.append("host limit reached; remaining targets skipped")
                         break
+                    if is_excluded_ip(ip):
+                        excluded_hosts += 1
+                        continue
                     if ip not in seen_main:
                         seen_main.add(ip)
                         main_ips.append(ip)
@@ -4406,17 +4719,31 @@ def build_minescan_inputs(target_text, ports, max_hosts=MINESCAN_MAX_HOSTS):
                 if expanded_total >= max_hosts:
                     warnings.append("host limit reached; remaining targets skipped")
                     continue
+                if is_excluded_ip(ip_str):
+                    excluded_hosts += 1
+                    continue
                 if ip_str not in seen_main:
                     seen_main.add(ip_str)
                     main_ips.append(ip_str)
                     expanded_total += 1
             else:
+                if is_excluded_ip(ip_str):
+                    excluded_hosts += 1
+                    continue
                 bucket = foreign.setdefault(explicit_port, [])
                 if ip_str not in bucket:
                     bucket.append(ip_str)
                     expanded_total += 1
         except Exception:
             continue
+
+    if excluded_hosts > 0:
+        try:
+            entries = int(_load_exclude_state().get("entries", 0) or 0)
+        except Exception:
+            entries = 0
+        warnings.insert(0, f"exclude.conf: ~{excluded_hosts:,} host(s) skipped"
+                           f" ({entries} entr{'y' if entries == 1 else 'ies'})")
 
     def estimate(targets, nports):
         hosts = 0
@@ -4980,7 +5307,8 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     seen = set()
 
     def emit(ip_port):
-        if not ip_port or ip_port in seen or is_ignored(ip_port):
+        if (not ip_port or ip_port in seen or is_ignored(ip_port)
+                or _target_is_excluded(ip_port)):
             return
         seen.add(ip_port)
         found.append(ip_port)
@@ -7205,7 +7533,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             return
                         eta = _format_masscan_eta(_masscan_estimate_seconds(
                             ranges, ports, masscan_rate, masscan_wait))
-                        say(f"masscan: discovering open ports on ~{ms_hosts:,} host(s) (live){eta}...")
+                        say(f"masscan: discovering open ports on ~{ms_hosts:,} host(s){exclude_summary()} (live){eta}...")
                         outcome = "ok"
                         try:
                             _, masscan_note = run_masscan_streaming(
@@ -7315,7 +7643,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         eta = _format_masscan_eta(
                             minescan_estimate_seconds(ms_runs, minescan_rate))
                         say(f"minescan: scanning {len(ms_runs)} run(s)"
-                            f" (~{total_hosts:,} hosts, ~{total_est:,} probes){eta}...")
+                            f" (~{total_hosts:,} hosts, ~{total_est:,} probes){exclude_summary()}{eta}...")
                         runs_ok = 0
                         first_error = ""
 
@@ -7323,7 +7651,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             if not alive():
                                 return
                             ip_port = hit.get("ip", "")
-                            if is_ignored(ip_port):
+                            if is_ignored(ip_port) or _target_is_excluded(ip_port):
                                 return
                             try:
                                 _remember_protocol(ip_port, hit.get("protocol"))
