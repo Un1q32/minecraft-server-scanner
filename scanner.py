@@ -4080,6 +4080,56 @@ def exclude_summary():
     return f" (exclude.conf: {n} entr{'y' if n == 1 else 'ies'})" if n else ""
 
 
+def _write_masscan_exclude_file():
+    """Normalized exclude.conf -> temp file for masscan --excludefile.
+
+    masscan refuses huge sweeps ("range too big, need confirmation") unless
+    at least one --exclude is given, so every masscan run gets this file
+    when exclusions exist. As a bonus, masscan itself then skips excluded
+    hosts even if our own range carving ever missed one. Returns the temp
+    path, or None when there is nothing to exclude. The caller must unlink
+    the file once masscan no longer needs it. Never raises.
+    """
+    try:
+        nets = _load_exclude_state().get("nets") or []
+        lines = []
+        for net in nets:
+            try:
+                if net.version != 4:
+                    continue
+                if net.prefixlen == 32:
+                    lines.append(str(net.network_address))
+                else:
+                    lines.append(str(net))
+            except Exception:
+                continue
+        if not lines:
+            return None
+        fd, path = tempfile.mkstemp(prefix="mcscan_exclude_", suffix=".conf")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(line + "\n")
+        except Exception:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+            return None
+        return path
+    except Exception:
+        return None
+
+
+def _remove_masscan_exclude_file(path):
+    """Best-effort unlink of _write_masscan_exclude_file's temp file."""
+    try:
+        if path:
+            os.unlink(path)
+    except Exception:
+        pass
+
+
 def _masscan_estimate_probes(masscan_targets, ports):
     """Total SYN probes masscan will send (hosts x ports), arithmetic only."""
     try:
@@ -5140,7 +5190,8 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     open_targets is a list of 'ip:port' strings with TCP open.
     Raises FileNotFoundError when masscan is missing, PermissionError when raw
     sockets are denied (needs root/admin), TimeoutError on timeout.
-    Results stream through stdout (`-oJ -`); no temp files are used.
+    Results stream through stdout (`-oJ -`); no temp result files are used
+    (only a temp --excludefile when exclude.conf has entries).
     """
     exe = exe or shutil.which("masscan")
     if not exe:
@@ -5170,7 +5221,9 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             )
         # -S reads the password from stdin, -p "" suppresses sudo's own prompt.
         base_cmd = ["sudo", "-S", "-p", "", exe]
-    cmd = base_cmd + list(masscan_targets) + [
+    exclude_path = _write_masscan_exclude_file()
+    exclude_args = ["--excludefile", exclude_path] if exclude_path else []
+    cmd = base_cmd + list(masscan_targets) + exclude_args + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),
@@ -5180,10 +5233,10 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     if timeout is None:
         timeout = _masscan_default_timeout(masscan_targets, ports, rate, wait)
     try:
-        proc = _masscan_popen(cmd, sudo_password if use_sudo else None)
-    except FileNotFoundError:
-        raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
-    try:
+        try:
+            proc = _masscan_popen(cmd, sudo_password if use_sudo else None)
+        except FileNotFoundError:
+            raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -5196,10 +5249,12 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             except Exception:
                 stdout, stderr = "", ""
             raise TimeoutError(f"masscan timed out after {timeout}s")
-    except TimeoutError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"masscan failed to run: {exc}")
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"masscan failed to run: {exc}")
+    finally:
+        _remove_masscan_exclude_file(exclude_path)
     output = (stderr or "").strip()
     opened = parse_masscan_json_text(stdout or "")
     returncode, failed = _masscan_proc_error_info(proc, output)
@@ -5293,7 +5348,12 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
         base_cmd = ["sudo", "-S", "-p", "", exe]
     # --interactive prints (and flushes) one 'Discovered open port ...' line
     # per hit; -oL - mirrors the same hits as list lines on the same pipe.
-    cmd = base_cmd + list(masscan_targets) + [
+    # --excludefile (when exclusions exist) satisfies masscan's "range too
+    # big" confirmation for internet-scale sweeps, and makes masscan itself
+    # skip excluded hosts as a second layer under our own range carving.
+    exclude_path = _write_masscan_exclude_file()
+    exclude_args = ["--excludefile", exclude_path] if exclude_path else []
+    cmd = base_cmd + list(masscan_targets) + exclude_args + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),
@@ -5328,41 +5388,46 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
         return False
 
     try:
-        proc = _masscan_popen(cmd, sudo_password if use_sudo else None,
-                              merge_stderr=True, binary_stream=True)
-    except FileNotFoundError:
-        raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
-    # One merged pipe: masscan's \r progress, flushed Discovered lines and
-    # buffered -oL lines all arrive here; nothing can deadlock or stay hidden.
-    timed_out, other = _drain_masscan_stdout(proc, timeout, handle_result,
-                                             progress_cb=on_scan_progress,
-                                             stop_event=stop_event)
-    stderr = other
-    if timed_out:
-        if found:
-            note = (stderr[:400] + " " if stderr else "") + f"[partial: timed out after {timeout}s]"
-            return found, note.strip()
-        raise TimeoutError(f"masscan timed out after {timeout}s")
-    returncode, failed = _masscan_proc_error_info(proc, stderr)
-    if failed:
-        # An old masscan may not know --interactive; retry plainly (batched).
-        if "interactive" in (stderr or "") and "unknown" in (stderr or "").lower():
-            return _run_masscan_streaming_plain(
-                base_cmd, masscan_targets, port_spec, rate, wait,
-                timeout, found, seen, emit, sudo_password if use_sudo else None,
-                on_scan_progress=on_scan_progress, stop_event=stop_event)
-        if found:
-            return found, stderr[:500]
-        _raise_masscan_error(returncode, stderr)
-    return found, (stderr[:500] if stderr else "")
+        try:
+            proc = _masscan_popen(cmd, sudo_password if use_sudo else None,
+                                  merge_stderr=True, binary_stream=True)
+        except FileNotFoundError:
+            raise FileNotFoundError("masscan binary not found. Install masscan or use Python backend.")
+        # One merged pipe: masscan's \r progress, flushed Discovered lines and
+        # buffered -oL lines all arrive here; nothing can deadlock or stay hidden.
+        timed_out, other = _drain_masscan_stdout(proc, timeout, handle_result,
+                                                 progress_cb=on_scan_progress,
+                                                 stop_event=stop_event)
+        stderr = other
+        if timed_out:
+            if found:
+                note = (stderr[:400] + " " if stderr else "") + f"[partial: timed out after {timeout}s]"
+                return found, note.strip()
+            raise TimeoutError(f"masscan timed out after {timeout}s")
+        returncode, failed = _masscan_proc_error_info(proc, stderr)
+        if failed:
+            # An old masscan may not know --interactive; retry plainly (batched).
+            if "interactive" in (stderr or "") and "unknown" in (stderr or "").lower():
+                return _run_masscan_streaming_plain(
+                    base_cmd, masscan_targets, port_spec, rate, wait,
+                    timeout, found, seen, emit, sudo_password if use_sudo else None,
+                    exclude_args=exclude_args,
+                    on_scan_progress=on_scan_progress, stop_event=stop_event)
+            if found:
+                return found, stderr[:500]
+            _raise_masscan_error(returncode, stderr)
+        return found, (stderr[:500] if stderr else "")
+    finally:
+        _remove_masscan_exclude_file(exclude_path)
 
 
 def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wait,
                                  timeout, found, seen, emit, sudo_password,
+                                 exclude_args=None,
                                  on_scan_progress=None, stop_event=None):
     """Fallback for masscan builds without --interactive: same merged stream
     with only -oL - list lines (still live in chunks, no temp files)."""
-    cmd = base_cmd + list(masscan_targets) + [
+    cmd = base_cmd + list(masscan_targets) + list(exclude_args or []) + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),
