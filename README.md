@@ -116,6 +116,9 @@ The result table has a CRACKED column. Every handshake already detects likely of
 - Keeps a local SQLite history (`servers.db`) of every server ever seen via a
   successful status ping, with first-discovery and last-seen dates plus
   times-seen count. Every scan records automatically — no manual add step.
+  Bogons (loopback, private LAN, etc.) are never stored: they scan and
+  display normally, but local test servers don't belong in history (or in
+  other people's databases via sync).
 - Each server also keeps two player-name lists from status-ping samples:
   players online now (latest sample) and everyone ever seen (union of all
   samples, kept after logout, capped at 500 names per server).

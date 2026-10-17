@@ -389,6 +389,23 @@ def init_server_db():
             _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
             _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
             con.commit()
+            # One-time cleanup: bogons (loopback/LAN test servers) are no
+            # longer persisted, so drop any rows from before this rule
+            # (the sync-import filter keeps them from coming back).
+            try:
+                cur = con.execute("SELECT ip_port FROM servers")
+                drop = []
+                for (ip_port,) in cur.fetchall():
+                    try:
+                        if _is_bogon_ip(get_ip_only(ip_port or "")):
+                            drop.append((ip_port,))
+                    except Exception:
+                        continue
+                if drop:
+                    con.executemany("DELETE FROM servers WHERE ip_port=?", drop)
+                    con.commit()
+            except Exception:
+                pass
         finally:
             con.close()
 
@@ -406,6 +423,21 @@ def record_server_result(result, source="scan"):
         host, port = split_host_port(ip_port)
     except Exception:
         host, port = ip_port, 25565
+    # Era hint for future rescans (recorded even for servers we refuse to
+    # persist, so local test servers still rescan instantly).
+    try:
+        _remember_era(ip_port, sanitize_motd(result.get("version", "") or ""),
+                      result.get("protocol"))
+    except Exception:
+        pass
+    # Bogons (loopback, private LAN, ...) are never persisted: they are
+    # meaningless to anyone else (and the DB syncs to the shared network
+    # DB). Scanning/displaying them still works; only storage skips.
+    try:
+        if _is_bogon_ip(host):
+            return
+    except Exception:
+        pass
     motd = sanitize_motd(result.get("motd", ""))
     try:
         online = int(result.get("players", 0))
@@ -503,6 +535,11 @@ def update_server_cracked(ip_port, cracked_label, message=""):
     _ensure_server_db()
     if not ip_port:
         return
+    try:
+        if _is_bogon_ip(get_ip_only(ip_port)):
+            return
+    except Exception:
+        pass
     now = time.time()
     label = (cracked_label or "").strip() or "Yes"
     with _SERVER_DB_LOCK:
@@ -532,6 +569,11 @@ def update_server_whitelist(ip_port, whitelist_label):
     _ensure_server_db()
     if not ip_port:
         return
+    try:
+        if _is_bogon_ip(get_ip_only(ip_port)):
+            return
+    except Exception:
+        pass
     now = time.time()
     label = (whitelist_label or "").strip()
     with _SERVER_DB_LOCK:
@@ -857,6 +899,14 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 ip_port = str(raw.get("ip_port", "")).strip()
                 if not is_valid_ip_port(get_ip_only(ip_port)):
                     continue
+                # Never import bogons (loopback/LAN): other clients' local
+                # test servers are meaningless here (and we never upload
+                # our own, so skipping keeps both sides clean).
+                try:
+                    if _is_bogon_ip(get_ip_only(ip_port)):
+                        continue
+                except Exception:
+                    pass
                 try:
                     host, port = split_host_port(ip_port)
                 except Exception:
@@ -3217,9 +3267,17 @@ def _legacy_hint(ip_port):
 
     Lets rescans lead with the era's own probe instead of paying full
     discovery again (and, for poison-sensitive servers, avoids the modern
-    garbage that starts the poison). One indexed SELECT (~0.1ms), fully
-    guarded: missing DB/table/row all yield (None, None). Never raises.
+    garbage that starts the poison). Checks the in-memory sightings first
+    (covers servers skipped from the DB, like bogons), then one indexed
+    SELECT (~0.1ms), fully guarded: missing DB/table/row all yield
+    (None, None). Never raises.
     """
+    try:
+        hit = _ERA_CACHE.get(ip_port)
+        if hit is not None:
+            return hit
+    except Exception:
+        pass
     try:
         with _SERVER_DB_LOCK:
             con = _server_db_connect()
@@ -3246,6 +3304,29 @@ def _legacy_hint(ip_port):
         return version, protocol
     except Exception:
         return None, None
+
+
+# In-memory sightings (ip_port -> (version, protocol)), so rescans keep
+# era hints even for servers never written to the DB (bogons). Bounded;
+# oldest half is dropped when full.
+_ERA_CACHE = {}
+_ERA_CACHE_MAX = 10000
+
+
+def _remember_era(ip_port, version, protocol):
+    """Record a sighting in the era cache. Never raises."""
+    try:
+        if not ip_port:
+            return
+        if len(_ERA_CACHE) >= _ERA_CACHE_MAX:
+            try:
+                for k in list(_ERA_CACHE)[:len(_ERA_CACHE) // 2]:
+                    _ERA_CACHE.pop(k, None)
+            except Exception:
+                pass
+        _ERA_CACHE[ip_port] = (version, protocol)
+    except Exception:
+        pass
 
 
 def _hint_era(version, protocol):
@@ -5051,9 +5132,15 @@ def _bogon_containing(ip_int):
 
 
 def _is_bogon_ip(ip_str):
-    """True when the string is an IPv4 address in bogon space. Never raises."""
+    """True when the string is an IPv4 address in bogon space. Never raises.
+
+    Tolerates 'ip:port' (only the host part is tested).
+    """
     try:
-        addr = ipaddress.ip_address(str(ip_str).strip())
+        t = str(ip_str).strip()
+        if t.count(":") == 1 and "." in t:
+            t = t.rsplit(":", 1)[0]
+        addr = ipaddress.ip_address(t)
         return (addr.version == 4
                 and _bogon_containing(int(addr)) is not None)
     except Exception:
