@@ -134,6 +134,9 @@ MASSCAN_DEFAULT_RATE = 10000
 MASSCAN_DEFAULT_WAIT = 2
 MASSCAN_MAX_HOSTS = 1000000
 MASSCAN_OUTPUT_TIMEOUT_MARGIN = 30
+# Loopback ranges cannot ride masscan's SYN sweep (raw sockets), so they are
+# expanded to direct ip:port handshakes instead, bounded by this many pairs.
+LOOPBACK_DIRECT_MAX = 4096
 
 # Never trust a server-provided length.  Apart from protecting against broken
 # servers, this prevents a single scan target from reserving gigabytes of RAM.
@@ -417,7 +420,25 @@ def record_server_result(result, source="scan"):
         protocol = int(result.get("protocol")) if result.get("protocol") is not None else None
     except Exception:
         protocol = None
-    cracked = "Yes" if result.get("cracked") else "No"
+    # Cracked verdicts carry strength: hard evidence (a handshake server
+    # ID, a completed login probe, a UUID match) is firm and overwrites;
+    # heuristics (bare status ping, era rules) refresh only over nothing
+    # firm. "Yes (heuristic)" displays like Yes everywhere (truthiness).
+    try:
+        new_firm = bool(result.get("cracked_firm", False))
+    except Exception:
+        new_firm = False
+    try:
+        rc = result.get("cracked")
+        if rc == "Yes (heuristic)":
+            cracked = "Yes (heuristic)"
+        elif rc in ("Yes", "Yes (cached)", "No"):
+            cracked = rc
+        else:
+            cracked = "Yes" if rc else "No"
+    except Exception:
+        cracked = "No"
+        new_firm = False
     # Player-name lists: the live sample is the current roster; the union of
     # every sample ever seen stays after logout. Minescan hits carry no
     # sample (webscan doesn't report one), so they must not blank the list
@@ -448,10 +469,17 @@ def record_server_result(result, source="scan"):
                     times_seen = int(times_seen or 0) + 1
                 except Exception:
                     times_seen = 1
-                # Preserve a confirmed cracked/whitelist verdict; only the
-                # status-ping heuristic ("Yes"/"No") refreshes otherwise.
-                keep_cracked = old_cracked or cracked
-                if old_cracked in ("Yes", "Yes (cached)"):
+                # Preserve a firm cracked verdict; heuristics refresh over
+                # anything not firm, and firm evidence overwrites anything
+                # (e.g. an era-rule "Yes" yields to a session hash proving
+                # online-mode, or to offline proof the other way).
+                # "Yes (heuristic)" counts as Yes everywhere by truthiness.
+                keep_cracked = cracked
+                try:
+                    old_firm = old_cracked in ("Yes", "Yes (cached)")
+                except Exception:
+                    old_firm = False
+                if old_firm and not new_firm:
                     keep_cracked = old_cracked
                 now_json = (_encode_player_list(sample_names) if has_sample
                             else (old_now if old_now else "[]"))
@@ -2306,9 +2334,39 @@ def parse_description(desc):
             return sanitize_motd(''.join([x.get('text', '') for x in desc['extra']]))
     return ''
 
-def ping_server(entry, proxy=None):
+def _classify_ping_failure(exc):
+    """Exception -> short failure kind for filter detection. Never raises."""
     try:
-        host, port = split_host_port(entry)
+        if isinstance(exc, ConnectionRefusedError):
+            return "refused"
+        if isinstance(exc, (socket.timeout, TimeoutError)):
+            return "timeout"
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            return "reset"
+        if isinstance(exc, ValueError):
+            return "garbage"
+        if isinstance(exc, OSError):
+            return "error"
+    except Exception:
+        pass
+    return "error"
+
+
+# Cooldowns for the patient retry loop. Only ever slept when the failure
+# signature says "poisoned/filtered but alive" (modern + handshake both
+# RST right after connecting), never for dead hosts (refused/timeout).
+# PATIENT_FE_DELAY first: vanilla 1.0's poison window after a garbage
+# connection is ~2-5s, then one bare FE decides the path (a parse hit
+# means SLP-era: refine + handshake and done). Otherwise handshake-only
+# retries with long quiet gaps: anti-bot burst filters (e.g. 2beta2t)
+# hold ~10-18s and every extra connection extends it, so FE is never
+# retried and two spaced handshake attempts follow.
+PATIENT_FE_DELAY = 6
+PATIENT_HS_DELAYS = (12, 12)
+
+
+def _ping_modern_status(host, port, proxy=None, note=None):
+    try:
         with open_connection(host, port, proxy=proxy, timeout=TIMEOUT) as sock:
             sock.settimeout(TIMEOUT)
 
@@ -2379,13 +2437,18 @@ def ping_server(entry, proxy=None):
                 'players_sample': players_sample,
                 'cracked': cracked
             }
-            _remember_protocol(result['ip'], result['protocol'])
+            # Firm verdict only with UUID evidence; a bare no-sample False
+            # must never override a previously confirmed Yes in the DB.
+            result['cracked_firm'] = bool(cracked)
+            if isinstance(note, dict):
+                note["how"] = "ok"
+            return result
+    except Exception as exc:
+        if isinstance(note, dict):
             try:
-                record_server_result(result, source="scan")
+                note["how"] = _classify_ping_failure(exc)
             except Exception:
                 pass
-            return result
-    except:
         return None
 
 def format_player_list(sample):
@@ -2402,6 +2465,1004 @@ def format_player_list(sample):
         if isinstance(name, str) and name.strip():
             names.append(name.strip())
     return ", ".join(names) if names else "-"
+
+
+# ==================== LEGACY PING (beta / alpha servers) ====================
+# Server List Ping only exists since Beta 1.8: older servers answer neither
+# the modern JSON ping nor 0xFE. Beta <= 1.7.x answers the login handshake
+# (0x02); Alpha 1.2.x (protocol 6) wants the 0x01 login (Java-UTF strings!)
+# first and the 0x02 handshake second. Fallback chain:
+#   modern JSON -> Beta handshake -> legacy SLP -> Beta login -> Alpha login.
+
+LEGACY_VERSION_PRE14 = "Legacy (< 1.4)"
+LEGACY_VERSION_PRE18 = "Legacy (Beta <= 1.7)"
+LEGACY_VERSION_ALPHA = "Legacy (Alpha)"
+
+
+def _mc_ucs2(text):
+    """Length-prefixed big-endian UCS-2 string for pre-Netty packets."""
+    try:
+        encoded = str(text or "").encode("utf-16-be")
+    except Exception:
+        encoded = b""
+    return struct.pack(">h", len(encoded) // 2) + encoded
+
+
+def _recv_exact_bounded(sock, length, limit):
+    """Read exactly length bytes, enforcing a hard size limit."""
+    if length < 0 or length > limit:
+        raise ValueError(f"Packet too large ({length} bytes; limit {limit})")
+    data = bytearray()
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            raise IOError("Socket closed")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _read_legacy_packet(sock):
+    """Read one pre-Netty packet. Returns (packet_id, text)."""
+    pid = _recv_exact_bounded(sock, 1, 1)[0]
+    if pid not in (0x02, 0xFF):
+        raise ValueError(f"Unexpected legacy packet id {pid:#04x}")
+    (ln,) = struct.unpack(">h", _recv_exact_bounded(sock, 2, 2))
+    if ln < 0 or ln > 512:
+        raise ValueError(f"Bad legacy string length {ln}")
+    raw = _recv_exact_bounded(sock, ln * 2, 1024)
+    return pid, raw.decode("utf-16-be", errors="replace")
+
+
+def _legacy_result(host, port, motd, online, maximum, version, protocol,
+                   cracked):
+    return {
+        "ip": f"{host}:{port}",
+        "players": online,
+        "max_players": maximum,
+        "motd": motd,
+        "version": version,
+        "protocol": protocol,
+        "players_sample": [],
+        "cracked": cracked,
+    }
+
+
+def _parse_legacy_slp_text(text):
+    """0xFF SLP payload -> (motd, online, max, version, protocol) or None."""
+    try:
+        if text.startswith("§1\x00"):
+            parts = text.split("\x00")
+            if len(parts) != 6:
+                return None
+            _mark, proto, version, motd, online, maximum = parts
+            try:
+                protocol = int(proto)
+            except Exception:
+                protocol = None
+            return motd, int(online), int(maximum), version or "N/A", protocol
+        parts = text.split("§")
+        if len(parts) < 3:
+            return None
+        online, maximum = int(parts[-2]), int(parts[-1])
+        motd = "§".join(parts[:-2])
+        return motd, online, maximum, LEGACY_VERSION_PRE14, None
+    except Exception:
+        return None
+
+
+def _raw_13_handshake(host, port, proto, proxy=None, timeout=4):
+    """One byte-proto handshake. Returns (kind, text).
+
+    kind "fd" with the 0xFD server ID ("-" offline, hash online),
+    "kick" with kick text, or "none" (RST/timeout/close/garbage).
+    Never raises.
+    """
+    try:
+        p = int(proto)
+    except Exception:
+        return "none", ""
+    if not 15 <= p <= 127:
+        return "none", ""
+    try:
+        name = OFFLINE_PROBE_NAME
+    except Exception:
+        name = "karkat"
+    try:
+        with open_connection(host, port, proxy=proxy,
+                             timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"\x02" + bytes([p]) + _mc_ucs2(name)
+                         + _mc_ucs2(host) + struct.pack(">i", port))
+            pid = _recv_exact_bounded(sock, 1, 1)[0]
+            if pid == 0xFD:
+                (ln,) = struct.unpack(
+                    ">H", _recv_exact_bounded(sock, 2, 2))
+                if ln < 0 or ln > 256:
+                    return "none", ""
+                raw = _recv_exact_bounded(sock, ln * 2, 512)
+                try:
+                    return "fd", raw.decode("utf-16-be")
+                except Exception:
+                    return "none", ""
+            if pid == 0xFF:
+                try:
+                    (ln,) = struct.unpack(
+                        ">H", _recv_exact_bounded(sock, 2, 2))
+                    text = ""
+                    if 0 <= ln <= 256:
+                        raw = _recv_exact_bounded(sock, ln * 2, 512)
+                        try:
+                            text = raw.decode("utf-16-be",
+                                              errors="replace")
+                        except Exception:
+                            pass
+                    return "kick", text
+                except Exception:
+                    return "none", ""
+            return "none", ""
+    except Exception:
+        return "none", ""
+
+
+def _ping_13_handshake(host, port, proto, proxy=None, timeout=4):
+    """1.3 - 1.6 era handshake: 0x02 + byte(proto) + user + host + port.
+
+    Correct-proto servers answer 0xFD Encryption Request, whose server ID
+    is "-" in offline mode (cracked) and a session hash when online-mode
+    (whose dead upstream auth makes it unjoinable). Wrong proto kicks
+    "Outdated ..." instantly (also a detection signal, without verdict).
+    Use sparingly: each attempt holds a server login slot ~30s.
+    Returns True/False/None (offline / not-offline / no answer).
+    """
+    kind, text = _raw_13_handshake(host, port, proto, proxy=proxy,
+                                   timeout=timeout)
+    if kind == "fd":
+        return text == "-"
+    if kind == "kick":
+        return False
+    return None
+
+
+# Pre-1.4 release versions by byte-handshake protocol (wiki pre-netty
+# table + live verification; snapshots omitted -> proto-labeled fallback).
+_LEGACY_PROTO_VERSIONS = {
+    15: "Beta 1.8 pre", 16: "Beta 1.8 pre", 17: "Beta 1.8.1",
+    18: "Beta 1.9 pre", 19: "Beta 1.9 pre", 20: "Beta 1.9 pre",
+    21: "Beta 1.9 pre", 22: "1.0", 23: "1.1", 28: "1.2", 29: "1.2",
+    39: "1.3",
+}
+
+
+def _probe_13_search(host, port, proxy=None, timeout=3):
+    """Binary-search a 3-field server's byte-handshake protocol 15..39.
+
+    Each wrong guess kicks "Outdated server!" (server older, go lower) or
+    "Outdated client!" (server newer, go higher); the right one answers
+    0xFD with the server ID. Beta-era servers RST byte-handshakes (they
+    take username-only), so two consecutive uninformative attempts abort
+    back to the heuristic. Returns (proto_or_None, True/False/None):
+    verdict only ever comes from a 0xFD server ID.
+    """
+    lo, hi = 15, 39
+    misses = 0
+    tried = 0
+    try:
+        while lo <= hi and tried < 9:
+            mid = (lo + hi) // 2
+            tried += 1
+            try:
+                kind, text = _raw_13_handshake(host, port, mid,
+                                               proxy=proxy,
+                                               timeout=timeout)
+            except Exception:
+                kind, text = "none", ""
+            if kind == "fd":
+                try:
+                    return mid, (text == "-")
+                except Exception:
+                    return mid, None
+            if kind == "kick":
+                misses = 0
+                if "Outdated server!" in text:
+                    hi = mid - 1
+                elif "Outdated client!" in text:
+                    lo = mid + 1
+                else:
+                    return mid, None
+                continue
+            misses += 1
+            if misses >= 2:
+                return None, None
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _slp_16_payload(host, port):
+    """Full 1.6-style SLP payload: FE 01 FA + MC|PingHost + host + port."""
+    try:
+        host_enc = str(host or "").encode("utf-16-be")
+    except Exception:
+        host_enc = b""
+    try:
+        port_i = int(port)
+    except Exception:
+        port_i = 25565
+    return (b"\xfe\x01\xfa" + _mc_ucs2("MC|PingHost")
+            + struct.pack(">h", 7 + len(host_enc) // 2)
+            + b"\x4a" + _mc_ucs2(host) + struct.pack(">i", port_i))
+
+
+def _slp_fe01_once(host, port, payload, proxy=None, timeout=3):
+    """One FE-01-shape probe (bare or full 1.6 payload), parsed strictly.
+
+    Returns the parsed result (3-field or §1) or None. Never raises.
+    """
+    try:
+        with open_connection(host, port, proxy=proxy,
+                             timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(payload)
+            pid = _recv_exact_bounded(sock, 1, 1)[0]
+            if pid != 0xFF:
+                return None
+            (ln,) = struct.unpack(
+                ">H", _recv_exact_bounded(sock, 2, 2))
+            if ln < 0 or ln > 512:
+                return None
+            raw = _recv_exact_bounded(sock, ln * 2, 1024)
+            try:
+                text = raw.decode("utf-16-be")
+            except Exception:
+                return None
+            parsed = _parse_legacy_slp_text(text)
+            if not parsed:
+                return None
+            motd, online, maximum, version, protocol = parsed
+            return _legacy_result(host, port, motd, online, maximum,
+                                  version, protocol, False)
+    except Exception:
+        return None
+
+
+def _is_legacy_modern_answer(result):
+    """True when an SLP answer carries a modern (§1, proto > 78) version:
+    the server changed eras, fall through to the full chain."""
+    try:
+        return (result is not None
+                and result.get("protocol") is not None
+                and int(result.get("protocol")) > 78)
+    except Exception:
+        return False
+
+
+def _pre14_probe(host, port, proxy=None):
+    """Full pre-SLP treatment, ordered to never wedge old readers.
+
+    Bare FE is complete for the 3-field era and never poisons: servers
+    that answer it close the connection themselves. The lone handshake
+    comes next (Beta through 1.2 answer; zero garbage sent so far, so a
+    Beta/1.0/1.1/1.2 verdict lands with only clean closes behind it).
+    Only then the 1.6-only full payload (its plugin-message bytes wedge
+    pre-1.3 readers, which is why it runs after the verdict), and finally
+    the byte-proto binary search for 1.3.x. A modern §1 answer means the
+    server changed: returns None so the caller runs the chain.
+    Handshake verdicts are firm evidence both ways. Returns a result
+    dict or None. Never raises.
+    """
+    try:
+        fe_result = _ping_bare_fe(host, port, proxy=proxy)
+    except Exception:
+        fe_result = None
+    if fe_result is None:
+        return None
+    if _is_legacy_modern_answer(fe_result):
+        return None
+    result = _apply_beta_era_cracked(fe_result)
+    # Lone handshake (Beta through 1.2 answer with the server ID).
+    # Only a genuine 0x02 reply short-circuits: a kick proves the host
+    # but carries no verdict, so discovery continues past it.
+    try:
+        hs2 = _ping_beta_handshake(host, port, proxy=proxy)
+    except Exception:
+        hs2 = None
+    try:
+        if hs2 is not None and not hs2.get("motd"):
+            result["cracked"] = bool(hs2.get("cracked"))
+            result["cracked_firm"] = bool(hs2.get("cracked_firm", False))
+            return result
+    except Exception:
+        pass
+    # FE-01 shapes, only now that the verdict is settled: bare (1.4 - 1.5
+    # §1), then full (1.6 §1). A §1 hit updates version/protocol and, for
+    # 1.3 - 1.6, takes the byte-proto handshake verdict.
+    for payload in (b"\xfe\x01", _slp_16_payload(host, port)):
+        try:
+            hit = _slp_fe01_once(host, port, payload, proxy=proxy)
+        except Exception:
+            hit = None
+        try:
+            if hit is None or _is_legacy_modern_answer(hit):
+                continue
+            if hit.get("version") == LEGACY_VERSION_PRE14:
+                continue
+            fe_result = hit
+            break
+        except Exception:
+            continue
+    result = _apply_beta_era_cracked(fe_result)
+    try:
+        proto = int(result.get("protocol")) \
+            if result.get("protocol") is not None else None
+    except Exception:
+        proto = None
+    if proto is not None and 39 <= proto <= 78:
+        try:
+            v13 = _ping_13_handshake(host, port, proto, proxy=proxy)
+        except Exception:
+            v13 = None
+        try:
+            if v13 is not None:
+                result["cracked"] = bool(v13)
+                result["cracked_firm"] = True
+        except Exception:
+            pass
+        return result
+    # No username-only handshake answer and no exact protocol: 1.3.x
+    # RSTs lone handshakes but takes the byte form, so binary-search
+    # it via outdated kicks (each wrong guess also proves the family).
+    # Skipped once §1 already named a protocol (nothing to discover).
+    if proto is None:
+        try:
+            found_proto, verdict = _probe_13_search(
+                host, port, proxy=proxy)
+        except Exception:
+            found_proto, verdict = None, None
+        if found_proto is not None:
+            try:
+                result["protocol"] = int(found_proto)
+                result["version"] = _LEGACY_PROTO_VERSIONS.get(
+                    int(found_proto),
+                    f"Legacy (protocol {int(found_proto)})")
+                if verdict is not None:
+                    result["cracked"] = bool(verdict)
+                    result["cracked_firm"] = True
+            except Exception:
+                pass
+    return result
+
+
+def _ping_bare_fe(host, port, proxy=None, timeout=3):
+    """One bare-0xFE probe, parsed strictly. For patient-mode refine.
+
+    Beta 1.8 - 1.3 era servers answer bare 0xFE with MOTD§online§max (and
+    1.4+ with the §1 format); unlike the 3-payload SLP sweep this is a
+    single connection, safe right after a handshake (FE doesn't poison).
+    Returns a result dict or None. Never raises.
+    """
+    try:
+        with open_connection(host, port, proxy=proxy,
+                             timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"\xfe")
+            pid = _recv_exact_bounded(sock, 1, 1)[0]
+            if pid != 0xFF:
+                return None
+            (ln,) = struct.unpack(
+                ">H", _recv_exact_bounded(sock, 2, 2))
+            if ln < 0 or ln > 512:
+                return None
+            raw = _recv_exact_bounded(sock, ln * 2, 1024)
+            try:
+                text = raw.decode("utf-16-be")
+            except Exception:
+                return None
+            parsed = _parse_legacy_slp_text(text)
+            if not parsed:
+                return None
+            motd, online, maximum, version, protocol = parsed
+            return _legacy_result(host, port, motd, online, maximum,
+                                  version, protocol, False)
+    except Exception:
+        return None
+
+
+def _apply_beta_era_cracked(result):
+    """SLP result without handshake evidence: pre-1.6 era means offline.
+
+    Protocol < 72 used minecraft.net sessions, long dead, so online mode
+    is impossible and any joinable server is offline mode. (1.6+, protocol
+    72+, uses the live sessionserver.) The 3-field format only ever
+    existed pre-1.4. Marks the verdict "Yes (heuristic)": hard evidence
+    (a handshake, a login probe) still overrides it later, while a bare
+    status re-ping never downgrades anything. Mutates and returns result.
+    Never raises.
+    """
+    try:
+        if result is not None and not result.get("cracked"):
+            proto = result.get("protocol")
+            if (proto is not None and int(proto) < 72) or (
+                    result.get("version") == LEGACY_VERSION_PRE14):
+                result["cracked"] = "Yes (heuristic)"
+    except Exception:
+        pass
+    return result
+
+
+def _ping_legacy_slp(host, port, proxy=None, timeout=2):
+    """0xFE pings, newest first: 1.6-style, 1.4/1.5-style, Beta 1.8-1.3."""
+    try:
+        payload_16 = _slp_16_payload(host, port)
+    except Exception:
+        return None
+    for payload in (payload_16, b"\xfe\x01", b"\xfe"):
+        try:
+            with open_connection(host, port, proxy=proxy,
+                                 timeout=timeout) as sock:
+                sock.settimeout(timeout)
+                sock.sendall(payload)
+                data = bytearray()
+                try:
+                    while len(data) < 8192:
+                        chunk = sock.recv(8192 - len(data))
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                except Exception:
+                    pass
+            if len(data) < 3 or data[0] != 0xFF:
+                continue
+            try:
+                (ln,) = struct.unpack(">H", bytes(data[1:3]))
+                text = bytes(data[3:3 + ln * 2]).decode("utf-16-be")
+            except Exception:
+                continue
+            parsed = _parse_legacy_slp_text(text)
+            if not parsed:
+                continue
+            motd, online, maximum, version, protocol = parsed
+            return _legacy_result(host, port, motd, online, maximum,
+                                  version, protocol, False)
+        except Exception:
+            continue
+    return None
+
+
+def _ping_beta_handshake(host, port, proxy=None, timeout=2, note=None):
+    """Pre-SLP servers (Beta 1.2 - 1.7.x): 0x02 login-handshake probe.
+
+    Sends only the handshake (no Login packet, no auth, no join): a 0x02
+    reply proves a Minecraft server is listening. Server ID "-" means no
+    auth (offline mode); anything else is the online-mode session hash.
+    UCS-2BE username (Beta 1.0/1.1 read Java-UTF and RST this; those are
+    picked up by the alpha-stage kick plus a UTF handshake instead, so
+    this stays single-encoding and fast).
+    note (optional dict) receives the failure kind under "how".
+    """
+    try:
+        with open_connection(host, port, proxy=proxy, timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"\x02" + _mc_ucs2(OFFLINE_PROBE_NAME))
+            pid, text = _read_legacy_packet(sock)
+            if isinstance(note, dict):
+                note["how"] = "ok"
+            if pid == 0x02:
+                out = _legacy_result(host, port, "", 0, 0,
+                                     LEGACY_VERSION_PRE18, None, text == "-")
+                # Server-ID evidence either way ('-' vs session hash).
+                out["cracked_firm"] = True
+                return out
+            # A kick at handshake still proves a Minecraft server is listening.
+            out = _legacy_result(host, port, text[:300], 0, 0,
+                                 LEGACY_VERSION_PRE18, None, False)
+            out["cracked_firm"] = False
+            return out
+    except Exception as exc:
+        if isinstance(note, dict):
+            try:
+                note["how"] = _classify_ping_failure(exc)
+            except Exception:
+                pass
+        return None
+
+
+
+
+# Alpha 1.2.x (protocol 6) speaks Java-UTF strings (DataInput readUTF), not
+# the UCS-2BE strings of later versions -- verified against the vanilla
+# Alpha server 0.2.8 bytecode (Packet1Login.read: int, UTF, UTF, long, byte;
+# packet id 1 = login, 2 = handshake). Login order is inverted vs Beta:
+# client sends 0x01 first, then 0x02, and the server answers 0x02 with the
+# server ID ("-" offline, random hex when online-mode=true).
+ALPHA_LOGIN_PROTOCOL = 6
+
+
+def _alpha_utf(text):
+    """Java writeUTF: 2-byte byte-length + modified UTF-8. Never raises."""
+    try:
+        out = bytearray()
+        for ch in str(text or ""):
+            o = ord(ch)
+            if o == 0:
+                out += b"\xc0\x80"
+            elif o < 0x80:
+                out.append(o)
+            elif o < 0x800:
+                out += bytes([0xC0 | (o >> 6), 0x80 | (o & 0x3F)])
+            else:
+                out += bytes([0xE0 | (o >> 12), 0x80 | ((o >> 6) & 0x3F),
+                              0x80 | (o & 0x3F)])
+        if len(out) > 65535:
+            out = out[:65535]
+        return struct.pack(">H", len(out)) + bytes(out)
+    except Exception:
+        return b"\x00\x00"
+
+
+def _alpha_deutf(raw):
+    """Java readUTF-ish decode of modified UTF-8 bytes. Never raises."""
+    try:
+        data = bytes(raw or b"")
+        out = []
+        i = 0
+        while i < len(data):
+            b = data[i]
+            if b < 0x80:
+                out.append(chr(b))
+                i += 1
+            elif (b & 0xE0) == 0xC0:
+                if i + 1 >= len(data):
+                    break
+                out.append(chr(((b & 0x1F) << 6) | (data[i + 1] & 0x3F)))
+                i += 2
+            else:
+                if i + 2 >= len(data):
+                    break
+                out.append(chr(((b & 0x0F) << 12)
+                               | ((data[i + 1] & 0x3F) << 6)
+                               | (data[i + 2] & 0x3F)))
+                i += 3
+        return "".join(out)
+    except Exception:
+        return ""
+
+
+def _alpha_login_packet(username, protocol=ALPHA_LOGIN_PROTOCOL):
+    """Alpha 0x01 login: int protocol + UTF user + UTF pass + long + byte."""
+    try:
+        proto = int(protocol)
+    except Exception:
+        proto = ALPHA_LOGIN_PROTOCOL
+    return (b"\x01" + struct.pack(">i", proto) + _alpha_utf(username)
+            + _alpha_utf("") + struct.pack(">q", 0) + b"\x00")
+
+
+def _skip_alpha_login_response(sock):
+    """Consume one server 0x01 Login Response body. True when it parses.
+
+    Layout (same `ad` packet class both directions): int entity + UTF +
+    UTF + long seed + byte. A server that logs us in with no session
+    check is offline mode, full stop.
+    """
+    try:
+        _recv_exact_bounded(sock, 4, 4)
+        for _ in range(2):
+            (sln,) = struct.unpack(
+                ">H", _recv_exact_bounded(sock, 2, 2))
+            if sln < 0 or sln > 256:
+                return False
+            _recv_exact_bounded(sock, sln, 512)
+        _recv_exact_bounded(sock, 9, 9)
+        return True
+    except Exception:
+        return False
+
+
+def _alpha_utf_handshake(host, port, proxy=None, timeout=2):
+    """Beta 1.0/1.1-era UTF handshake on a fresh connection.
+
+    Those versions read Java-UTF strings (UCS-2BE bytes RST) and have no
+    SLP. A 0x02 reply proves the server; the server ID ("-" vs hash) is
+    firm evidence. Kicks/other/None yield None (caller keeps its kick
+    result). Never raises.
+    """
+    try:
+        name = OFFLINE_PROBE_NAME
+    except Exception:
+        name = "karkat"
+    try:
+        with open_connection(host, port, proxy=proxy,
+                             timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"\x02" + _alpha_utf(name))
+            pid = _recv_exact_bounded(sock, 1, 1)[0]
+            if pid != 0x02:
+                return None
+            (ln,) = struct.unpack(
+                ">H", _recv_exact_bounded(sock, 2, 2))
+            if ln < 0 or ln > 256:
+                return None
+            text = _alpha_deutf(_recv_exact_bounded(sock, ln, 768))
+            out = _legacy_result(host, port, "", 0, 0,
+                                 LEGACY_VERSION_PRE18, None,
+                                 text == "-")
+            out["cracked_firm"] = True
+            return out
+    except Exception:
+        return None
+
+
+def _ping_alpha_login(host, port, proxy=None, timeout=2):
+    """Alpha 1.2.x servers (protocol 6): 0x01 login, then 0x02 if needed.
+
+    Offline servers answer the 0x01 at once with an 0x01 Login Response
+    (the login completes server-side: cracked). Online-mode servers stay
+    silent (dead upstream auth) until they get the 0x02, which they answer
+    with the hex server ID. A wrong-protocol login parses far enough to
+    kick "Outdated ...", which also proves an ancient server.
+    Returns a result dict or None. Never raises (internally guarded).
+    """
+    try:
+        name = OFFLINE_PROBE_NAME
+    except Exception:
+        name = "karkat"
+    try:
+        with open_connection(host, port, proxy=proxy,
+                             timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(_alpha_login_packet(name))
+            # Offline servers answer the 0x01 promptly; online-mode ones
+            # stay silent (dead auth) until the 0x02 below. Read first so
+            # offline servers never see a stray out-of-state 0x02.
+            try:
+                sock.settimeout(1)
+                pid_raw = _recv_exact_bounded(sock, 1, 1)
+            except Exception:
+                pid_raw = b""
+            if pid_raw == b"\x01":
+                # Login Response without any session check: offline mode.
+                if _skip_alpha_login_response(sock):
+                    out = _legacy_result(host, port, "", 0, 0,
+                                         LEGACY_VERSION_ALPHA, None, True)
+                    out["cracked_firm"] = True
+                    return out
+                return None
+            if pid_raw == b"\xff":
+                try:
+                    sock.settimeout(4)
+                    (ln,) = struct.unpack(
+                        ">H", _recv_exact_bounded(sock, 2, 2))
+                    text = ""
+                    if 0 <= ln <= 512:
+                        text = _alpha_deutf(
+                            _recv_exact_bounded(sock, ln, 1536))
+                except Exception:
+                    text = ""
+                # Kick direction names who is outdated: "Outdated client!"
+                # means WE are older, i.e. the server is NEWER than proto 6
+                # (Beta 1.0+, which RSTs lone UCS-2 handshakes). Its UTF
+                # handshake works right away (kicks close cleanly), so ask
+                # it directly for the verdict instead of discarding this.
+                # "Outdated server!" means OLDER (old Alpha): label Alpha.
+                if "Outdated client!" in text:
+                    try:
+                        hs_out = _alpha_utf_handshake(host, port,
+                                                      proxy=proxy,
+                                                      timeout=timeout)
+                    except Exception:
+                        hs_out = None
+                    if hs_out is not None:
+                        return hs_out
+                    return _legacy_result(host, port, text[:300], 0, 0,
+                                          LEGACY_VERSION_PRE18, None, False)
+                return _legacy_result(host, port, text[:300], 0, 0,
+                                      LEGACY_VERSION_ALPHA, None, False)
+            if pid_raw not in (b"",):
+                # Unexpected first packet (e.g. stray 0x02): not Alpha.
+                return None
+            # Silence: online-mode (or filtered) server waiting. The 0x02
+            # completes the dance; the reply carries the verdict (a slow
+            # offline S:01 landing here is handled too).
+            try:
+                sock.sendall(b"\x02" + _alpha_utf(name))
+            except Exception:
+                return None
+            try:
+                sock.settimeout(4)
+            except Exception:
+                pass
+            try:
+                pid = _recv_exact_bounded(sock, 1, 1)[0]
+            except Exception:
+                return None
+            if pid == 0x01:
+                if _skip_alpha_login_response(sock):
+                    out = _legacy_result(host, port, "", 0, 0,
+                                         LEGACY_VERSION_ALPHA, None, True)
+                    out["cracked_firm"] = True
+                    return out
+                return None
+            if pid not in (0x02, 0xFF):
+                return None
+            try:
+                (ln,) = struct.unpack(
+                    ">H", _recv_exact_bounded(sock, 2, 2))
+                text = ""
+                if 0 <= ln <= 768:
+                    text = _alpha_deutf(_recv_exact_bounded(sock, ln, 1536))
+            except Exception:
+                return None
+            if pid == 0x02:
+                out = _legacy_result(host, port, "", 0, 0,
+                                     LEGACY_VERSION_ALPHA, None,
+                                     text == "-")
+                # Server-ID evidence either way ('-' vs session hash).
+                out["cracked_firm"] = True
+                return out
+            # Kick direction names who is outdated: "Outdated client!"
+            # means WE are older, i.e. the server is NEWER than proto 6
+            # (Beta 1.0+ -- not Alpha, let other stages decide).
+            # "Outdated server!" means it is OLDER (old Alpha), and any
+            # other kick (auth/full/ban on proto 6) is Alpha 1.2.6 itself.
+            if "Outdated client!" in text:
+                return None
+            return _legacy_result(host, port, text[:300], 0, 0,
+                                  LEGACY_VERSION_ALPHA, None, False)
+    except Exception:
+        return None
+
+
+def _legacy_hint(ip_port):
+    """Last-seen (version, protocol) for this server, or (None, None).
+
+    Lets rescans lead with the era's own probe instead of paying full
+    discovery again (and, for poison-sensitive servers, avoids the modern
+    garbage that starts the poison). One indexed SELECT (~0.1ms), fully
+    guarded: missing DB/table/row all yield (None, None). Never raises.
+    """
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                cur = con.execute(
+                    "SELECT version, protocol FROM servers WHERE ip_port=?",
+                    (ip_port,))
+                row = cur.fetchone()
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+        if not row:
+            return None, None
+        try:
+            version = row[0] or None
+        except Exception:
+            version = None
+        try:
+            protocol = row[1]
+        except Exception:
+            protocol = None
+        return version, protocol
+    except Exception:
+        return None, None
+
+
+def _hint_era(version, protocol):
+    """Version label/protocol -> 'alpha' | 'pre14' | 'beta' | None.
+
+    None means no usable hint: probe in the normal order (modern first).
+    Never raises.
+    """
+    try:
+        v = (version or "").strip()
+        if v == LEGACY_VERSION_ALPHA:
+            return "alpha"
+        if v == LEGACY_VERSION_PRE14:
+            return "pre14"
+        if v == LEGACY_VERSION_PRE18:
+            return "beta"
+        if v.startswith("b1.") or v.startswith("Beta"):
+            return "beta"
+        m = re.match(r"^1\.(\d+)", v)
+        if m:
+            try:
+                minor = int(m.group(1))
+            except Exception:
+                return None
+            if minor <= 6:
+                return "pre14"
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def _hs_with_slp_refine(host, port, proxy=None, note=None):
+    """Beta handshake, refined by SLP when one answers. Shared by the
+    normal chain and the history-hint fast path. Returns a result or None.
+    Never raises.
+    """
+    try:
+        handshaked = _ping_beta_handshake(host, port, proxy=proxy,
+                                          note=note)
+    except Exception:
+        handshaked = None
+    if handshaked is None:
+        return None
+    result = handshaked
+    try:
+        refined = _ping_legacy_slp(host, port, proxy=proxy)
+    except Exception:
+        refined = None
+    if refined is not None:
+        try:
+            if handshaked.get("cracked"):
+                refined["cracked"] = True
+        except Exception:
+            pass
+        result = refined
+    return result
+
+
+def ping_server(entry, proxy=None):
+    """Status ping with legacy fallback.
+
+    Modern JSON first, then the Beta login handshake (Beta <= 1.7 has no
+    ping protocol; tried before any 0xFE because some filters RST
+    handshakes for a while after seeing 0xFE probes), then legacy SLP
+    (Beta 1.8 - 1.6 era, also refines a handshake hit with version/counts),
+    then the Alpha 1.2.x login dance (0x01 first with Java-UTF strings,
+    then 0x02), then patient retries for poisoned/filtered hosts (bare FE
+    first -- FE never poisons -- then handshake).
+    Rescans consult the history DB first: a known Legacy row leads with
+    that era's own probe (no modern garbage, no poison, usually instant),
+    falling back to the full chain when the hint misses.
+    Detection only: no chat is sent and logins are never played out --
+    though an Alpha-offline server logs a join on the 0x01 alone.
+    Every success records to the history DB; None means nothing answered.
+    """
+    try:
+        host, port = split_host_port(entry)
+    except Exception:
+        return None
+    result = None
+    try:
+        era = _hint_era(*_legacy_hint(f"{host}:{port}"))
+    except Exception:
+        era = None
+    if era == "pre14" and result is None:
+        # Era-complete probe (MOTD/counts/verdict); None falls through.
+        try:
+            result = _pre14_probe(host, port, proxy=proxy)
+        except Exception:
+            result = None
+    if era == "beta" and result is None:
+        try:
+            result = _hs_with_slp_refine(host, port, proxy=proxy)
+        except Exception:
+            result = None
+    if era == "alpha" and result is None:
+        try:
+            result = _ping_alpha_login(host, port, proxy=proxy)
+        except Exception:
+            result = None
+    if result is not None:
+        try:
+            _remember_protocol(result["ip"], result.get("protocol"))
+        except Exception:
+            pass
+        try:
+            record_server_result(result, source="scan")
+        except Exception:
+            pass
+        return result
+    modern_note: dict = {}
+    try:
+        result = _ping_modern_status(host, port, proxy=proxy,
+                                     note=modern_note)
+    except Exception:
+        result = None
+    if result is None:
+        # Handshake BEFORE any 0xFE: some filters (e.g. 2beta2t) RST
+        # handshakes for ~15s after seeing 0xFE probes, but answer an
+        # unprovoked handshake immediately.
+        handshake_note: dict = {}
+        burst_filtered = False
+        try:
+            result = _hs_with_slp_refine(host, port, proxy=proxy,
+                                         note=handshake_note)
+        except Exception:
+            result = None
+        if result is None:
+            if modern_note.get("how") in (
+                    "reset", "garbage", "error") and handshake_note.get(
+                    "how") in ("reset", "error"):
+                # Burst/poison signature: something is alive, but extra
+                # connections right now only extend its memory. Skip the
+                # 3-payload SLP sweep (each attempt is another connection)
+                # and go quiet until the patient loop; the bare-FE probe
+                # there covers the SLP eras with a single connection.
+                # Dead hosts (refused/timeout) never reach this branch.
+                burst_filtered = True
+            else:
+                try:
+                    result = _ping_legacy_slp(host, port, proxy=proxy)
+                except Exception:
+                    result = None
+                # No handshake evidence (it failed), but the SLP itself may
+                # prove pre-1.6 era (then online mode is impossible).
+                result = _apply_beta_era_cracked(result)
+                # 1.3 - 1.6 with an exact protocol: one byte-proto
+                # handshake settles the verdict via its 0xFD server ID.
+                try:
+                    proto = int(result.get("protocol")) \
+                        if result is not None and \
+                        result.get("protocol") is not None else None
+                except Exception:
+                    proto = None
+                if result is not None and proto is not None \
+                        and 39 <= proto <= 78:
+                    try:
+                        v13 = _ping_13_handshake(host, port, proto,
+                                                 proxy=proxy)
+                    except Exception:
+                        v13 = None
+                    try:
+                        if v13 is not None:
+                            result["cracked"] = bool(v13)
+                            result["cracked_firm"] = True
+                    except Exception:
+                        pass
+    if result is None:
+        try:
+            result = _ping_alpha_login(host, port, proxy=proxy)
+        except Exception:
+            result = None
+    if result is None and burst_filtered:
+        # Something is alive but burst-poisoned the early probes (vanilla
+        # 1.0 RSTs anything arriving hot on a garbage connection's heels;
+        # anti-bot filters do the same deliberately). Every extra
+        # connection can extend the silent treatment, so spend them
+        # carefully: one pre14 probe after the short cooldown (bare FE
+        # never poisons and carries MOTD/counts/era, FE-01 refines 1.4+,
+        # handshakes settle the verdict), then handshake-only retries --
+        # never FE again, filters RST it on sight.
+        try:
+            time.sleep(PATIENT_FE_DELAY)
+        except Exception:
+            pass
+        try:
+            result = _pre14_probe(host, port, proxy=proxy)
+        except Exception:
+            result = None
+        if result is None:
+            for delay in PATIENT_HS_DELAYS:
+                try:
+                    time.sleep(delay)
+                except Exception:
+                    pass
+                try:
+                    result = _ping_beta_handshake(host, port, proxy=proxy)
+                except Exception:
+                    result = None
+                if result is not None:
+                    break
+    if result is None:
+        return None
+    try:
+        _remember_protocol(result["ip"], result.get("protocol"))
+    except Exception:
+        pass
+    try:
+        record_server_result(result, source="scan")
+    except Exception:
+        pass
+    try:
+        result.pop("cracked_firm", None)
+    except Exception:
+        pass
+    return result
 
 
 # ==================== CRACKED SERVER CHECKER ====================
@@ -3665,16 +4726,21 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
             seen.add(host)
             hosts.append(host)
 
-    def add_int_hosts(lo, hi, skip):
-        """Emit usable hosts in [lo, hi], jumping over exclude.conf blocks."""
+    def add_int_hosts(lo, hi, skip, raw=False):
+        """Emit usable hosts in [lo, hi], jumping over exclude.conf blocks.
+
+        raw=True skips the exclusion jumps (explicit loopback ranges are
+        the local machine, so there is nothing to carve out).
+        """
         cur = lo
         while cur <= hi and len(hosts) < max_hosts:
-            try:
-                cur = _next_allowed_host(cur, hi)
-            except Exception:
-                pass
-            if cur is None or cur > hi:
-                break
+            if not raw:
+                try:
+                    cur = _next_allowed_host(cur, hi)
+                except Exception:
+                    pass
+                if cur is None or cur > hi:
+                    break
             if cur not in skip:
                 add_host(str(ipaddress.ip_address(cur)))
             cur += 1
@@ -3692,9 +4758,11 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
         if net.version != 4:
             return
         try:
-            subs = subtract_excludes_from_spec(spec)
+            raw = _spec_within_bogons(spec)
+            subs = [spec] if raw else subtract_excludes_from_spec(spec)
         except Exception:
             subs = [spec]
+            raw = False
         skip = set()
         try:
             if net.num_addresses > 2:
@@ -3710,7 +4778,7 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
                 continue
             if rng is None:
                 continue
-            add_int_hosts(rng[0], rng[1], skip)
+            add_int_hosts(rng[0], rng[1], skip, raw=raw)
 
     def add_dash_hosts(token):
         """Enumerate a start-end range, jumping over exclude.conf blocks."""
@@ -3720,7 +4788,11 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
             rng = None
         if rng is None:
             return
-        add_int_hosts(rng[0], rng[1], set())
+        try:
+            raw = _spec_within_bogons(token)
+        except Exception:
+            raw = False
+        add_int_hosts(rng[0], rng[1], set(), raw=raw)
 
     tokens = _split_target_tokens(target_text)
 
@@ -3948,9 +5020,84 @@ def _load_exclude_state():
     return _EXCLUDE_CACHE
 
 
-def is_excluded_ip(ip_str):
-    """True when the IPv4 address falls inside exclude.conf. Never raises."""
+# Bogons: IPv4 space that is never publicly routable (loopback, RFC1918
+# private use, link-local, TEST-NET documentation, benchmarking, multicast,
+# reserved). Scanning it can only ever touch the local machine/LAN, so an
+# explicitly entered bogon target always works -- only sweeps skip it.
+# Deliberately NOT included: 100.64.0.0/10 (carrier-grade NAT is ISP-shared
+# space, potentially other customers) and anything publicly routable
+# (complaint entries stay enforced even when typed explicitly).
+_BOGON_NETS = tuple(
+    ipaddress.ip_network(c) for c in (
+        "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
+        "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24",
+        "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+        "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+        "255.255.255.255/32",
+    )
+)
+
+
+def _bogon_containing(ip_int):
+    """The bogon net containing this address int, or None. Never raises."""
     try:
+        for net in _BOGON_NETS:
+            if int(net.network_address) <= ip_int <= int(
+                    net.broadcast_address):
+                return net
+    except Exception:
+        pass
+    return None
+
+
+def _is_bogon_ip(ip_str):
+    """True when the string is an IPv4 address in bogon space. Never raises."""
+    try:
+        addr = ipaddress.ip_address(str(ip_str).strip())
+        return (addr.version == 4
+                and _bogon_containing(int(addr)) is not None)
+    except Exception:
+        return False
+
+
+_LOOPBACK_NET = ipaddress.ip_network("127.0.0.0/8")
+
+
+def _is_loopback_ip(ip_str):
+    """True when the string is an IPv4 address in 127.0.0.0/8. Never raises."""
+    try:
+        addr = ipaddress.ip_address(str(ip_str).strip())
+        return addr.version == 4 and addr in _LOOPBACK_NET
+    except Exception:
+        return False
+
+
+def _spec_within_loopback(spec):
+    """True when an IP/CIDR/dash spec lies entirely in 127.0.0.0/8."""
+    try:
+        rng = _spec_int_range(spec)
+        if rng is None:
+            return False
+        lo, hi = rng
+        return (lo >= int(_LOOPBACK_NET.network_address)
+                and hi <= int(_LOOPBACK_NET.broadcast_address))
+    except Exception:
+        return False
+
+
+def is_excluded_ip(ip_str):
+    """True when the IPv4 address falls inside exclude.conf. Never raises.
+
+    Bogons (loopback, RFC1918, ...) are never treated as excluded: they
+    are not publicly routable, so explicitly typing e.g. 127.0.0.1 or
+    192.168.1.5 (test servers, LAN) always works. Sweeps are unaffected --
+    range enumeration carves via the raw intervals (which still contain
+    bogon space), so 0.0.0.0/0 and friends keep skipping it; only
+    explicitly entered bogon addresses get through.
+    """
+    try:
+        if _is_bogon_ip(ip_str):
+            return False
         addr = ipaddress.ip_address(str(ip_str).strip())
         if addr.version != 4:
             return False
@@ -4004,6 +5151,26 @@ def _spec_int_range(spec):
         return (int(addr), int(addr))
     except Exception:
         return None
+
+
+def _spec_within_bogons(spec):
+    """True when an IP/CIDR/dash spec lies entirely inside ONE bogon net.
+
+    Such specs are explicitly entered local-only space (e.g. 192.168.0.0/16
+    or 127.0.0.0/30), so builders keep them whole instead of carving.
+    Specs merely overlapping bogons (e.g. 192.0.0.0/8, 0.0.0.0/0) carve
+    normally. Never raises.
+    """
+    try:
+        rng = _spec_int_range(spec)
+        if rng is None:
+            return False
+        lo, hi = rng
+        net = _bogon_containing(lo)
+        return (net is not None
+                and hi <= int(net.broadcast_address))
+    except Exception:
+        return False
 
 
 def subtract_excludes_from_spec(spec):
@@ -4080,7 +5247,7 @@ def exclude_summary():
     return f" (exclude.conf: {n} entr{'y' if n == 1 else 'ies'})" if n else ""
 
 
-def _write_masscan_exclude_file():
+def _write_masscan_exclude_file(targets=None):
     """Normalized exclude.conf -> temp file for masscan --excludefile.
 
     masscan refuses huge sweeps ("range too big, need confirmation") unless
@@ -4089,14 +5256,43 @@ def _write_masscan_exclude_file():
     hosts even if our own range carving ever missed one. Returns the temp
     path, or None when there is nothing to exclude. The caller must unlink
     the file once masscan no longer needs it. Never raises.
+
+    Bogon nets (loopback, RFC1918, ...) intersecting the target list are
+    omitted: such targets are always explicitly entered local-only space,
+    which our carving deliberately kept -- without this masscan would skip
+    them anyway. Swept ranges never intersect bogon nets (carving removed
+    them), so sweeps keep full exclusion. Complaint entries are never
+    omitted.
     """
     try:
         nets = _load_exclude_state().get("nets") or []
+        specs = []
+        try:
+            for spec in (targets or []):
+                s = (spec or "").strip()
+                # Tolerate 'ip:port' direct targets (only the IP matters).
+                if s.count(":") == 1 and "." in s:
+                    s = s.rsplit(":", 1)[0]
+                rng = _spec_int_range(s)
+                if rng is not None:
+                    specs.append(rng)
+        except Exception:
+            specs = []
         lines = []
         for net in nets:
             try:
                 if net.version != 4:
                     continue
+                try:
+                    lo, hi = int(net.network_address), int(
+                        net.broadcast_address)
+                    bogon = _bogon_containing(lo) is not None and (
+                        _bogon_containing(hi) is not None)
+                    if bogon and any(
+                            tlo <= hi and thi >= lo for tlo, thi in specs):
+                        continue
+                except Exception:
+                    pass
                 if net.prefixlen == 32:
                     lines.append(str(net.network_address))
                 else:
@@ -4197,25 +5393,31 @@ def build_masscan_inputs(target_text, ports):
     Returns (masscan_targets, direct_targets):
       masscan_targets: list of 'IP', 'CIDR' or 'start-end' strings for masscan.
       direct_targets: list of 'ip:port' strings to ping directly (explicit ports
-        outside the scan port list, or entries masscan cannot express).
+        outside the scan port list, entries masscan cannot express, and all
+        loopback targets -- masscan's SYN discovery cannot cover 127.0.0.0/8,
+        so loopback handshakes directly with no privileges needed).
     Hostnames are resolved to IPs for masscan; unresolvable names are skipped.
 
     Every valid range is passed through: masscan sweeps huge/multi ranges
     natively (timeout and progress scale with the size), so unlike the
     Python path there is no host budget that could silently drop a range.
+    (Loopback ranges instead expand to direct targets, capped.)
     """
     ports = list(dict.fromkeys(int(p) for p in (ports or [25565]) if 1 <= int(p) <= 65535)) or [25565]
     port_set = set(ports)
     masscan_targets = []
     direct_targets = []
     seen_range = set()
+    loopback_direct_n = 0
 
     def add_range(spec):
         spec = spec.strip()
         if not spec or spec in seen_range:
             return
         try:
-            subs = subtract_excludes_from_spec(spec)
+            # Explicit bogon ranges are local-only space: keep whole.
+            subs = ([spec] if _spec_within_bogons(spec)
+                    else subtract_excludes_from_spec(spec))
         except Exception:
             subs = [spec]
         for sub in subs:
@@ -4231,6 +5433,26 @@ def build_masscan_inputs(target_text, ports):
         if (ip_port not in direct_targets and not is_ignored(ip_port)
                 and not _target_is_excluded(ip_port)):
             direct_targets.append(ip_port)
+
+    def add_direct_ips(ips, only_ports=None):
+        """Loopback IPs straight to handshake targets (ip:port per port).
+
+        masscan's SYN sweep cannot cover loopback, and a direct handshake
+        needs no raw-socket privileges. Capped at LOOPBACK_DIRECT_MAX pairs.
+        """
+        nonlocal loopback_direct_n
+        try:
+            plist = list(only_ports) if only_ports is not None else ports
+        except Exception:
+            plist = ports
+        for ip in ips or []:
+            for p in plist:
+                if loopback_direct_n >= LOOPBACK_DIRECT_MAX:
+                    return
+                before = len(direct_targets)
+                add_direct(f"{ip}:{p}")
+                if len(direct_targets) > before:
+                    loopback_direct_n += 1
 
     tokens = _split_target_tokens(target_text)
 
@@ -4260,6 +5482,15 @@ def build_masscan_inputs(target_text, ports):
                     continue
                 if net.version != 4:
                     continue
+                if _spec_within_loopback(str(net)):
+                    lo, hi = int(net.network_address), int(net.broadcast_address)
+                    ips = []
+                    cur = lo
+                    while cur <= hi and len(ips) < LOOPBACK_DIRECT_MAX:
+                        ips.append(str(ipaddress.ip_address(cur)))
+                        cur += 1
+                    add_direct_ips(ips)
+                    continue
                 add_range(str(net))
                 continue
             if "-" in token and "/" not in token and ":" not in token:
@@ -4270,6 +5501,10 @@ def build_masscan_inputs(target_text, ports):
                 except ValueError:
                     continue
                 if start.version != 4 or end.version != 4 or int(end) < int(start):
+                    continue
+                if _spec_within_loopback(token):
+                    add_direct_ips(expand_ip_range(
+                        left.strip(), right.strip(), LOOPBACK_DIRECT_MAX))
                     continue
                 add_range(f"{start}-{end}")
                 continue
@@ -4290,6 +5525,11 @@ def build_masscan_inputs(target_text, ports):
                         ip_str = socket.gethostbyname(host)
                     except Exception:
                         continue
+                if _is_loopback_ip(ip_str):
+                    # Loopback needs no SYN discovery; handshake directly
+                    # (this also spares localhost scans the sudo prompt).
+                    add_direct(f"{ip_str}:{explicit_port}")
+                    continue
                 if explicit_port in port_set:
                     add_range(ip_str)
                 else:
@@ -4297,6 +5537,9 @@ def build_masscan_inputs(target_text, ports):
                 continue
             try:
                 ipaddress.ip_address(token)
+                if _is_loopback_ip(token):
+                    add_direct_ips([token.strip()])
+                    continue
                 add_range(token)
                 continue
             except ValueError:
@@ -4304,6 +5547,9 @@ def build_masscan_inputs(target_text, ports):
             try:
                 ip_str = socket.gethostbyname(token)
             except Exception:
+                continue
+            if _is_loopback_ip(ip_str):
+                add_direct_ips([ip_str])
                 continue
             add_range(ip_str)
         except Exception:
@@ -4681,7 +5927,9 @@ def build_minescan_inputs(target_text, ports, max_hosts=MINESCAN_MAX_HOSTS):
         if spec and spec not in seen_range:
             try:
                 before = _masscan_count_hosts(spec, cap=None)
-                subs = subtract_excludes_from_spec(spec)
+                # Explicit bogon ranges are local-only space: keep whole.
+                subs = ([spec] if _spec_within_bogons(spec)
+                        else subtract_excludes_from_spec(spec))
                 after = sum(_masscan_count_hosts(s, cap=None) for s in subs)
                 if after < before:
                     excluded_hosts += before - after
@@ -5221,7 +6469,11 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             )
         # -S reads the password from stdin, -p "" suppresses sudo's own prompt.
         base_cmd = ["sudo", "-S", "-p", "", exe]
-    exclude_path = _write_masscan_exclude_file()
+    try:
+        specs_note = list(masscan_targets or [])
+    except Exception:
+        specs_note = []
+    exclude_path = _write_masscan_exclude_file(targets=specs_note)
     exclude_args = ["--excludefile", exclude_path] if exclude_path else []
     cmd = base_cmd + list(masscan_targets) + exclude_args + [
         "-p", port_spec,
@@ -5351,7 +6603,11 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     # --excludefile (when exclusions exist) satisfies masscan's "range too
     # big" confirmation for internet-scale sweeps, and makes masscan itself
     # skip excluded hosts as a second layer under our own range carving.
-    exclude_path = _write_masscan_exclude_file()
+    try:
+        specs_note = list(masscan_targets or [])
+    except Exception:
+        specs_note = []
+    exclude_path = _write_masscan_exclude_file(targets=specs_note)
     exclude_args = ["--excludefile", exclude_path] if exclude_path else []
     cmd = base_cmd + list(masscan_targets) + exclude_args + [
         "-p", port_spec,
@@ -7598,7 +8854,11 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             return
                         eta = _format_masscan_eta(_masscan_estimate_seconds(
                             ranges, ports, masscan_rate, masscan_wait))
-                        say(f"masscan: discovering open ports on ~{ms_hosts:,} host(s){exclude_summary()} (live){eta}...")
+                        if not ranges and direct:
+                            say(f"masscan: {len(direct)} loopback/direct target(s),"
+                                f" handshaking{exclude_summary()} (no SYN sweep)...")
+                        else:
+                            say(f"masscan: discovering open ports on ~{ms_hosts:,} host(s){exclude_summary()} (live){eta}...")
                         outcome = "ok"
                         try:
                             _, masscan_note = run_masscan_streaming(
