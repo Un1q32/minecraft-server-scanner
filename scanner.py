@@ -40,6 +40,7 @@ def _require_nbtlib():
 
 # Qt (PySide6) UI + threading
 import threading
+_QT_AVAILABLE = True
 try:
     from PySide6.QtCore import Qt, QTimer, QThread
     from PySide6.QtGui import QIcon, QPixmap, QImage, QColor
@@ -49,17 +50,69 @@ try:
         QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QSplitter,
         QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
     )
+except ImportError:
+    # Headless fallback: the scanning/DB/sync core below must stay usable
+    # without Qt (headless servers, CLI). GUI classes still *define*
+    # against these inert stand-ins but must never be instantiated
+    # headless; CLI paths never touch them.
+    _QT_AVAILABLE = False
+    import types as _stub_types
+    from unittest import mock as _stub_mock
+
+    def _make_qt_stub_module(_name):
+        _mod = _stub_types.ModuleType(_name)
+
+        def __getattr__(_attr, _mod=_mod, _name=_name):
+            _cls = type(_attr, (_stub_mock.MagicMock,), {})
+            _cls.__module__ = _name
+            setattr(_mod, _attr, _cls)
+            return _cls
+
+        _mod.__getattr__ = __getattr__
+        sys.modules[_name] = _mod
+        return _mod
+
+    for _m in ("PySide6", "PySide6.QtCore", "PySide6.QtGui",
+               "PySide6.QtWidgets"):
+        _make_qt_stub_module(_m)
+    del _make_qt_stub_module
+    from PySide6.QtCore import Qt, QTimer, QThread
+    from PySide6.QtGui import QIcon, QPixmap, QImage, QColor
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
+        QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
+        QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QSplitter,
+        QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    )
+try:
     from qt_helpers import (
         QtBaseMixin, ResultTable, make_table_sortable, q_ask_open, q_ask_save,
         q_ask_string, q_error, q_info, ask_reason_with_whitelist,
         ensure_shodan_key_ui as _qt_ensure_shodan_key_ui,
         SudoPasswordDialog, ui_after,
     )
-except ImportError as _qt_err:
-    raise SystemExit(
-        "PySide6 is required for the Qt UI (pip install PySide6). "
-        f"Import failed: {_qt_err}"
+except ImportError:
+    # Same headless deal for the Qt helper module (it imports PySide6
+    # itself, so it is missing exactly when Qt is). A working PySide6
+    # install is left alone; only the helper names are stubbed.
+    _QT_AVAILABLE = False
+    import types as _stub_types
+    from unittest import mock as _stub_mock
+    _qh = _stub_types.ModuleType("qt_helpers")
+    for _n in ("QtBaseMixin", "ResultTable", "make_table_sortable",
+               "q_ask_open", "q_ask_save", "q_ask_string", "q_error",
+               "q_info", "ask_reason_with_whitelist",
+               "ensure_shodan_key_ui", "SudoPasswordDialog", "ui_after"):
+        setattr(_qh, _n, type(_n, (_stub_mock.MagicMock,),
+                             {"__module__": "qt_helpers"}))
+    sys.modules["qt_helpers"] = _qh
+    from qt_helpers import (
+        QtBaseMixin, ResultTable, make_table_sortable, q_ask_open, q_ask_save,
+        q_ask_string, q_error, q_info, ask_reason_with_whitelist,
+        ensure_shodan_key_ui as _qt_ensure_shodan_key_ui,
+        SudoPasswordDialog, ui_after,
     )
+    del _qh
 
 import base64  
 import io      

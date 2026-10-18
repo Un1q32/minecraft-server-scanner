@@ -206,6 +206,27 @@ Run:
 
 The application stores its working files in the current working directory unless a path uses %APPDATA% explicitly.
 
+## Headless CLI (`mcscan.py`)
+
+The same scanning/DB/sync code with no Qt dependency, for headless
+servers — `import scanner` falls back to inert UI stubs when PySide6 is
+absent, and every CLI path below avoids them. Target syntax is identical
+to the GUI's Network Scan box (IPs, CIDRs, `start-end` ranges, ASNs,
+hostnames). Run it from the same working directory as the GUI so it
+shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
+
+    python mcscan.py --sync                  # sync shared DB (netdb.json creds)
+    python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
+    python mcscan.py --export out.csv        # dump the full local DB as CSV
+
+Useful flags: `--backend {auto,masscan,minescan,python}` (default `auto`,
+masscan first like the GUI), `--ports 25565,25566`, `--rate`, `--wait`,
+`--max-hosts`. Discovery only (status ping + player sample) — whitelist
+and cracked login probes stay in the GUI. Like the GUI, masscan needs
+raw-socket privileges: run as root, rely on passwordless sudo for the
+automatic retry, or pick another backend. Ctrl-C stops a running scan
+and keeps results found so far.
+
 ## Text format
 
 The standard exported server line is:
