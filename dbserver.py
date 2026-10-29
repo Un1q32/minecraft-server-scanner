@@ -82,6 +82,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -97,6 +98,8 @@ IP_PORT_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$")
 MAX_BODY_BYTES = 25 * 1024 * 1024
 MAX_SERVERS_PER_REQUEST = 20000
 MAX_SERVERS_PER_RESPONSE = 50000
+SQLITE_MAX_INT = 2 ** 63 - 1     # larger ints overflow the sqlite3 binding
+MAX_TIMESTAMP = 1e18             # far beyond any real epoch, still finite
 TIMESTAMP_SKEW = 300
 NONCE_CACHE_MAX = 20000
 
@@ -201,8 +204,28 @@ def db_connect(db_path):
     return con
 
 
+_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_sql_ident(name):
+    """Identifier for DDL interpolation: bare [A-Za-z0-9_] only.
+
+    SQLite cannot bind table/column names, so anything interpolated into
+    PRAGMA/ALTER must be whitelisted, never escaped.
+    """
+    text = str(name or "")
+    if not _SQL_IDENT_RE.match(text):
+        raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return text
+
+
 def _add_column_if_missing(con, column, ddl):
+    """Migration helper; see _safe_sql_ident (migrations are not user input)."""
     try:
+        column = _safe_sql_ident(column)
+        ddl = str(ddl or "")
+        if not re.fullmatch(r"[A-Za-z0-9_ ()\[\]'.,+-]+", ddl):
+            return
         existing = {row[1] for row in con.execute("PRAGMA table_info(servers)")}
         if column not in existing:
             con.execute(f"ALTER TABLE servers ADD COLUMN {column} {ddl}")
@@ -230,6 +253,26 @@ def init_db(db_path):
         con.commit()
     finally:
         con.close()
+
+
+def _clamp_seq(value):
+    """Query cursor -> [0, sqlite INTEGER max], or None when unparseable."""
+    try:
+        v = int(value)
+    except Exception:
+        return None
+    return max(0, min(v, SQLITE_MAX_INT))
+
+
+def _clamp_ts(value):
+    """Query timestamp -> finite non-negative float (0.0 when unusable)."""
+    try:
+        v = float(value)
+    except Exception:
+        return 0.0
+    if math.isnan(v) or math.isinf(v):
+        return 0.0
+    return max(0.0, min(v, MAX_TIMESTAMP))
 
 
 def _clamp_str(value, limit):
@@ -642,15 +685,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "servers": n, "now": _utcnow()})
                 return
             qs = parse_qs(parsed.query or "")
-            try:
-                since_seq = (qs.get("since_seq") or [None])[0]
-                since_seq = None if since_seq is None else int(since_seq)
-            except Exception:
-                since_seq = None
-            try:
-                since = float((qs.get("since") or ["0"])[0])
-            except Exception:
-                since = 0.0
+            raw_seq = (qs.get("since_seq") or [None])[0]
+            since_seq = None if raw_seq is None else _clamp_seq(raw_seq)
+            since = _clamp_ts((qs.get("since") or ["0"])[0])
             try:
                 limit = int((qs.get("limit") or [str(MAX_SERVERS_PER_RESPONSE)])[0])
             except Exception:
@@ -700,15 +737,9 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(incoming, list) or len(incoming) > MAX_SERVERS_PER_REQUEST:
             self._send_json(400, {"error": "bad 'servers' list"})
             return
-        try:
-            since_seq = payload.get("since_seq", None)
-            since_seq = None if since_seq is None else int(since_seq)
-        except Exception:
-            since_seq = None
-        try:
-            since = float(payload.get("since", 0) or 0)
-        except Exception:
-            since = 0.0
+        raw_seq = payload.get("since_seq", None)
+        since_seq = None if raw_seq is None else _clamp_seq(raw_seq)
+        since = _clamp_ts(payload.get("since", 0) or 0)
         merged = 0
         with _db_lock:
             con = db_connect(self.server.db_path)

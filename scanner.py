@@ -393,9 +393,34 @@ def record_cracked_server(ip_port, message="", extra=None):
 # manual "add" step is needed. first_seen is set once; last_seen, the
 # latest MOTD/players/version and times_seen update on every re-sight.
 
+_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_sql_ident(name):
+    """Identifier for DDL interpolation: bare [A-Za-z0-9_] only.
+
+    SQLite cannot parameterize table/column names, so anything that ends up
+    in PRAGMA/ALTER must be whitelisted rather than escaped.
+    """
+    text = str(name or "")
+    if not _SQL_IDENT_RE.match(text):
+        raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return text
+
+
 def _add_column_if_missing(con, table, column, ddl):
-    """Add a column to an existing local DB without recreating it."""
+    """Add a column to an existing local DB without recreating it.
+
+    Migrations only: table/column are validated identifiers and the type
+    declaration is restricted to a conservative character set, because DDL
+    cannot use bound parameters. No user-controlled text may reach this.
+    """
     try:
+        table = _safe_sql_ident(table)
+        column = _safe_sql_ident(column)
+        ddl = str(ddl or "")
+        if not re.fullmatch(r"[A-Za-z0-9_ ()\[\]'.,+-]+", ddl):
+            return
         existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
@@ -408,6 +433,16 @@ def _add_column_if_missing(con, table, column, ddl):
 # players_ever = union of every name ever seen in a sample (stays after logout).
 PLAYERS_EVER_MAX = 500  # cap per server; samples only hold ~12 names per sighting
 PLAYER_NAME_MAX_LEN = 32  # Minecraft names are <= 16 chars; allow extra headroom
+# Server-reported text is attacker-controlled: a hostile "Minecraft server"
+# can return megabytes of MOTD/version/sample inside the 4 MB status cap.
+# Stored fields are clamped to what the shared DB already accepts, so one
+# such server cannot bloat servers.db or the sync upload.
+MAX_MOTD_CHARS = 500
+MAX_VERSION_CHARS = 100
+MAX_SOURCE_CHARS = 64
+MAX_COUNTED_PLAYERS = 1_000_000
+MAX_SAMPLE_NAMES = 100       # per sighting (vanilla samples ~12)
+MAX_SANITIZE_INPUT = 4000    # bound the regex work on hostile strings
 
 
 def _clean_player_name(name):
@@ -440,7 +475,7 @@ def _sample_names(sample):
                     names.append(cleaned)
             except Exception:
                 continue
-        return sorted(set(names), key=str.lower)
+        return sorted(set(names), key=str.lower)[:MAX_SAMPLE_NAMES]
     except Exception:
         return []
 
@@ -554,8 +589,8 @@ def record_server_result(result, source="scan"):
     _ensure_server_db()
     if not isinstance(result, dict) or not result.get("ip"):
         return
-    ip_port = result.get("ip")
-    if not is_valid_ip_port(get_ip_only(ip_port)):
+    ip_port = strict_ip_port(result.get("ip"))
+    if not ip_port:
         return
     now = time.time()
     try:
@@ -570,16 +605,23 @@ def record_server_result(result, source="scan"):
             return
     except Exception:
         pass
-    motd = sanitize_motd(result.get("motd", ""))
+    motd = sanitize_motd(result.get("motd", ""))[:MAX_MOTD_CHARS]
     try:
-        online = int(result.get("players", 0))
+        online = max(0, min(int(result.get("players", 0)),
+                            MAX_COUNTED_PLAYERS))
     except Exception:
         online = 0
     try:
-        maximum = int(result.get("max_players", 0))
+        maximum = max(0, min(int(result.get("max_players", 0)),
+                             MAX_COUNTED_PLAYERS))
     except Exception:
         maximum = 0
-    version = sanitize_motd(result.get("version", "") or "")
+    version = sanitize_motd(result.get("version", "") or "")[
+        :MAX_VERSION_CHARS]
+    try:
+        source = str(source or "")[:MAX_SOURCE_CHARS] or "scan"
+    except Exception:
+        source = "scan"
     try:
         protocol = int(result.get("protocol")) if result.get("protocol") is not None else None
     except Exception:
@@ -642,13 +684,18 @@ def update_server_cracked(ip_port, cracked_label, message=""):
     _ensure_server_db()
     if not ip_port:
         return
+    ip_port = strict_ip_port(ip_port)
+    if not ip_port:
+        return
     try:
-        if _is_bogon_ip(get_ip_only(ip_port)):
+        # Only well-formed ip:port rows are ever written; every value is
+        # bound, this just keeps junk keys out of the table.
+        if _is_bogon_ip(ip_port):
             return
     except Exception:
-        pass
+        return
     now = time.time()
-    label = (cracked_label or "").strip() or "Yes"
+    label = (cracked_label or "").strip()[:32] or "Yes"
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
@@ -676,13 +723,16 @@ def update_server_whitelist(ip_port, whitelist_label):
     _ensure_server_db()
     if not ip_port:
         return
+    ip_port = strict_ip_port(ip_port)
+    if not ip_port:
+        return
     try:
-        if _is_bogon_ip(get_ip_only(ip_port)):
+        if _is_bogon_ip(ip_port):
             return
     except Exception:
-        pass
+        return
     now = time.time()
-    label = (whitelist_label or "").strip()
+    label = (whitelist_label or "").strip()[:200]
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
@@ -1003,8 +1053,8 @@ def netdb_merge_remote(servers, upload_watermark=None):
             for raw in servers:
                 if not isinstance(raw, dict):
                     continue
-                ip_port = str(raw.get("ip_port", "")).strip()
-                if not is_valid_ip_port(get_ip_only(ip_port)):
+                ip_port = strict_ip_port(raw.get("ip_port"))
+                if not ip_port:
                     continue
                 # Never import bogons (loopback/LAN): other clients' local
                 # test servers are meaningless here (and we never upload
@@ -2140,6 +2190,20 @@ def sanitize_query_for_filename(query):
 def is_valid_ip_port(entry):
     return re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$", entry)
 
+
+def strict_ip_port(value):
+    """Bare 'ip:port' or None.
+
+    Unlike get_ip_only(), which extracts a valid-looking prefix from free
+    text, this rejects anything that is not exactly an ip:port -- so junk
+    (including SQL-ish payloads) can never become a DB key.
+    """
+    try:
+        text = str(value or "").strip()
+    except Exception:
+        return None
+    return text if is_valid_ip_port(text) else None
+
 def get_ip_only(line_or_ip):  #
     if " |" in line_or_ip:
         line_or_ip = line_or_ip.split(" |")[0]
@@ -2239,6 +2303,8 @@ def version_filter_allows(version, selected):
     
 def sanitize_motd(m):
     m = "" if m is None else str(m)
+    if len(m) > MAX_SANITIZE_INPUT:
+        m = m[:MAX_SANITIZE_INPUT]
     m = re.sub(r"§[0-9A-FK-ORa-fk-or]", "", m)  # strip legacy MC color/style codes
     return re.sub(r"\s+", " ", m.replace("\r", " ").replace("\n", " ")).strip()
 
