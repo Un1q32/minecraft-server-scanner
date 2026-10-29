@@ -210,6 +210,7 @@ to the GUI's Network Scan box (IPs, CIDRs, `start-end` ranges, ASNs,
 hostnames). Run it from the same working directory as the GUI so it
 shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
 
+    python mcscan.py --init-db URL TOKEN    # save shared-DB creds to netdb.json
     python mcscan.py --sync                  # sync shared DB (netdb.json creds)
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV

@@ -4,9 +4,10 @@
 Shares all scanning/DB/sync code with the GUI (scanner.py), which imports
 fine without Qt. Target syntax is identical to the GUI's Network Scan box:
 IPs, CIDRs, start-end ranges, ASNs, hostnames, comma/space/newline
-separated -- e.g. "1.0.0.0/8, AS13335, 2beta2t.org".
+separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
 
   mcscan.py --sync                  sync shared DB (creds from netdb.json)
+  mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --scan 1.0.0.0/8 ...    scan, print hits live, then sync
   mcscan.py --export out.csv        dump the full local DB to CSV
 
@@ -53,13 +54,43 @@ def _sync_creds():
         (cfg.get("token", "") or "").strip()
 
 
+def cmd_init_db(url, token):
+    """Write shared-DB creds to netdb.json (preserving sync progress)."""
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        print("error: both URL and token are required: "
+              "--init-db URL TOKEN")
+        return 2
+    try:
+        cfg = scanner.netdb_load_config()
+    except Exception:
+        cfg = {}
+    try:
+        last_sync = float((cfg or {}).get("last_sync", 0) or 0)
+    except Exception:
+        last_sync = 0.0
+    try:
+        last_seq = int((cfg or {}).get("last_seq", 0) or 0)
+    except Exception:
+        last_seq = 0
+    scanner.netdb_save_config(url, token, last_sync, last_seq)
+    # netdb_save_config swallows IO errors, so verify the write.
+    saved_url, saved_token = _sync_creds()
+    if saved_url != url or saved_token != token:
+        print("error: could not write netdb.json "
+              "(check directory permissions).")
+        return 1
+    print(f"saved shared-DB URL and token to {scanner.NETDB_CONFIG_FILE}")
+    return 0
+
+
 def cmd_sync():
     """Sync the shared DB using netdb.json. Returns exit code."""
     url, token = _sync_creds()
     if not url or not token:
-        print("error: netdb.json has no URL/token yet -- paste them in the "
-              "GUI's Servers tab once, or create netdb.json with "
-              '{"url": ..., "token": ...}.')
+        print("error: netdb.json has no URL/token yet -- run "
+              "'mcscan.py --init-db URL TOKEN' first.")
         return 2
     print(f"syncing shared DB at {url} ...")
     try:
@@ -399,6 +430,9 @@ def main(argv=None):
         description="Headless Minecraft server scanner (shares the "
                     "GUI's code; Qt never required).")
     parser.add_argument(
+        "--init-db", nargs=2, metavar=("URL", "TOKEN"), default=None,
+        help="save shared-DB URL and token to netdb.json")
+    parser.add_argument(
         "--sync", action="store_true",
         help="sync the shared DB using creds in netdb.json")
     parser.add_argument(
@@ -426,7 +460,8 @@ def main(argv=None):
         help="Python-backend host cap (default: %(default)s)")
     args = parser.parse_args(argv)
 
-    if not args.sync and args.targets is None and not args.export:
+    if not args.sync and args.targets is None and not args.export \
+            and args.init_db is None:
         parser.print_help()
         return 2
     try:
@@ -434,6 +469,8 @@ def main(argv=None):
     except Exception as exc:
         print(f"warning: DB init failed: {exc}")
     rc = 0
+    if args.init_db is not None:
+        rc = cmd_init_db(*args.init_db) or rc
     if args.sync:
         rc = cmd_sync() or rc
     if args.targets is not None:

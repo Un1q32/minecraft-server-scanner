@@ -3837,8 +3837,14 @@ def expand_scan_targets(target_text, ports, max_hosts=NETWORK_SCAN_MAX_HOSTS):
                 add_cidr_hosts(token)
                 continue
             host, explicit_port = split_host_port(token) if ":" in token else (token, None)
-            ipaddress.ip_address(host)
-            add_host(f"{host}:{explicit_port}" if explicit_port else host)
+            # Hostnames resolve to their IPv4 (masscan/minescan backends
+            # already do this; the Python backend used to drop them).
+            try:
+                ipaddress.ip_address(host)
+                ip_str = host
+            except ValueError:
+                ip_str = socket.gethostbyname(host)
+            add_host(f"{ip_str}:{explicit_port}" if explicit_port else ip_str)
         except Exception:
             continue
 
