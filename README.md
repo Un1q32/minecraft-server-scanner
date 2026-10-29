@@ -260,8 +260,12 @@ diluted into their `/20` so a rescan doesn't burst at known addresses.
 
 Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
 sweeps a random slice of the internet rather than all four billion
-addresses. The shared DB is synced every `--sync-every` seconds (default
-300) and once more on exit, so peers see new finds promptly.
+addresses. While a round runs, a status line at the bottom of the terminal
+counts servers found so far in that round — `new`, `updated` and total
+hits — and is rewritten in place as results arrive (when output is piped
+it prints a plain summary line every 15 seconds instead). The shared DB is
+synced every `--sync-every` seconds (default 300) and once more on exit, so
+peers see new finds promptly.
 
 `--strategies slash24a,slash32b` restricts the pool, `--no-rescan` skips
 the rescan half, and `--rounds N` stops after N rounds (useful for

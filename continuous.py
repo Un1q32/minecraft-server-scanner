@@ -36,6 +36,7 @@ back to the Python handshake pool and skips rounds that are too large.
 import json
 import os
 import random
+import sys
 import threading
 import time
 
@@ -53,6 +54,8 @@ DENSE_IP_SERVERS = 8            # slash32c: only IPs with this many servers
 DEFAULT_FOUND = 1_000_000       # matscan's "never scored yet" seed
 PY_MAX_PROBES = 250_000         # refuse bigger rounds on the Python backend
 RANDOM_EXPLORE = 0.10
+STATUS_INTERVAL = 0.3           # live status redraw (seconds)
+STATUS_LOG_INTERVAL = 15.0      # redraw cadence when output is piped
 
 STRATEGY_NAMES = (
     "slash0", "slash16a", "slash16b",
@@ -289,6 +292,117 @@ def rescan_targets(rows, tier):
     return targets
 
 
+# --- live round status ----------------------------------------------------
+class LiveStatus:
+    """One-line status pinned under the round output.
+
+    On a terminal the line is rewritten in place (cursor up, clear, draw)
+    so the screen doesn't scroll while a round runs. When stdout is piped
+    it degrades to a plain summary line every few seconds, which keeps
+    redirected logs readable. ``note()`` prints a message without losing
+    the bar.
+    """
+
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stdout
+        try:
+            self.tty = bool(self.stream.isatty())
+        except Exception:
+            self.tty = False
+        self.active = False
+        self.label = ""
+        self.stats = {"new": 0, "updated": 0, "revived": 0, "total": 0}
+        self.started = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._drawn = False
+        self._last_log = 0.0
+
+    # -- rendering --
+    def _line(self):
+        s = self.stats
+        elapsed = max(0.0, time.time() - self.started)
+        return (f"[{self.label}] new {s['new']} | updated {s['updated']}"
+                f" | {s['total']} hit(s) | {int(elapsed) // 60:02d}:"
+                f"{int(elapsed) % 60:02d}")
+
+    def _draw_locked(self):
+        line = self._line()
+        if self._drawn:
+            self.stream.write("\x1b[1A\r\x1b[2K")
+        self.stream.write(line + "\n")
+        self.stream.flush()
+        self._drawn = True
+
+    def _erase_locked(self):
+        if self._drawn:
+            self.stream.write("\x1b[1A\r\x1b[2K")
+            self.stream.flush()
+            self._drawn = False
+
+    # -- lifecycle --
+    def start(self, label):
+        with self._lock:
+            self.label = label
+            self.stats = {"new": 0, "updated": 0, "revived": 0, "total": 0}
+            self.started = time.time()
+            self.active = True
+            self._last_log = time.time()
+            if self.tty:
+                self._draw_locked()
+        if not self.tty:
+            self._thread = threading.Thread(target=self._ticker, daemon=True)
+            self._thread.start()
+
+    def _ticker(self):
+        while not self._stop.wait(STATUS_INTERVAL):
+            with self._lock:
+                if not self.active:
+                    return
+                now = time.time()
+                if now - self._last_log >= STATUS_LOG_INTERVAL:
+                    self._last_log = now
+                    self.stream.write(self._line() + "\n")
+                    self.stream.flush()
+
+    def note(self, message):
+        """Print a message without losing the bar."""
+        with self._lock:
+            if self.tty and self.active and self._drawn:
+                self._erase_locked()
+                self.stream.write(str(message) + "\n")
+                self._draw_locked()
+            else:
+                self.stream.write(str(message) + "\n")
+                self.stream.flush()
+
+    def hit(self, kind):
+        """kind: 'new' | 'updated' | 'revived' -- revived counts as updated."""
+        with self._lock:
+            if not self.active:
+                return
+            if kind == "new":
+                self.stats["new"] += 1
+            else:
+                self.stats["updated"] += 1
+            self.stats["total"] += 1
+            if self.tty:
+                self._draw_locked()
+
+    def stop(self):
+        with self._lock:
+            self.active = False
+            self._erase_locked()
+        self._stop.set()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=1.0)
+            except Exception:
+                pass
+            self._thread = None
+
+
 # --- strategy picker (persisted scores) -----------------------------------
 class StrategyPicker:
     def __init__(self, path, enabled=None):
@@ -370,12 +484,14 @@ def _sudo_retryable():
 
 
 def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
-              backend="auto", on_hit=None, allow_sudo=True):
+              backend="auto", on_hit=None, allow_sudo=True, log=None):
     """Run one time-boxed sweep. Returns result dicts.
 
     Uses masscan when available (explicit ranges/ports), else the Python
-    handshake pool for rounds small enough to finish.
+    handshake pool for rounds small enough to finish. ``log`` routes
+    messages through the live status bar when one is active.
     """
+    _log = log or print
     ranges = _carve(ranges)
     if not ranges:
         return []
@@ -386,8 +502,8 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
         if backend == "masscan":
             raise FileNotFoundError("masscan binary not found")
         if est > PY_MAX_PROBES:
-            print(f"  skipping: ~{est:,} probes is too much for the Python "
-                  f"backend (install masscan or use --backend masscan)")
+            _log(f"  skipping: ~{est:,} probes is too much for the Python "
+                 f"backend (install masscan or use --backend masscan)")
             return []
 
     results = []
@@ -427,8 +543,8 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 sweep(False)
             except PermissionError:
                 if allow_sudo and _sudo_retryable():
-                    print("  masscan needs root; retrying with passwordless "
-                          "sudo...")
+                    _log("  masscan needs root; retrying with passwordless "
+                         "sudo...")
                     sweep(True)
                 else:
                     raise
@@ -451,7 +567,7 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
             " ".join(ranges), ports,
             max_hosts=min(host_cap, PY_MAX_PROBES))
     except Exception as exc:
-        print(f"  target expansion failed: {exc}")
+        _log(f"  target expansion failed: {exc}")
         return []
     if not targets:
         return []
@@ -467,24 +583,39 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
     return results
 
 
+def _classify_one(before, result, now=None):
+    """Classify one result: 'new' | 'updated' | 'revived' | None.
+
+    'revived' is an updated server that had been unseen for a week.
+    """
+    try:
+        ip_port = result.get("ip", "")
+    except Exception:
+        return None
+    if not ip_port:
+        return None
+    now = now or _now()
+    seen = before.get(ip_port)
+    if seen is None:
+        return "new"
+    if seen > 0 and now - seen > REVIVED_AFTER:
+        return "revived"
+    return "updated"
+
+
 def _classify(before, results):
     """(new, new_on_25565, revived) versus the pre-round snapshot."""
-    now = _now()
     new = new_def = revived = 0
     for result in results:
-        try:
-            ip_port = result.get("ip", "")
-        except Exception:
-            continue
-        if not ip_port:
-            continue
-        seen = before.get(ip_port)
-        if seen is None:
+        kind = _classify_one(before, result)
+        if kind == "new":
             new += 1
-            if _port_of(ip_port) == 25565:
-                new_def += 1
-            continue
-        if seen > 0 and now - seen > REVIVED_AFTER:
+            try:
+                if _port_of(result.get("ip", "")) == 25565:
+                    new_def += 1
+            except Exception:
+                pass
+        elif kind == "revived":
             revived += 1
     return new, new_def, revived
 
@@ -537,7 +668,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     # never dies just because it isn't running as root.
     state = {"backend": backend}
 
-    def do_round(ranges, ports, duration=None):
+    def do_round(ranges, ports, duration=None, on_hit=None, log=None):
         """run_round with daemon-grade error handling.
 
         Returns (results, fatal). A fatal error (masscan explicitly
@@ -545,28 +676,30 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
         everything else is logged and the loop keeps going. In auto mode a
         masscan failure retries the round with the Python backend.
         """
+        _log = log or print
         for attempt in range(2):
             current = state["backend"]
             try:
                 return (run_round(
                     ranges, ports, rate=rate, wait=wait,
                     scan_duration=duration or scan_duration,
-                    stop_event=stop_event, backend=current), False)
+                    stop_event=stop_event, backend=current,
+                    on_hit=on_hit, log=_log), False)
             except (PermissionError, FileNotFoundError) as exc:
                 if current == "masscan":
-                    print(f"  error: masscan unavailable: {exc}")
-                    print("  run as root (or with passwordless sudo), "
-                          "or use --backend python")
+                    _log(f"  error: masscan unavailable: {exc}")
+                    _log("  run as root (or with passwordless sudo), "
+                         "or use --backend python")
                     return ([], True)
                 if attempt == 0:
-                    print(f"  masscan unavailable ({exc}); "
-                          "using the Python backend from here on")
+                    _log(f"  masscan unavailable ({exc}); "
+                         "using the Python backend from here on")
                     state["backend"] = "python"
                     continue
-                print(f"  round failed: {exc}")
+                _log(f"  round failed: {exc}")
                 return ([], False)
             except Exception as exc:
-                print(f"  round failed: {exc}")
+                _log(f"  round failed: {exc}")
                 return ([], False)
         return ([], False)
 
@@ -586,9 +719,22 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
             started = time.time()
             results = []
             name = None
+            status = LiveStatus()
+            counts = {"new": 0, "updated": 0, "revived": 0, "total": 0}
+            count_lock = threading.Lock()
+
+            def on_hit(result, _before=before):
+                kind = _classify_one(_before, result)
+                if kind is None:
+                    return
+                with count_lock:
+                    counts[kind] += 1
+                    counts["total"] += 1
+                status.hit(kind)
 
             if body == "normal":
                 name = picker.pick()
+                label = f"round {rounds} {name}"
                 print(f"strategy: {name}")
                 try:
                     ranges, ports = STRATEGIES[name](before_rows)
@@ -598,7 +744,12 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                 if ranges:
                     print(f"  {len(ranges)} target spec(s), "
                           f"{len(ports)} port(s)")
-                results, fatal = do_round(ranges, ports)
+                status.start(label)
+                try:
+                    results, fatal = do_round(ranges, ports, on_hit=on_hit,
+                                              log=status.note)
+                finally:
+                    status.stop()
                 if fatal:
                     _sync_now(url, token)
                     return 1
@@ -618,24 +769,32 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     by_port = {}
                     for spec, port in targets:
                         by_port.setdefault(port, []).append(spec)
-                    for port, specs in sorted(by_port.items()):
-                        if stop_event.is_set():
-                            break
-                        batch, fatal = do_round(
-                            specs, [port],
-                            duration=max(30, scan_duration // 2))
-                        results.extend(batch)
-                        if fatal:
-                            _sync_now(url, token)
-                            return 1
+                    status.start(f"round {rounds} rescan")
+                    try:
+                        for port, specs in sorted(by_port.items()):
+                            if stop_event.is_set():
+                                break
+                            batch, fatal = do_round(
+                                specs, [port],
+                                duration=max(30, scan_duration // 2),
+                                on_hit=on_hit, log=status.note)
+                            results.extend(batch)
+                            if fatal:
+                                _sync_now(url, token)
+                                return 1
+                    finally:
+                        status.stop()
                 else:
                     print("  nothing due")
 
             elapsed = max(0.0, time.time() - started)
             new, new_def, revived = _classify(before, results)
-            print(f"  {len(results)} responded, {new} new "
-                  f"({new_def} on 25565), {revived} revived, "
-                  f"{elapsed:.0f}s")
+            with count_lock:
+                live_total = counts["total"]
+                live_updated = counts["updated"]
+            print(f"  {live_total} responded, {new} new "
+                  f"({new_def} on 25565), {live_updated} updated, "
+                  f"{revived} revived, {elapsed:.0f}s")
             if name:
                 score = round((new + 5 * new_def + 0.1 * revived)
                               * 3600.0 / (elapsed + 30.0))
