@@ -749,7 +749,11 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     print(f"  strategy failed: {exc}")
                     ranges, ports = [], []
                 if ranges:
-                    print(f"  {len(ranges)} target spec(s), "
+                    carved_n = len(_carve(ranges))
+                    dropped = len(ranges) - carved_n
+                    note = (f", {dropped} removed by exclude.conf"
+                            if dropped else "")
+                    print(f"  {carved_n} target spec(s){note}, "
                           f"{len(ports)} port(s)")
                 status.start(label)
                 try:

@@ -275,6 +275,12 @@ the rescan half, and `--rounds N` stops after N rounds (useful for
 testing). The deep-port strategies need masscan and root; without them the
 Python backend skips rounds whose probe count exceeds its cap.
 
+`exclude.conf` applies to every round, to both halves: strategy ranges and
+rescan targets (including padded /20s) are carved before any backend runs,
+and masscan additionally receives them as an `--excludefile`. The round
+header reports how many specs that removed, and edits to the file apply to
+the next round without a restart.
+
 ## Text format
 
 The standard exported server line is:

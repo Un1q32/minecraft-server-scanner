@@ -254,6 +254,69 @@ def _cached_protocol(ip_port):
             return _PROTOCOL_CACHE.get(ip_port)
     except Exception:
         return None
+
+
+def _stored_protocol(ip_port):
+    """Last-seen protocol for this server from servers.db, or None.
+
+    Lets a whitelist probe start with the right protocol after a restart,
+    instead of spending an extra status connection to discover it (which
+    Paper-style connection throttles treat as a rapid reconnect).
+    """
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                cur = con.execute(
+                    "SELECT protocol FROM servers WHERE ip_port=?",
+                    (ip_port,))
+                row = cur.fetchone()
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
+    except Exception:
+        return None
+
+
+def _persist_protocol(ip_port, protocol):
+    """Store a protocol discovered by a probe, so future probes skip the
+    status connection. Only updates existing rows (never creates one)."""
+    try:
+        protocol = int(protocol)
+    except Exception:
+        return
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                cur = con.execute(
+                    "SELECT protocol FROM servers WHERE ip_port=?",
+                    (ip_port,))
+                row = cur.fetchone()
+                if not row:
+                    return
+                try:
+                    old = int(row[0]) if row[0] is not None else None
+                except Exception:
+                    old = None
+                if old == protocol:
+                    return
+                con.execute(
+                    "UPDATE servers SET protocol=?, needs_sync=1"
+                    " WHERE ip_port=?", (protocol, ip_port))
+                con.commit()
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 # When True, every whitelist verification (in all scan tabs) routes through
 # proxies and rotates across all accounts to avoid rate limiting.
 _WHITELIST_USE_PROXIES = False
@@ -3008,6 +3071,15 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
     if protocol is None:
         protocol = _cached_protocol(ip_port)
     if protocol is None:
+        # The history DB remembers the last protocol this server spoke.
+        # Using it avoids the status ping below, which would be a *second*
+        # connection milliseconds before the login -- exactly what Paper's
+        # connection-throttle punishes.
+        db_protocol = _stored_protocol(ip_port)
+        if db_protocol is not None:
+            protocol = db_protocol
+            _remember_protocol(ip_port, protocol)
+    if protocol is None:
         try:
             protocol, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
         except Exception:
@@ -3015,6 +3087,7 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
             status_data = {}
         if protocol is not None:
             _remember_protocol(ip_port, protocol)
+            _persist_protocol(ip_port, protocol)
         did_fresh_status = True
     try:
         protocol = int(protocol)
@@ -3210,6 +3283,7 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
             try:
                 protocol, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
                 _remember_protocol(ip_port, protocol)
+                _persist_protocol(ip_port, protocol)
                 try:
                     protocol = int(protocol)
                 except Exception:
@@ -3396,7 +3470,20 @@ def check_selected_whitelist(parent, tree, progress_cb=None):
         values = tree.item(iid, "values")
         row = dict(zip(columns, values))
         if row.get("ip"):
-            entries.append({"ip": row["ip"], "version": row.get("version", ""), "protocol": row.get("protocol")})
+            protocol = row.get("protocol")
+            if protocol in (None, ""):
+                # Result tables don't carry a protocol column, so look it up
+                # (memory cache, then history DB) instead of making the
+                # whitelist probe discover it with an extra connection.
+                try:
+                    protocol = _cached_protocol(row["ip"])
+                except Exception:
+                    protocol = None
+                if protocol is None:
+                    protocol = _stored_protocol(row["ip"])
+            entries.append({"ip": row["ip"],
+                            "version": row.get("version", ""),
+                            "protocol": protocol})
             tree.set(iid, "whitelist", "Queued")
     if not entries:
         return 0
