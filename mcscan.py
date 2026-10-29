@@ -10,6 +10,7 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --scan 1.0.0.0/8 ...    scan, print hits live, then sync
   mcscan.py --export out.csv        dump the full local DB to CSV
+  mcscan.py --continuous            self-tuning forever scan (matscan-style)
 
 Discovery only (status ping + player sample); whitelist/cracked login
 probes stay in the GUI. Needs no display; masscan still needs raw-socket
@@ -424,6 +425,30 @@ def cmd_scan(args):
     return 0
 
 
+def cmd_continuous(args):
+    """Run the self-tuning forever loop. Returns exit code."""
+    try:
+        import continuous
+    except Exception as exc:
+        print(f"error: could not load continuous mode: {exc}")
+        return 1
+    strategies = None
+    if getattr(args, "strategies", None):
+        strategies = [s.strip() for s in args.strategies.split(",")
+                      if s.strip()]
+    return continuous.run_continuous(
+        rate=args.rate,
+        wait=args.wait,
+        scan_duration=getattr(args, "scan_duration", 300),
+        sync_every=getattr(args, "sync_every", 300),
+        state_path=getattr(args, "state_file", "strategies.json"),
+        backend=args.backend,
+        strategies=strategies,
+        do_rescan=not getattr(args, "no_rescan", False),
+        max_rounds=getattr(args, "rounds", None),
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="mcscan",
@@ -443,6 +468,31 @@ def main(argv=None):
         "--export", metavar="FILE",
         help="write the full local DB to FILE as CSV")
     parser.add_argument(
+        "--continuous", action="store_true",
+        help="run forever, picking scan strategies by their yield history "
+             "(matscan-style) and rescanning due servers")
+    parser.add_argument(
+        "--scan-duration", type=int, default=300, metavar="SECS",
+        help="time box per scan round in --continuous (default: 300)")
+    parser.add_argument(
+        "--sync-every", type=int, default=300, metavar="SECS",
+        help="shared-DB sync cadence in --continuous (default: 300)")
+    parser.add_argument(
+        "--state-file", default="strategies.json", metavar="FILE",
+        help="strategy score file for --continuous "
+             "(default: strategies.json)")
+    parser.add_argument(
+        "--strategies", metavar="LIST", default=None,
+        help="comma-separated strategies for --continuous: "
+             "slash0,slash16a,slash16b,slash24a,slash24b,slash24c,"
+             "slash32a,slash32b,slash32c")
+    parser.add_argument(
+        "--no-rescan", action="store_true",
+        help="--continuous: skip the rescan half of the loop")
+    parser.add_argument(
+        "--rounds", type=int, default=None, metavar="N",
+        help="--continuous: stop after N rounds (testing)")
+    parser.add_argument(
         "--backend", default="auto",
         choices=("auto", "masscan", "minescan", "python"),
         help="discovery backend (default: auto, masscan first)")
@@ -461,7 +511,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if not args.sync and args.targets is None and not args.export \
-            and args.init_db is None:
+            and args.init_db is None and not args.continuous:
         parser.print_help()
         return 2
     try:
@@ -473,6 +523,8 @@ def main(argv=None):
         rc = cmd_init_db(*args.init_db) or rc
     if args.sync:
         rc = cmd_sync() or rc
+    if args.continuous:
+        rc = cmd_continuous(args) or rc
     if args.targets is not None:
         rc = cmd_scan(args) or rc
     if args.export:

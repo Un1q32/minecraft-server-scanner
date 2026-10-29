@@ -214,6 +214,7 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
     python mcscan.py --sync                  # sync shared DB (netdb.json creds)
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
+    python mcscan.py --continuous            # self-tuning forever scan
 
 Useful flags: `--backend {auto,masscan,minescan,python}` (default `auto`,
 masscan first like the GUI), `--ports 25565,25566`, `--rate`, `--wait`,
@@ -222,6 +223,50 @@ and cracked login probes stay in the GUI. Like the GUI, masscan needs
 raw-socket privileges: run as root, rely on passwordless sudo for the
 automatic retry, or pick another backend. Ctrl-C stops a running scan
 and keeps results found so far.
+
+#### Continuous mode
+
+    python mcscan.py --continuous
+
+Runs forever and picks what to scan next from what has been paying off
+(matscan-inspired). Each round alternates **normal** and **rescan**:
+
+Normal rounds choose one strategy, weighted by history:
+
+| strategy | targets |
+| --- | --- |
+| `slash0` | whole IPv4 space on 25565 (time-boxed, masscan's random order) |
+| `slash16a` | `/16`s around servers seen in the last 30 days |
+| `slash16b` | `/16`s with ≥ 32 known IPs (busy subnets, last 365 days) |
+| `slash24a` | `/24`s around servers seen in the last 365 days, port 25565 |
+| `slash24b` | the same `/24`s on 25566-25568 |
+| `slash24c` | the same `/24`s on 25560-25564 and 25569-25570 |
+| `slash32a` | known IPs (last 30 days) on every port 1024-65535 |
+| `slash32b` | known IPs (last 365 days) on every port 1024-65535 |
+| `slash32c` | IPs hosting ≥ 8 servers, on every port 1024-65535 |
+
+After each normal round the strategy is scored as new servers per hour,
+`(new + 5×new_on_25565 + 0.1×revived) × 3600 / (seconds + 30)` — finds on
+the default port count 5× (they last longer), a server unseen for a week
+that answers again counts 0.1×. Scores persist in `strategies.json`
+(`--state-file`); 90% of rounds take the best strategy, 10% explore a
+random one, and untried strategies go first so the empty case bootstraps
+with `slash0`.
+
+Rescan rounds revisit servers by age: last pinged 2h-1d, 1-7d, 7-30d,
+30-365d, or over a year ago, plus one fast tier (every 10 minutes) for
+servers that currently have players online. Older-with-25565 hosts are
+diluted into their `/20` so a rescan doesn't burst at known addresses.
+
+Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
+sweeps a random slice of the internet rather than all four billion
+addresses. The shared DB is synced every `--sync-every` seconds (default
+300) and once more on exit, so peers see new finds promptly.
+
+`--strategies slash24a,slash32b` restricts the pool, `--no-rescan` skips
+the rescan half, and `--rounds N` stops after N rounds (useful for
+testing). The deep-port strategies need masscan and root; without them the
+Python backend skips rounds whose probe count exceeds its cap.
 
 ## Text format
 
