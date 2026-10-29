@@ -229,6 +229,8 @@ def run_masscan_backend(target_text, ports, rate, wait, stop_event,
                       f"handshaked={probed['n']}/{total_hosts}", flush=True)
 
     def handshake(ip_port):
+        if scanner.shutdown_requested():
+            return
         try:
             r = scanner.ping_server(ip_port)
         except Exception:
@@ -241,6 +243,21 @@ def run_masscan_backend(target_text, ports, rate, wait, stop_event,
             _print_hit(r)
         status()
 
+    pool_done = False
+
+    def finish_pool(wait):
+        nonlocal pool_done
+        if pool_done:
+            return
+        pool_done = True
+        try:
+            if wait:
+                pool.shutdown(wait=True)
+            else:
+                pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
     try:
         with lock:
             for d in direct:
@@ -248,7 +265,7 @@ def run_masscan_backend(target_text, ports, rate, wait, stop_event,
         if not ranges:
             print(f"masscan: {len(direct)} direct target(s), "
                   "handshaking (no SYN sweep)...")
-            pool.shutdown(wait=True)
+            finish_pool(not scanner.shutdown_requested())
             return results
 
         def on_open(ip_port):
@@ -277,13 +294,14 @@ def run_masscan_backend(target_text, ports, rate, wait, stop_event,
                     stop_event=stop_event)
             else:
                 raise
-        pool.shutdown(wait=True)
+        finish_pool(not scanner.shutdown_requested())
     except scanner.ScanStopped:
-        try:
-            pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        finish_pool(False)
         print("stopped.")
+    except BaseException:
+        # Ctrl+C / SIGTERM: never wait for queued handshakes.
+        finish_pool(False)
+        raise
     return results
 
 
@@ -347,11 +365,53 @@ def run_minescan_backend(target_text, ports, stop_event):
     return results
 
 
+# Set by the SIGINT/SIGTERM handler; scans poll it and bail out fast.
+_CLI_STOP = threading.Event()
+_SIGNAL_STATE = {"count": 0}
+
+
+def install_signal_handlers():
+    """Ctrl+C: ask scans to stop; a second one force-quits.
+
+    Without a handler, Ctrl+C raises KeyboardInterrupt in whatever frame
+    happens to be running, and unwinding leaves queued handshakes behind
+    that the interpreter's atexit hook then joins (the "hang"). A handler
+    plus cooperative cancellation makes the first Ctrl+C orderly and fast.
+    """
+    import signal
+
+    def handler(signum, frame):
+        _SIGNAL_STATE["count"] += 1
+        _CLI_STOP.set()
+        try:
+            scanner.request_shutdown()
+        except Exception:
+            pass
+        if _SIGNAL_STATE["count"] >= 2:
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(130)
+        try:
+            print("\ninterrupted: stopping after the current probes "
+                  "(Ctrl+C again to force quit)...", flush=True)
+        except Exception:
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handler)
+        except Exception:
+            pass
+
+
 def cmd_scan(args):
     """Run a backend sweep, print hits live, sync at the end."""
     target_text = "\n".join(args.targets)
     ports = _parse_ports(args.ports)
-    stop_event = threading.Event()
+    stop_event = _CLI_STOP
     results = []
     tried = []
 
@@ -402,8 +462,14 @@ def cmd_scan(args):
         print("\ninterrupted; stopping...")
         try:
             stop_event.set()
+            scanner.request_shutdown()
         except Exception:
             pass
+        return 130
+    if stop_event.is_set():
+        print(f"scan stopped ({'+'.join(tried) or 'nothing ran'}). "
+              f"Responded: {len(results)} before the interrupt.")
+        print("skipping the shared-DB sync; run --sync when convenient.")
         return 130
     print(f"scan complete ({'+'.join(tried) or 'nothing ran'}). "
           f"Responded: {len(results)}.")
@@ -445,6 +511,7 @@ def cmd_continuous(args):
         backend=args.backend,
         strategies=strategies,
         do_rescan=not getattr(args, "no_rescan", False),
+        stop_event=_CLI_STOP,
         max_rounds=getattr(args, "rounds", None),
     )
 
@@ -514,22 +581,34 @@ def main(argv=None):
             and args.init_db is None and not args.continuous:
         parser.print_help()
         return 2
+    install_signal_handlers()
     try:
         scanner.init_server_db()
     except Exception as exc:
         print(f"warning: DB init failed: {exc}")
     rc = 0
-    if args.init_db is not None:
-        rc = cmd_init_db(*args.init_db) or rc
-    if args.sync:
-        rc = cmd_sync() or rc
-    if args.continuous:
-        rc = cmd_continuous(args) or rc
-    if args.targets is not None:
-        rc = cmd_scan(args) or rc
-    if args.export:
-        # --export runs even if a scan failed (rc preserved).
-        rc = cmd_export(args.export) or rc
+    try:
+        if args.init_db is not None:
+            rc = cmd_init_db(*args.init_db) or rc
+        if args.sync:
+            rc = cmd_sync() or rc
+        if args.continuous:
+            rc = cmd_continuous(args) or rc
+        if args.targets is not None:
+            rc = cmd_scan(args) or rc
+        if args.export:
+            # --export runs even if a scan failed (rc preserved).
+            rc = cmd_export(args.export) or rc
+    finally:
+        if _CLI_STOP.is_set():
+            # Interrupted: don't let the interpreter's atexit hook join
+            # worker threads (that is the classic "Ctrl+C hangs" path).
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(rc or 130)
     return rc
 
 

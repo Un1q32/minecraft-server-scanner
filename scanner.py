@@ -197,6 +197,32 @@ MAX_ICON_CACHE_ENTRIES = 512
 _CRACKED_CACHE_LOCK = threading.Lock()
 _WHITELIST_LOG_LOCK = threading.Lock()
 _SERVER_DB_LOCK = threading.Lock()
+
+# Cooperative shutdown. Ctrl+C / SIGTERM / window close sets this so that
+# (a) probes bail between steps instead of finishing every queued target,
+# and (b) executors stop waiting for queued futures. Without it a Ctrl+C
+# during a big sweep waits for the whole queue, then the interpreter's
+# atexit hook joins those same threads again ("Exception ignored on
+# threading shutdown" / apparent hang).
+_SHUTDOWN = threading.Event()
+
+
+def request_shutdown():
+    """Ask all scans and probes to stop as soon as convenient."""
+    try:
+        _SHUTDOWN.set()
+    except Exception:
+        pass
+
+
+def shutdown_requested():
+    """True once request_shutdown() has been called."""
+    try:
+        return _SHUTDOWN.is_set()
+    except Exception:
+        return False
+
+
 _SERVER_DB_TAB_INSTANCE = None
 # Throttle for online-mode (Mojang-authenticated) whitelist probes only.
 # Cracked/offline probes never touch this. The lock spaces the *start* of
@@ -2403,6 +2429,8 @@ def parse_description(desc):
     return ''
 
 def ping_server(entry, proxy=None):
+    if _SHUTDOWN.is_set():
+        return None
     try:
         host, port = split_host_port(entry)
         with open_connection(host, port, proxy=proxy, timeout=TIMEOUT) as sock:
@@ -5734,6 +5762,8 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
     total, done = len(filtered), 0
 
     def task(ip):
+        if _SHUTDOWN.is_set():
+            return None
         if on_start:
             try: on_start(ip)
             except Exception: pass
@@ -5747,7 +5777,8 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
 
         pending = set(futures)
         while pending:
-            if stop_event is not None and stop_event.is_set():
+            if _SHUTDOWN.is_set() or (
+                    stop_event is not None and stop_event.is_set()):
                 stopped = True
                 break
             # Short wait (instead of as_completed) so a stop request is
@@ -5771,6 +5802,10 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
                 if on_progress:
                     try: on_progress(done, total)
                     except Exception: pass
+    except BaseException:
+        # Ctrl+C / SIGTERM / any hard error: never wait for the queue.
+        stopped = True
+        raise
     finally:
         if stopped:
             for f in futures:
@@ -11472,6 +11507,20 @@ class FullAppGUI(QMainWindow):
         self.resize(1100, 760)
         self.create_widgets()
 
+    def closeEvent(self, event):
+        """Stop scans/probes before the window goes away.
+
+        Queued handshakes otherwise keep the interpreter's atexit hook
+        waiting after the window closes; with the shutdown flag set the
+        executors cancel them and only in-flight probes (<= a few seconds)
+        remain.
+        """
+        try:
+            request_shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def create_widgets(self):
         nb = QTabWidget(self)
         self.setCentralWidget(nb)
@@ -11505,18 +11554,73 @@ class FullAppGUI(QMainWindow):
         USER_LOG_MANAGER.attach_tab(self.user_log_tab)
 
 # ==================== GUI entry ====================
+_SIGNAL_STATE = {"count": 0}
+
+
+def _install_signal_handlers(app=None):
+    """Ctrl+C / SIGTERM: stop scans, quit the UI, force-quit on a 2nd hit.
+
+    Qt's C++ event loop only runs Python code for callbacks, so the entry
+    point also installs a cheap periodic timer that lets pending signals be
+    delivered while the window is idle.
+    """
+    import signal
+
+    def handler(signum, frame):
+        _SIGNAL_STATE["count"] += 1
+        request_shutdown()
+        if _SIGNAL_STATE["count"] >= 2:
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(130)
+        try:
+            print("\nInterrupt: stopping scans and exiting "
+                  "(Ctrl+C again to force quit)...", flush=True)
+        except Exception:
+            pass
+        if app is not None:
+            try:
+                app.quit()
+            except Exception:
+                pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handler)
+        except Exception:
+            pass
+
+
 def main():  #gone but not forgotten
     try:
         init_server_db()
     except Exception:
         pass
     app = QApplication.instance() or QApplication(sys.argv)
+    _install_signal_handlers(app)
     win = FullAppGUI()
+    # No-op tick: gives Python a chance to run signal handlers while Qt's
+    # loop is otherwise idle (otherwise Ctrl+C sits undelivered).
+    _tick = QTimer(win)
+    _tick.timeout.connect(lambda: None)
+    _tick.start(200)
     win.show()
     try:
         app.exec()
     except Exception:
         pass
+    if _SIGNAL_STATE["count"]:
+        # Interrupted: skip the atexit join of worker threads; scans have
+        # already been asked to stop and the DB commits are durable.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(130)
 
 
 if __name__ == "__main__":  #

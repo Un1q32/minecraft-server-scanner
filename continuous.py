@@ -524,12 +524,16 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
         pool = scanner.ThreadPoolExecutor(max_workers=scanner.MAX_WORKERS)
 
         def handshake(ip_port):
+            if scanner.shutdown_requested():
+                return
             try:
                 emit(scanner.ping_server(ip_port))
             except Exception:
                 pass
 
         def on_open(ip_port):
+            if scanner.shutdown_requested() or stop_event.is_set():
+                return
             pool.submit(handshake, ip_port)
 
         def sweep(use_sudo):
@@ -554,8 +558,11 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
             # Time box hit with nothing found: normal for slash0.
             pass
         finally:
+            # Interrupted: drop queued handshakes instead of waiting for
+            # them (and for the atexit join that follows).
+            quick = scanner.shutdown_requested() or stop_event.is_set()
             try:
-                pool.shutdown(wait=True)
+                pool.shutdown(wait=not quick, cancel_futures=quick)
             except Exception:
                 pass
         return results
@@ -802,8 +809,8 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                 picker.update(name, score)
 
             now = _now()
-            if sync_every and (now - last_sync >= sync_every
-                               or last_sync == 0.0):
+            if (sync_every and not stop_event.is_set()
+                    and (now - last_sync >= sync_every or last_sync == 0.0)):
                 _sync_now(url, token)
                 last_sync = now
 
@@ -821,7 +828,19 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     except KeyboardInterrupt:
         print("\ninterrupted.")
         stop_event.set()
-        _sync_now(url, token)
+        try:
+            scanner.request_shutdown()
+        except Exception:
+            pass
+        print("skipping the final sync (run --sync when convenient); "
+              "findings are already in the local DB.")
+        return 130
+    if stop_event.is_set():
+        # Ctrl+C / SIGTERM: a sync can take many seconds per request, so
+        # don't make the user wait for it. Unsent rows stay dirty.
+        print("\ncontinuous mode stopped. Skipping the final sync "
+              "(run --sync when convenient); findings are already stored "
+              "locally.")
         return 130
     print("\ncontinuous mode stopping; final sync...")
     _sync_now(url, token)

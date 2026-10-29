@@ -222,7 +222,10 @@ masscan first like the GUI), `--ports 25565,25566`, `--rate`, `--wait`,
 and cracked login probes stay in the GUI. Like the GUI, masscan needs
 raw-socket privileges: run as root, rely on passwordless sudo for the
 automatic retry, or pick another backend. Ctrl-C stops a running scan
-and keeps results found so far.
+and keeps results found so far — it abandons queued probes rather than
+waiting for them, skips the end-of-scan sync, and a second Ctrl-C forces
+an immediate exit. The GUI behaves the same (closing the window also
+stops in-flight scans).
 
 #### Continuous mode
 
