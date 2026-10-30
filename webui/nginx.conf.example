@@ -55,7 +55,14 @@ server {
 #
 #     root /home/uniq/devel/minecraft-server-scanner/webui/static;
 #     index index.html;
-#     types { application/wasm wasm; }
+#     # Explicit types so a minimal nginx config without mime.types still
+#     # executes core.js/app.js and streams core.wasm correctly.
+#     types {
+#         text/html html;
+#         text/css css;
+#         text/javascript js;
+#         application/wasm wasm;
+#     }
 #
 #     location = /servers.db {
 #         proxy_pass http://127.0.0.1:8080;

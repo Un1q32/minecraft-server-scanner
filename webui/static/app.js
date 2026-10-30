@@ -72,6 +72,20 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
+function assetUrl(path) {
+  return new URL(path, document.baseURI).href;
+}
+
+function loadScript(path) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = assetUrl(path);
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`could not load ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
 function sortLabel(key) {
   return {
     ip_port: "ip",
@@ -442,7 +456,7 @@ copyBtn.addEventListener("click", copyIps);
 
 async function loadDatabase() {
   setStatus("Loading database…");
-  const response = await fetch(`/servers.db?ts=${Date.now()}`, { cache: "no-store" });
+  const response = await fetch(assetUrl(`servers.db?ts=${Date.now()}`), { cache: "no-store" });
   if (!response.ok) {
     const detail = (await response.text().catch(() => "")).trim();
     throw new Error(`HTTP ${response.status} loading servers.db${detail ? `: ${detail}` : ""}`);
@@ -501,8 +515,26 @@ document.addEventListener("keydown", (event) => {
 async function boot() {
   try {
     setStatus("Starting WebAssembly…");
+    if (typeof createCore !== "function") {
+      // The script tag failed or was blocked; try once more explicitly.
+      await loadScript("core.js?v=3-retry");
+    }
+    if (typeof createCore !== "function") {
+      let detail = "";
+      try {
+        const probe = await fetch(assetUrl("core.js?v=3-probe"), { cache: "no-store" });
+        const body = await probe.text();
+        detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
+      } catch (probeError) {
+        detail = ` — ${String(probeError)}`;
+      }
+      throw new Error(
+        `WebAssembly runtime failed to load (core.js${detail}). ` +
+        "Make sure core.js is served as JavaScript with a 200 response.",
+      );
+    }
     core = await createCore({
-      locateFile: (file) => `/${file}`,
+      locateFile: (file) => assetUrl(file),
       print: () => {},
       printErr: () => {},
     });
@@ -520,7 +552,7 @@ async function boot() {
       ip: core.cwrap("mc_ip", "string", ["number"]),
     };
 
-    const info = await fetch("/api/info", { cache: "no-store" })
+    const info = await fetch(assetUrl("api/info"), { cache: "no-store" })
       .then((response) => (response.ok ? response.json() : null))
       .catch(() => null);
     if (info && info.db_name) {
