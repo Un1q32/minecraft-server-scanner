@@ -215,11 +215,14 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
+    python mcscan.py --recheck-whitelist 1.2.3.4:25565  # probe whitelist status
 
 Useful flags: `--backend {auto,masscan,minescan,python}` (default `auto`,
 masscan first like the GUI), `--ports 25565,25566`, `--rate`, `--wait`,
-`--max-hosts`. Discovery only (status ping + player sample) — whitelist
-and cracked login probes stay in the GUI. Like the GUI, masscan needs
+`--max-hosts`. Discovery only (status ping + player sample), except
+`--recheck-whitelist`, which runs the same login probes as the GUI's
+Check Whitelist button. Cracked login probes stay in the GUI. Like the
+GUI, masscan needs
 raw-socket privileges: run as root, rely on passwordless sudo for the
 automatic retry, or pick another backend. Ctrl-C stops a running scan
 and keeps results found so far — it abandons queued probes rather than
@@ -302,6 +305,110 @@ rescan targets (including padded /20s) are carved before any backend runs,
 and masscan additionally receives them as an `--excludefile`. The round
 header reports how many specs that removed, and edits to the file apply to
 the next round without a restart.
+
+## Rust DB viewer (`dbviewer`)
+
+The Python GUI builds a widget per server, which becomes slow once the
+shared DB has tens of thousands of rows. `dbviewer/` is a small Rust + Qt 6
+(QML) application that only views `servers.db`: it opens the database
+read-only, exposes the rows through a `QAbstractTableModel`, and lets Qt's
+`TableView` ask for just the visible cells. Scanning is not implemented
+there, but **Sync DB** runs `mcscan.py --sync` and **Recheck whitelist**
+runs the same probes as the GUI for the selected rows.
+
+On a 113k-row database, the release build opens the whole table in about
+80–110 ms; searches take 45–90 ms and sorting is in memory (a few ms to
+about 45 ms).
+
+### Build and run
+
+Requirements: a Rust toolchain, Qt 6.5 or newer (Quick and Quick Controls 2),
+CMake, and `qmake`/`qmake6` on `PATH`. CXX-Qt handles Linux, Windows and macOS; there is
+no platform-specific code beyond suppressing the console window on Windows.
+
+    cd dbviewer
+    cargo build --release
+    ./target/release/dbviewer [servers.db]
+
+    dbviewer --db servers.db --query "players>=10" --sort last_seen:desc
+
+Command-line options:
+
+- `--db PATH` (or a bare path) — database to open; defaults to
+  `servers.db` in the current directory. A directory works too.
+- `--query EXPR` — initial search expression.
+- `--sort COL[:asc|desc]` — initial sort (`ip_port`, `motd`, `players`,
+  `version`, `cracked`, `whitelist`, `first_seen`, `last_seen`,
+  `times_seen`). The direction defaults to ascending.
+
+You can also drag a `.db` file onto the window, or use **Open DB…** (Ctrl+O).
+The table follows the desktop's Qt palette (light or dark). Columns use the
+native Qt table header: drag the divider between headers to resize them. The
+vertical scrollbar has its own column beside the table and the horizontal one
+its own strip below it, so both are easy to grab (and clicking anywhere on a
+bar jumps that way). The columns match
+the Python Servers tab — IP, MOTD, PLAYERS, VERSION, CRACKED, WHITELIST,
+ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN and TIMES SEEN. Clicking a
+header sorts with the same keys and direction as the Python GUI: the first
+click ascending, the next descending, with versions compared numerically
+(`1.9 < 1.21.1 < 1.21.10`), IPs as octets, and timestamps by displayed
+minute. Clicks stack: the last-clicked column is the primary sort and
+earlier columns break ties (sorting by version and then whitelist keeps the
+version order inside each whitelist group). A sync/recheck reload re-applies
+the whole stack, not just the last column.
+
+### Searching
+
+Type in the search box; results update as you type (Enter searches
+immediately, Esc clears). Terms combine with AND. A bare word searches IP,
+MOTD, version, whitelist and sampled player names.
+
+    anarchy                  anywhere in the text fields
+    motd:"anarchy server"    field contains text (quotes keep spaces)
+    ip:1.2.3.                IP/port prefix
+    version~1.21             contains
+    cracked=yes              status text (matches cached/heuristic too)
+    whitelist=yes|no|unknown whitelist status
+    players>=10  max<100     numeric compare
+    seen<7d  first>30d       time windows with s/m/h/d/w suffix
+    names:Notch              player seen on the server
+    -motd:test               exclude a term
+    times>3 players:0        multiple terms AND together
+
+Every value is bound as a SQL parameter and every field name comes from a
+whitelist, so search input cannot change the query shape.
+
+### Sync
+
+**Sync DB** runs `<python> mcscan.py --sync` in the database's directory
+(where `netdb.json` lives). The log dialog opens automatically only if the
+command is still running after 10 seconds or exits non-zero; a quick
+successful sync stays quiet and its output is available from the **Log**
+button. The viewer reloads the current query when the sync finishes and
+re-applies the active sort, so changed rows move into their new positions.
+`mcscan.py` is
+looked for next to the database, one directory up, then in the working
+directory; the interpreter is `python3` (`python` on Windows), or whatever
+`DBVIEWER_PYTHON` names:
+
+    DBVIEWER_PYTHON=py dbviewer          # Windows launcher, if needed
+
+### Recheck whitelist
+
+Select one or more rows and click **Recheck whitelist** (click, Ctrl-click
+or Shift-click to select). The viewer runs
+
+    <python> mcscan.py --recheck-whitelist IP:PORT ...
+
+in the database's directory and reloads the table when it finishes. Its log
+follows the same rule: the dialog appears only for a job still running after
+10 seconds or one that exits non-zero, and the table reloads and re-applies
+the active sort when it ends (e.g. a freshly checked whitelist row moves into
+place). The same row selection feeds
+**Copy IP(s)**, which puts the selected `IP:PORT` values on the clipboard,
+one per line. Offline-mode servers are
+answered without an account; online-mode probes rotate the accounts stored
+in `mc_accounts.json`, exactly like the GUI's Check Whitelist button.
 
 ## Text format
 

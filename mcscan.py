@@ -8,13 +8,16 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
 
   mcscan.py --sync                  sync shared DB (creds from netdb.json)
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
+  mcscan.py --recheck-whitelist IP:PORT ...
+                                    probe whitelist status for those servers
   mcscan.py --scan 1.0.0.0/8 ...    scan, print hits live, then sync
   mcscan.py --export out.csv        dump the full local DB to CSV
   mcscan.py --continuous            self-tuning forever scan (matscan-style)
 
-Discovery only (status ping + player sample); whitelist/cracked login
-probes stay in the GUI. Needs no display; masscan still needs raw-socket
-privileges (run as root, or passwordless sudo for the automatic retry).
+Discovery only (status ping + player sample) unless --recheck-whitelist
+is used, which runs the same login probes as the GUI's Check Whitelist
+button. Needs no display; masscan still needs raw-socket privileges (run as
+root, or passwordless sudo for the automatic retry).
 """
 
 import argparse
@@ -106,6 +109,78 @@ def cmd_sync():
           f"inserted={summary.get('inserted', 0)} "
           f"updated={summary.get('updated', 0)} "
           f"total_remote={summary.get('total_remote', 0)}")
+    return 0
+
+
+def cmd_recheck_whitelist(ips):
+    """Probe whitelist status for the given servers and update servers.db.
+
+    Mirrors the GUI's "Check Whitelist": stored Minecraft accounts rotate
+    for online-mode servers, offline-mode servers answer without one.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    entries = []
+    seen = set()
+    for raw in ips or []:
+        ip = scanner.strict_ip_port(raw)
+        if not ip:
+            print(f"skip {raw!r}: not a valid ip:port", flush=True)
+            continue
+        if ip in seen:
+            continue
+        seen.add(ip)
+        version = ""
+        protocol = None
+        try:
+            con = scanner._server_db_connect()
+            try:
+                row = con.execute(
+                    "SELECT version, protocol FROM servers WHERE ip_port=?",
+                    (ip,)).fetchone()
+            finally:
+                con.close()
+            if row:
+                version = str(row[0] or "")
+                protocol = row[1]
+        except Exception as exc:
+            print(f"warning: could not read {ip}: {exc}", flush=True)
+        if protocol in (None, ""):
+            protocol = scanner._stored_protocol(ip)
+        entries.append({"ip": ip, "version": version, "protocol": protocol})
+
+    if not entries:
+        print("error: no valid servers to check", flush=True)
+        return 2
+
+    print(f"whitelist recheck: {len(entries)} server(s)", flush=True)
+    done = threading.Event()
+
+    def on_update(entry, result, message):
+        label = scanner.whitelist_result_label(result, message)
+        scanner.update_server_whitelist(entry.get("ip"), label)
+        print(f"  {entry.get('ip')}: {label}", flush=True)
+
+    def progress(completed, total):
+        print(f"  progress: {completed}/{total}", flush=True)
+        if completed >= total:
+            done.set()
+
+    try:
+        scanner.run_whitelist_verifier_async(
+            entries, None, on_update, progress_cb=progress)
+    except Exception as exc:
+        print(f"error: whitelist recheck failed: {exc}", flush=True)
+        return 1
+
+    timeout = max(120, 20 * len(entries))
+    if not done.wait(timeout):
+        print("error: whitelist recheck timed out", flush=True)
+        return 1
+    print(f"whitelist recheck complete: {len(entries)} server(s)", flush=True)
     return 0
 
 
@@ -546,6 +621,10 @@ def main(argv=None):
         help="scan targets (same syntax as the GUI box): IPs, CIDRs, "
              "ranges (a-b), ASNs, hostnames")
     parser.add_argument(
+        "--recheck-whitelist", nargs="+", metavar="IP:PORT", default=None,
+        help="probe whitelist status for these servers and update the DB "
+             "(same probes as the GUI's Check Whitelist)")
+    parser.add_argument(
         "--export", metavar="FILE",
         help="write the full local DB to FILE as CSV")
     parser.add_argument(
@@ -602,7 +681,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if not args.sync and args.targets is None and not args.export \
-            and args.init_db is None and not args.continuous:
+            and args.init_db is None and not args.continuous \
+            and args.recheck_whitelist is None:
         parser.print_help()
         return 2
     install_signal_handlers()
@@ -616,6 +696,8 @@ def main(argv=None):
             rc = cmd_init_db(*args.init_db) or rc
         if args.sync:
             rc = cmd_sync() or rc
+        if args.recheck_whitelist is not None:
+            rc = cmd_recheck_whitelist(args.recheck_whitelist) or rc
         if args.continuous:
             rc = cmd_continuous(args) or rc
         if args.targets is not None:
