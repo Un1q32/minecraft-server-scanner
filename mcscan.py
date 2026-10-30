@@ -612,6 +612,7 @@ def cmd_continuous(args):
         max_rounds=getattr(args, "rounds", None),
         shard=shard,
         seed=getattr(args, "scan_seed", None),
+        base_ports=_parse_ports(getattr(args, "ports", "25565")),
     )
 
 
@@ -678,7 +679,9 @@ def main(argv=None):
         help="discovery backend (default: auto, masscan first)")
     parser.add_argument(
         "--ports", default="25565",
-        help='ports to scan, e.g. "25565" or "25565,25566" (default: 25565)')
+        help='ports to scan, e.g. "25565" or "25565,25566" (default: 25565); '
+             'in --continuous this sets the broad-strategy ports '
+             '(slash0/slash16*/slash24a)')
     parser.add_argument(
         "--rate", type=int, default=scanner.MASSCAN_DEFAULT_RATE,
         help="masscan packets/sec (default: %(default)s)")

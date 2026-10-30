@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MC Server DB</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="toolbar">
+    <input id="search" type="text" spellcheck="false" autocomplete="off"
+           placeholder="Search…  e.g. motd:anarchy players&gt;=10 seen&lt;7d -cracked:yes">
+    <button id="searchBtn" type="button">Search</button>
+    <button id="copyBtn" type="button">Copy IP(s)</button>
+    <button id="syncBtn" type="button">Sync DB</button>
+    <span id="status" class="status">Loading…</span>
+  </header>
+
+  <main class="split">
+    <section class="tablePane">
+      <div id="gridScroll" class="gridScroll">
+        <div id="grid" class="grid">
+          <div id="headerRow" class="headerRow"></div>
+          <div id="body" class="body">
+            <div id="rows" class="rows"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="detailPane">
+      <pre id="detail"></pre>
+    </aside>
+  </main>
+
+  <div id="logOverlay" class="overlay hidden">
+    <div class="logBox">
+      <div class="logHead">
+        <span>mcscan.py output</span>
+        <button id="logClose" type="button">Close</button>
+      </div>
+      <pre id="logText"></pre>
+    </div>
+  </div>
+
+  <script src="/core.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

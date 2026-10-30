@@ -241,10 +241,10 @@ Normal rounds choose one strategy, weighted by history:
 
 | strategy | targets |
 | --- | --- |
-| `slash0` | whole IPv4 space on 25565 (time-boxed, masscan's random order) |
+| `slash0` | whole IPv4 space on the configured ports (default 25565; time-boxed, masscan's random order) |
 | `slash16a` | `/16`s around servers seen in the last 30 days |
 | `slash16b` | `/16`s with ≥ 32 known IPs (busy subnets, last 365 days) |
-| `slash24a` | `/24`s around servers seen in the last 365 days, port 25565 |
+| `slash24a` | `/24`s around servers seen in the last 365 days |
 | `slash24b` | the same `/24`s on 25566-25568 |
 | `slash24c` | the same `/24`s on 25560-25564 and 25569-25570 |
 | `slash32a` | known IPs (last 30 days) on every port 1024-65535 |
@@ -266,7 +266,11 @@ diluted into their `/20` so a rescan doesn't burst at known addresses.
 
 Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
 sweeps a random slice of the internet rather than all four billion
-addresses. While a round runs, a status line at the bottom of the terminal
+addresses. `--ports` (e.g. `--ports 25565,25566,25600-25610`) sets the
+ports used by the broad `slash0`, `slash16a`, `slash16b` and `slash24a`
+strategies; `slash24b`/`slash24c` keep their fixed nearby-port sets and
+the `slash32*` strategies still sweep every port on known IPs. Rescans
+always use each server's stored port. While a round runs, a status line at the bottom of the terminal
 counts servers found so far in that round — `new`, `updated` and total
 hits — and is rewritten in place as results arrive (when output is piped
 it prints a plain summary line every 15 seconds instead). The shared DB is
@@ -409,6 +413,36 @@ place). The same row selection feeds
 one per line. Offline-mode servers are
 answered without an account; online-mode probes rotate the accounts stored
 in `mc_accounts.json`, exactly like the GUI's Check Whitelist button.
+
+## Web DB viewer (`webui`)
+
+A browser UI for the same `servers.db`, for when you want the table without
+launching Qt. It is read-only except for **Sync DB**; there is no Open DB
+picker and no whitelist recheck. The 11 columns, numeric version/IP sorting,
+stacked sort keys, search language, detail pane and Copy IP(s) all match the
+Rust viewer.
+
+    python webui/webui.py
+    python webui/webui.py --db /path/to/servers.db --port 8080
+    python webui/webui.py --no-browser
+
+It binds to `127.0.0.1` by default. The Python server takes a consistent
+SQLite snapshot (including the WAL) and serves it; the page loads that
+snapshot into `webui/static/core.wasm`, a small Emscripten/SQLite build, so
+filtering, sorting and formatting run in the browser. A 120k-row database
+opens in roughly 100-170 ms and sorts in roughly 60-110 ms on a desktop.
+The table is virtualized: only the visible rows are drawn, so scrolling
+stays smooth.
+
+`--ports`, scanning and the continuous loop are not part of this UI.
+**Sync DB** runs `mcscan.py --sync` beside the database and reloads the
+current query/sort when it finishes; its output dialog opens only if the
+sync takes more than 10 seconds or exits non-zero.
+
+The generated WASM is committed. Rebuild it after changing `webui/core.cpp`
+with Emscripten installed:
+
+    ./webui/build.sh
 
 ## Text format
 

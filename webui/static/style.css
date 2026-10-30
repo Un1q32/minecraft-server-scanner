@@ -1,0 +1,238 @@
+:root {
+  color-scheme: light dark;
+  --bg: Canvas;
+  --fg: CanvasText;
+  --field: Field;
+  --field-text: FieldText;
+  --btn: ButtonFace;
+  --btn-text: ButtonText;
+  --border: GrayText;
+  --sel: Highlight;
+  --sel-text: HighlightText;
+  --alt: color-mix(in srgb, Canvas 94%, CanvasText);
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+  border-radius: 0;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 12px/1.4 var(--mono);
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------------- toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  background: var(--btn);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+input,
+button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--field);
+  border: 1px solid var(--border);
+  padding: 3px 7px;
+}
+
+button {
+  background: var(--btn);
+  color: var(--btn-text);
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#search {
+  flex: 1 1 auto;
+  min-width: 120px;
+  color: var(--field-text);
+}
+
+.status {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  padding: 0 6px;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+/* ----------------------------------------------------------------- table */
+.split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.tablePane {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  border-right: 1px solid var(--border);
+}
+
+.gridScroll {
+  flex: 1 1 auto;
+  overflow: auto;
+  position: relative;
+  background: var(--bg);
+}
+
+.grid {
+  position: relative;
+  min-width: 100%;
+}
+
+.headerRow {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: var(--cols);
+  height: 26px;
+  background: var(--btn);
+  border-bottom: 1px solid var(--border);
+}
+
+.hcell {
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  border-right: 1px solid var(--border);
+  color: var(--btn-text);
+  font-weight: bold;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  user-select: none;
+}
+
+.hcell.active {
+  background: var(--sel);
+  color: var(--sel-text);
+}
+
+.body {
+  position: relative;
+}
+
+.rows {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+}
+
+.row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: grid;
+  grid-template-columns: var(--cols);
+  height: 22px;
+  line-height: 22px;
+  cursor: default;
+  user-select: none;
+}
+
+.row.odd {
+  background: var(--alt);
+}
+
+.row.selected {
+  background: var(--sel);
+  color: var(--sel-text);
+}
+
+.cell {
+  padding: 0 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------------- detail */
+.detailPane {
+  flex: 0 0 380px;
+  width: 380px;
+  overflow: auto;
+  background: var(--bg);
+}
+
+#detail {
+  margin: 0;
+  padding: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+/* ------------------------------------------------------------- sync log */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.overlay.hidden {
+  display: none;
+}
+
+.logBox {
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 92vw);
+  height: min(480px, 80vh);
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+
+.logHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px;
+  background: var(--btn);
+  color: var(--btn-text);
+  border-bottom: 1px solid var(--border);
+}
+
+#logText {
+  flex: 1 1 auto;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}

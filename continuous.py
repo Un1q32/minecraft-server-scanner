@@ -3,10 +3,11 @@
 Alternates two round categories forever:
 
 * **normal** -- a scan strategy picked by weight:
-    slash0    the whole IPv4 space on port 25565 (time-boxed, random order)
+    slash0    the whole IPv4 space on the configured ports (default 25565;
+              time-boxed, random order)
     slash16a  /16 blocks around servers seen in the last 30 days
     slash16b  /16 blocks with >= 32 known IPs (busy subnets, last 365 days)
-    slash24a  /24 blocks around servers seen in the last 365 days (25565)
+    slash24a  /24 blocks around servers seen in the last 365 days
     slash24b  ... same /24s on ports 25566-25568
     slash24c  ... same /24s on ports 25560-25564 + 25569-25570
     slash32a  known IPs (last 30 days) on all ports 1024-65535
@@ -155,37 +156,42 @@ def _prefixes_to_cidrs(groups, prefix_len):
 
 
 # --- scan strategies ------------------------------------------------------
-def strat_slash0(_rows):
-    """Whole IPv4 space on 25565; the time box makes it a random slice."""
-    return (["0.0.0.0/0"], [25565])
+def _base_ports(ports):
+    """Configured ports for the broad strategies; default is 25565."""
+    return list(ports) if ports else [25565]
 
 
-def strat_slash16a(rows):
+def strat_slash0(_rows, base_ports=None):
+    """Whole IPv4 space on the configured ports (default 25565)."""
+    return (["0.0.0.0/0"], _base_ports(base_ports))
+
+
+def strat_slash16a(rows, base_ports=None):
     active = _active(rows, 30 * 86400)
     groups = _group_by(active, 16)
-    return (_prefixes_to_cidrs(groups, 16), [25565])
+    return (_prefixes_to_cidrs(groups, 16), _base_ports(base_ports))
 
 
-def strat_slash16b(rows):
+def strat_slash16b(rows, base_ports=None):
     active = _active(rows, 365 * 86400)
     groups = {k: v for k, v in _group_by(active, 16).items()
               if len(v) >= DENSE_SUBNET_IPS}
-    return (_prefixes_to_cidrs(groups, 16), [25565])
+    return (_prefixes_to_cidrs(groups, 16), _base_ports(base_ports))
 
 
-def strat_slash24a(rows):
+def strat_slash24a(rows, base_ports=None):
     active = _active(rows, 365 * 86400)
     groups = _group_by(active, 24)
-    return (_prefixes_to_cidrs(groups, 24), [25565])
+    return (_prefixes_to_cidrs(groups, 24), _base_ports(base_ports))
 
 
-def strat_slash24b(rows):
+def strat_slash24b(rows, _base_ports=None):
     active = _active(rows, 365 * 86400)
     groups = _group_by(active, 24)
     return (_prefixes_to_cidrs(groups, 24), [25566, 25567, 25568])
 
 
-def strat_slash24c(rows):
+def strat_slash24c(rows, _base_ports=None):
     active = _active(rows, 365 * 86400)
     groups = _group_by(active, 24)
     ports = list(range(25560, 25565)) + [25569, 25570]
@@ -203,15 +209,15 @@ def _known_ips(rows, max_age):
     return [str(ip) for ip in sorted(seen)]
 
 
-def strat_slash32a(rows):
+def strat_slash32a(rows, _base_ports=None):
     return (_known_ips(rows, 30 * 86400), _dead_ports())
 
 
-def strat_slash32b(rows):
+def strat_slash32b(rows, _base_ports=None):
     return (_known_ips(rows, 365 * 86400), _dead_ports())
 
 
-def strat_slash32c(rows):
+def strat_slash32c(rows, _base_ports=None):
     import ipaddress
     counts = {}
     for row in _active(rows, 30 * 86400):
@@ -660,8 +666,10 @@ def _sync_now(url, token):
 def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                    sync_every=DEFAULT_SYNC_EVERY, state_path="strategies.json",
                    backend="auto", strategies=None, do_rescan=True,
-                   stop_event=None, max_rounds=None, shard=None, seed=None):
+                   stop_event=None, max_rounds=None, shard=None, seed=None,
+                   base_ports=None):
     """The forever loop. Returns a process exit code."""
+    base_ports = _base_ports(base_ports)
     if backend == "minescan":
         print("error: continuous mode supports --backend auto, masscan or "
               "python (minescan is for one-off --scan).")
@@ -680,9 +688,12 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     shard_note = (f" shard={shard[0]}/{shard[1]}"
                   f" seed={seed if seed is not None else scanner.DEFAULT_SHARD_SEED}"
                   if shard else "")
+    ports_note = ("" if base_ports == [25565]
+                  else f" ports={','.join(str(p) for p in base_ports)}")
     print(f"continuous mode: strategies={','.join(picker.enabled)} "
           f"rescan={'on' if do_rescan else 'off'} "
-          f"scan_duration={scan_duration}s backend={backend}{shard_note}")
+          f"scan_duration={scan_duration}s backend={backend}"
+          f"{ports_note}{shard_note}")
     print(f"shared-DB sync every {sync_every}s "
           f"({'enabled' if url and token else 'skipped: no netdb.json'})")
 
@@ -762,7 +773,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                 label = f"round {rounds} {name}"
                 print(f"strategy: {name}")
                 try:
-                    ranges, ports = STRATEGIES[name](before_rows)
+                    ranges, ports = STRATEGIES[name](before_rows, base_ports)
                 except Exception as exc:
                     print(f"  strategy failed: {exc}")
                     ranges, ports = [], []
