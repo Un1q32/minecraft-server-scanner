@@ -331,6 +331,11 @@ rowsEl.addEventListener("mousedown", (event) => {
     return;
   }
   event.preventDefault();
+  // Tapping a row must not leave the search field focused; on mobile that
+  // keeps the on-screen keyboard open over the table.
+  if (document.activeElement && document.activeElement.blur) {
+    document.activeElement.blur();
+  }
   selectRow(Number(element.dataset.row), event);
 });
 
@@ -567,7 +572,11 @@ async function boot() {
     showHelp();
     renderRows();
     setStatus(`${totalCount} servers | loaded in ${mc.loadMs()} ms`);
-    searchInput.focus();
+    // Only focus the search box on devices with a real pointer. Programmatic
+    // focus on a phone can raise the keyboard before the user asks for it.
+    if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
+      searchInput.focus();
+    }
   } catch (error) {
     setStatus(`Load failed: ${String(error)}`);
     detailEl.textContent = `Could not load the database.\n\n${String(error)}`;
