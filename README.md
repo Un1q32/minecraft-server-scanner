@@ -448,6 +448,30 @@ The build compiles the SQLite 3.54.0 amalgamation directly (downloaded into
 `webui/.sqlite/`), rather than using Emscripten's port manager, so it also
 works when Emscripten has a frozen cache.
 
+### Hosting with nginx
+
+Run the app on loopback and let nginx terminate TLS and enforce auth:
+
+    python webui/webui.py --host 127.0.0.1 --port 8080 --no-browser
+
+`webui/nginx.conf.example` is a complete reverse-proxy site (HTTP redirect,
+TLS, optional Basic auth, a 600 s read timeout for sync, and streaming for
+the database snapshot). `webui/mc-webui.service.example` is the matching
+systemd unit. Basic outline:
+
+    sudo cp webui/nginx.conf.example /etc/nginx/sites-available/mc-webui
+    sudo ln -s /etc/nginx/sites-available/mc-webui /etc/nginx/sites-enabled/
+    sudo htpasswd -c /etc/nginx/.htpasswd youruser
+    sudo certbot --nginx -d db.example.com
+    sudo nginx -t && sudo systemctl reload nginx
+
+Use a dedicated hostname (the page fetches `/core.js`, `/servers.db` and
+`/api/*` from the site root). Do **not** expose port 8080 directly: the page
+has no authentication of its own and **Sync DB** runs `mcscan.py --sync`.
+The example config protects it with Basic auth; an `allow`/`deny` IP filter
+works too. The database snapshot is about 30 MB, so `proxy_buffering off`
+keeps the first load responsive.
+
 ## Text format
 
 The standard exported server line is:

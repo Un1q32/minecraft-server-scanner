@@ -1,0 +1,15 @@
+[Unit]
+Description=MC server DB web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uniq
+WorkingDirectory=/home/uniq/devel/minecraft-server-scanner
+ExecStart=/usr/bin/python3 /home/uniq/devel/minecraft-server-scanner/webui/webui.py --host 127.0.0.1 --port 8080 --no-browser
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
