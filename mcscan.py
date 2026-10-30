@@ -502,6 +502,18 @@ def cmd_continuous(args):
     if getattr(args, "strategies", None):
         strategies = [s.strip() for s in args.strategies.split(",")
                       if s.strip()]
+    shard = None
+    if getattr(args, "shard", None):
+        try:
+            index_s, total_s = str(args.shard).split("/", 1)
+            index, total = int(index_s), int(total_s)
+        except Exception:
+            print(f"error: --shard must look like 1/3, got {args.shard!r}")
+            return 2
+        if not (1 <= index <= total <= 1_000_000):
+            print(f"error: --shard must satisfy 1 <= I <= N, got {args.shard!r}")
+            return 2
+        shard = (index, total)
     return continuous.run_continuous(
         rate=args.rate,
         wait=args.wait,
@@ -513,6 +525,8 @@ def cmd_continuous(args):
         do_rescan=not getattr(args, "no_rescan", False),
         stop_event=_CLI_STOP,
         max_rounds=getattr(args, "rounds", None),
+        shard=shard,
+        seed=getattr(args, "scan_seed", None),
     )
 
 
@@ -556,6 +570,16 @@ def main(argv=None):
     parser.add_argument(
         "--no-rescan", action="store_true",
         help="--continuous: skip the rescan half of the loop")
+    parser.add_argument(
+        "--shard", metavar="I/N", default=None,
+        help="--continuous: this machine's slice of the scan space, e.g. "
+             "1/3 on the first of three machines; use a different I on "
+             "each machine (they share the default seed so slices are "
+             "disjoint)")
+    parser.add_argument(
+        "--scan-seed", type=int, default=None, metavar="N",
+        help="--continuous --shard: masscan shuffle seed; all machines "
+             "must use the same value (default: a fixed constant)")
     parser.add_argument(
         "--rounds", type=int, default=None, metavar="N",
         help="--continuous: stop after N rounds (testing)")

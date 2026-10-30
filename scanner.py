@@ -4456,6 +4456,31 @@ def _remove_masscan_exclude_file(path):
         pass
 
 
+DEFAULT_SHARD_SEED = 0xC0FFEE
+
+
+def _masscan_shard_args(shard, seed=None):
+    """--shard i/n (+ a shared --seed) so several machines split the space.
+
+    masscan shuffles the target space from a seed; shards are only disjoint
+    when every machine uses the SAME seed (masscan itself hints this), so
+    sharding defaults to a fixed seed. Returns [] when sharding is off.
+    """
+    if not shard:
+        return []
+    try:
+        index, total = int(shard[0]), int(shard[1])
+    except Exception:
+        return []
+    if not (1 <= index <= total <= 1_000_000):
+        return []
+    try:
+        seed_value = DEFAULT_SHARD_SEED if seed is None else int(seed)
+    except Exception:
+        seed_value = DEFAULT_SHARD_SEED
+    return ["--shard", f"{index}/{total}", "--seed", str(seed_value)]
+
+
 def _masscan_estimate_probes(masscan_targets, ports):
     """Total SYN probes masscan will send (hosts x ports), arithmetic only."""
     try:
@@ -5628,7 +5653,7 @@ def sudo_noninteractive_ok(timeout=10):
 def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
                           wait=MASSCAN_DEFAULT_WAIT, on_open=None, on_scan_progress=None,
                           timeout=None, exe=None, use_sudo=False, sudo_password=None,
-                          stop_event=None):
+                          stop_event=None, shard=None, seed=None):
     """Run masscan and call on_open(ip_port) live as open ports are found.
 
     masscan runs with `--interactive` (which flushes a `Discovered open
@@ -5679,7 +5704,8 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     # skip excluded hosts as a second layer under our own range carving.
     exclude_path = _write_masscan_exclude_file()
     exclude_args = ["--excludefile", exclude_path] if exclude_path else []
-    cmd = base_cmd + list(masscan_targets) + exclude_args + [
+    shard_args = _masscan_shard_args(shard, seed)
+    cmd = base_cmd + list(masscan_targets) + exclude_args + shard_args + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),
@@ -5737,7 +5763,7 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
                 return _run_masscan_streaming_plain(
                     base_cmd, masscan_targets, port_spec, rate, wait,
                     timeout, found, seen, emit, sudo_password if use_sudo else None,
-                    exclude_args=exclude_args,
+                    exclude_args=exclude_args, shard_args=shard_args,
                     on_scan_progress=on_scan_progress, stop_event=stop_event)
             if found:
                 return found, stderr[:500]
@@ -5749,11 +5775,11 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
 
 def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wait,
                                  timeout, found, seen, emit, sudo_password,
-                                 exclude_args=None,
+                                 exclude_args=None, shard_args=None,
                                  on_scan_progress=None, stop_event=None):
     """Fallback for masscan builds without --interactive: same merged stream
     with only -oL - list lines (still live in chunks, no temp files)."""
-    cmd = base_cmd + list(masscan_targets) + list(exclude_args or []) + [
+    cmd = base_cmd + list(masscan_targets) + list(exclude_args or []) + list(shard_args or []) + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),

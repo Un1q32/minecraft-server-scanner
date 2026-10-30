@@ -448,7 +448,11 @@ class StrategyPicker:
             return "slash0"
         if random.random() < RANDOM_EXPLORE:
             return random.choice(self.enabled)
-        return max(self.enabled, key=lambda n: self.scores.get(n, 0))
+        # Best score wins, but break ties randomly: several machines with
+        # the same history would otherwise pick the same strategy forever.
+        best = max(self.scores.get(n, 0) for n in self.enabled)
+        top = [n for n in self.enabled if self.scores.get(n, 0) == best]
+        return random.choice(top)
 
     def update(self, name, score):
         self.scores[name] = int(score)
@@ -484,7 +488,8 @@ def _sudo_retryable():
 
 
 def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
-              backend="auto", on_hit=None, allow_sudo=True, log=None):
+              backend="auto", on_hit=None, allow_sudo=True, log=None,
+              shard=None, seed=None):
     """Run one time-boxed sweep. Returns result dicts.
 
     Uses masscan when available (explicit ranges/ports), else the Python
@@ -540,7 +545,7 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
             scanner.run_masscan_streaming(
                 ranges, ports, rate=rate, wait=wait, on_open=on_open,
                 timeout=scan_duration, use_sudo=use_sudo,
-                stop_event=stop_event)
+                stop_event=stop_event, shard=shard, seed=seed)
 
         try:
             try:
@@ -576,6 +581,15 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
     except Exception as exc:
         _log(f"  target expansion failed: {exc}")
         return []
+    if not targets:
+        return []
+    if shard:
+        try:
+            index, total = int(shard[0]) - 1, int(shard[1])
+            if 0 <= index < total:
+                targets = targets[index::total]
+        except Exception:
+            pass
     if not targets:
         return []
 
@@ -646,7 +660,7 @@ def _sync_now(url, token):
 def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                    sync_every=DEFAULT_SYNC_EVERY, state_path="strategies.json",
                    backend="auto", strategies=None, do_rescan=True,
-                   stop_event=None, max_rounds=None):
+                   stop_event=None, max_rounds=None, shard=None, seed=None):
     """The forever loop. Returns a process exit code."""
     if backend == "minescan":
         print("error: continuous mode supports --backend auto, masscan or "
@@ -663,9 +677,12 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
 
     picker = StrategyPicker(state_path, strategies)
     bodies = ["normal"] + (["rescan"] if do_rescan else [])
+    shard_note = (f" shard={shard[0]}/{shard[1]}"
+                  f" seed={seed if seed is not None else scanner.DEFAULT_SHARD_SEED}"
+                  if shard else "")
     print(f"continuous mode: strategies={','.join(picker.enabled)} "
           f"rescan={'on' if do_rescan else 'off'} "
-          f"scan_duration={scan_duration}s backend={backend}")
+          f"scan_duration={scan_duration}s backend={backend}{shard_note}")
     print(f"shared-DB sync every {sync_every}s "
           f"({'enabled' if url and token else 'skipped: no netdb.json'})")
 
@@ -691,7 +708,8 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     ranges, ports, rate=rate, wait=wait,
                     scan_duration=duration or scan_duration,
                     stop_event=stop_event, backend=current,
-                    on_hit=on_hit, log=_log), False)
+                    on_hit=on_hit, log=_log, shard=shard,
+                    seed=seed), False)
             except (PermissionError, FileNotFoundError) as exc:
                 if current == "masscan":
                     _log(f"  error: masscan unavailable: {exc}")

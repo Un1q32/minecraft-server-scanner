@@ -275,6 +275,28 @@ the rescan half, and `--rounds N` stops after N rounds (useful for
 testing). The deep-port strategies need masscan and root; without them the
 Python backend skips rounds whose probe count exceeds its cap.
 
+#### Running several machines
+
+Continuous mode is deterministic where it matters (ranges come from the
+DB, and the best-scoring strategy wins), so independent machines would
+otherwise overlap — especially at bootstrap, where every fresh DB picks
+`slash0` and sweeps the same address space. Give each machine a distinct
+slice instead:
+
+    mcscan.py --continuous --shard 1/3     # machine 1
+    mcscan.py --continuous --shard 2/3     # machine 2
+    mcscan.py --continuous --shard 3/3     # machine 3
+
+masscan divides the space itself (`--shard I/N`), and all machines must
+shuffle from the same seed or their shards will drift into each other, so
+sharding passes a fixed `--seed` (`--scan-seed` to override; use the same
+value everywhere). The Python backend, which has no native sharding, takes
+every Nth expanded target instead. Strategy ties are also broken randomly
+per machine, so hosts with similar histories diversify over time.
+
+Do not mix shard counts mid-run: a machine at `1/3` and one at `1/2` are
+not disjoint.
+
 `exclude.conf` applies to every round, to both halves: strategy ranges and
 rescan targets (including padded /20s) are carved before any backend runs,
 and masscan additionally receives them as an `--excludefile`. The round
