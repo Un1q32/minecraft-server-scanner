@@ -444,6 +444,10 @@ with Emscripten installed:
 
     ./webui/build.sh
 
+The build compiles the SQLite 3.54.0 amalgamation directly (downloaded into
+`webui/.sqlite/`), rather than using Emscripten's port manager, so it also
+works when Emscripten has a frozen cache.
+
 ## Text format
 
 The standard exported server line is:

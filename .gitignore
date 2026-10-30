@@ -42,3 +42,6 @@ desktop.ini
 .idea/
 
 /webscan
+
+# Web UI build inputs (downloaded SQLite amalgamation)
+/webui/.sqlite/
