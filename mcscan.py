@@ -184,6 +184,16 @@ def cmd_recheck_whitelist(ips):
     return 0
 
 
+def _csv_cell(value):
+    """Neutralize spreadsheet formula injection from server-controlled text."""
+    if value is None:
+        return ""
+    text = str(value)
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
 def cmd_export(path):
     """Dump the full local DB to CSV. Returns exit code."""
     try:
@@ -202,7 +212,7 @@ def cmd_export(path):
                         val = e.get(col, "")
                     except Exception:
                         val = ""
-                    row.append("" if val is None else val)
+                    row.append(_csv_cell(val))
                 writer.writerow(row)
     except Exception as exc:
         print(f"error: could not write {path}: {exc}")

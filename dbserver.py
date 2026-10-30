@@ -127,6 +127,7 @@ SCHEMA = (
 
 PLAYERS_EVER_MAX = 500  # per-server cap on the ever-seen name list
 PLAYER_NAME_MAX_LEN = 32
+MAX_VARINT_VALUE = 0x7FFFFFFF
 
 _db_lock = threading.Lock()
 _nonce_lock = threading.Lock()
@@ -276,16 +277,19 @@ def _clamp_ts(value):
 
 
 def _clamp_str(value, limit):
+    """Server text -> stored text. Preserve every character; cap length.
+
+    Display hardening (control/ANSI/bidi escaping, newline flattening) is
+    the viewer's job so synced rows are stored byte-for-byte as reported.
+    """
     s = "" if value is None else str(value)
-    s = re.sub(r"\s+", " ", s.replace("\r", " ").replace("\n", " ")).strip()
     return s[:limit]
 
 
 def _clean_player_name(value):
     try:
         s = "" if value is None else str(value)
-        s = re.sub(r"\s+", " ", s.replace("\r", " ").replace("\n", " ")).strip()
-        return s[:PLAYER_NAME_MAX_LEN].strip()
+        return s[:PLAYER_NAME_MAX_LEN]
     except Exception:
         return ""
 
@@ -366,6 +370,8 @@ def sanitize_row(raw):
     try:
         protocol = raw.get("protocol")
         protocol = None if protocol is None else int(protocol)
+        if protocol is not None and not (0 <= protocol <= MAX_VARINT_VALUE):
+            protocol = None
     except Exception:
         protocol = None
     try:

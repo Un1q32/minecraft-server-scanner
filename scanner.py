@@ -42,8 +42,8 @@ def _require_nbtlib():
 import threading
 _QT_AVAILABLE = True
 try:
-    from PySide6.QtCore import Qt, QTimer, QThread
-    from PySide6.QtGui import QIcon, QPixmap, QImage, QColor
+    from PySide6.QtCore import Qt, QTimer, QThread, QBuffer, QByteArray
+    from PySide6.QtGui import QIcon, QPixmap, QImage, QColor, QImageReader
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
         QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
@@ -76,8 +76,8 @@ except ImportError:
                "PySide6.QtWidgets"):
         _make_qt_stub_module(_m)
     del _make_qt_stub_module
-    from PySide6.QtCore import Qt, QTimer, QThread
-    from PySide6.QtGui import QIcon, QPixmap, QImage, QColor
+    from PySide6.QtCore import Qt, QTimer, QThread, QBuffer, QByteArray
+    from PySide6.QtGui import QIcon, QPixmap, QImage, QColor, QImageReader
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
         QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
@@ -192,6 +192,7 @@ MASSCAN_OUTPUT_TIMEOUT_MARGIN = 30
 # servers, this prevents a single scan target from reserving gigabytes of RAM.
 MAX_STATUS_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_FAVICON_RESPONSE_BYTES = 512 * 1024
+MAX_PROXY_HEADER_BYTES = 64 * 1024
 MAX_ICON_CACHE_ENTRIES = 512
 # Minecraft VarInts are signed 32-bit on the wire. Keeping this bound also
 # stops a crafted status response ("protocol": -1) from making varint_encode
@@ -373,17 +374,28 @@ def get_cached_cracked_entry(ip_port):
         return dict(entry) if entry else None
 
 def record_cracked_server(ip_port, message="", extra=None):
+    message = sanitize_motd(message or "")[:500]
     data = {
-        "message": message or "",
+        "message": message,
         "first_seen": time.time(),
         "last_seen": time.time()
     }
     if isinstance(extra, dict):
+        try:
+            players = max(0, min(int(extra.get("players", 0) or 0),
+                                 MAX_COUNTED_PLAYERS))
+        except Exception:
+            players = 0
+        try:
+            max_players = max(0, min(int(extra.get("max_players", 0) or 0),
+                                     MAX_COUNTED_PLAYERS))
+        except Exception:
+            max_players = 0
         data.update({
-            "motd": extra.get("motd", ""),
-            "version": extra.get("version", ""),
-            "players": extra.get("players", 0),
-            "max_players": extra.get("max_players", 0)
+            "motd": sanitize_motd(extra.get("motd", ""))[:MAX_MOTD_CHARS],
+            "version": sanitize_motd(extra.get("version", ""))[:MAX_VERSION_CHARS],
+            "players": players,
+            "max_players": max_players
         })
     with _CRACKED_CACHE_LOCK:
         existing = _CRACKED_CACHE.get(ip_port)
@@ -393,7 +405,7 @@ def record_cracked_server(ip_port, message="", extra=None):
         _save_cracked_cache_locked()
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        line = f"{ts} | {ip_port} | {message or 'CRACKED'}\n"
+        line = f"{ts} | {ip_port} | {display_text(message, 500) or 'CRACKED'}\n"
         with open(CRACKED_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line)
     except Exception:
@@ -459,18 +471,22 @@ MAX_VERSION_CHARS = 100
 MAX_SOURCE_CHARS = 64
 MAX_COUNTED_PLAYERS = 1_000_000
 MAX_SAMPLE_NAMES = 100       # per sighting (vanilla samples ~12)
+MAX_USER_LOG_ENTRIES = 50000 # players tracked in user_log.json
 MAX_SANITIZE_INPUT = 4000    # bound the regex work on hostile strings
 
 
 def _clean_player_name(name):
-    """One server-reported name -> cleaned string, or "" to drop."""
+    """One server-reported name -> stored string, or "" to drop.
+
+    Content is preserved exactly (emoji, newlines, formatting codes); only
+    the length is capped so a hostile server cannot bloat the DB. Display
+    code escapes it separately via display_text().
+    """
     try:
-        cleaned = sanitize_motd(name)
+        cleaned = "" if name is None else str(name)
     except Exception:
         return ""
-    if len(cleaned) > PLAYER_NAME_MAX_LEN:
-        cleaned = cleaned[:PLAYER_NAME_MAX_LEN].strip()
-    return cleaned
+    return cleaned[:PLAYER_NAME_MAX_LEN]
 
 
 def _sample_names(sample):
@@ -709,7 +725,7 @@ def update_server_cracked(ip_port, cracked_label, message=""):
     except Exception:
         return
     now = time.time()
-    label = (cracked_label or "").strip()[:32] or "Yes"
+    label = sanitize_motd(cracked_label or "")[:32] or "Yes"
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
@@ -746,7 +762,7 @@ def update_server_whitelist(ip_port, whitelist_label):
     except Exception:
         return
     now = time.time()
-    label = (whitelist_label or "").strip()[:200]
+    label = sanitize_motd(whitelist_label or "")[:200]
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
@@ -1356,7 +1372,8 @@ def netdb_sync_once(url, token, timeout=None):
             "now": now}
 
 ICON_ENABLED = True           
-ICON_SIZE = 24                
+ICON_SIZE = 24
+ICON_MAX_DIM = 512            # reject decompression-bomb server icons
 ICON_COL_EXTRA_PAD = 24       
 ICON_FETCH_TIMEOUT = 2        
 ICON_THREADS = 10             
@@ -1852,7 +1869,9 @@ def _http_connect(sock, proxy, target_host, target_port):
     sock.sendall(req)
     data = b""
     while b"\r\n\r\n" not in data:
-        chunk = sock.recv(4096)
+        if len(data) >= MAX_PROXY_HEADER_BYTES:
+            raise ValueError("Proxy response headers too large")
+        chunk = sock.recv(min(4096, MAX_PROXY_HEADER_BYTES - len(data)))
         if not chunk:
             raise ConnectionError("Proxy closed during CONNECT")
         data += chunk
@@ -2225,7 +2244,20 @@ def get_ip_only(line_or_ip):  #
 
 # Common formatter so all tabs show exactly the same line format
 def format_result_line(ip_port, motd, players_online, players_max, version):  #
-    return f"{ip_port} | MOTD: {sanitize_motd(motd)} | Players: {players_online}/{players_max} | Version: {version}"
+    try:
+        online = str(max(0, min(int(players_online), MAX_COUNTED_PLAYERS)))
+    except Exception:
+        # Keep placeholders like the Shodan "N/A" path, but never emit
+        # server-controlled control characters.
+        online = display_text(players_online, 16) or "0"
+    try:
+        maximum = str(max(0, min(int(players_max), MAX_COUNTED_PLAYERS)))
+    except Exception:
+        maximum = display_text(players_max, 16) or "0"
+    safe_version = display_text(version, MAX_VERSION_CHARS)
+    safe_motd = display_text(motd, MAX_MOTD_CHARS)
+    return (f"{ip_port} | MOTD: {safe_motd} | "
+            f"Players: {online}/{maximum} | Version: {safe_version}")
 
 # Sorting helpers for Treeviews
 def _players_key(val):  # "6/73" -> 6
@@ -2315,12 +2347,45 @@ def version_filter_allows(version, selected):
     selected_norm = sanitize_motd(selected).lower()
     return selected_norm in version_norm or version_norm in selected_norm
     
+# C0/C1 controls (except TAB/LF/CR, which are content) plus bidi and
+# zero-width formatting characters. U+200C/U+200D (ZWNJ/ZWJ) are kept so
+# emoji sequences and scripts that rely on them render correctly.
+_DISPLAY_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_DISPLAY_BIDI_RE = re.compile(
+    r"[\u061c\u180e\u200b\u200e\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+
+
 def sanitize_motd(m):
+    """Server-reported text -> stored text.
+
+    Storage preserves every character exactly: newlines, tabs, emoji,
+    legacy section-sign formatting codes and other control characters are
+    all kept. Only the length is capped to bound DB growth. Terminal/UI
+    safety is the display layer's job (see display_text); never destroy
+    stored data to make a viewer safe.
+    """
     m = "" if m is None else str(m)
-    if len(m) > MAX_SANITIZE_INPUT:
-        m = m[:MAX_SANITIZE_INPUT]
-    m = re.sub(r"§[0-9A-FK-ORa-fk-or]", "", m)  # strip legacy MC color/style codes
-    return re.sub(r"\s+", " ", m.replace("\r", " ").replace("\n", " ")).strip()
+    return m[:MAX_SANITIZE_INPUT]
+
+
+def display_text(value, limit=0):
+    """Server-controlled text -> safely renderable single-line text.
+
+    Output-only hardening used by CLI/log/GUI rendering. It strips C0/C1
+    controls and bidi/zero-width overrides (which a hostile server could
+    use for terminal escapes or text spoofing) and collapses whitespace,
+    but it must never be used for values written to the database.
+    """
+    s = "" if value is None else str(value)
+    if len(s) > MAX_SANITIZE_INPUT:
+        s = s[:MAX_SANITIZE_INPUT]
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _DISPLAY_CONTROL_RE.sub("", s)
+    s = _DISPLAY_BIDI_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if limit:
+        s = s[:limit]
+    return s
 
 MC_TRANSLATE_MESSAGES = {
     "multiplayer.disconnect.unverified_username": "Failed to verify username",
@@ -2421,7 +2486,9 @@ def save_shodan_results(servers, filepath):
             if is_ignored(ip_port):
                 skipped_ignored += 1
                 continue
-            line = f"{ip_port} | MOTD: {motd} | Players: {players} | Version: {version}"
+            line = (f"{ip_port} | MOTD: {display_text(motd)} | "
+                    f"Players: {display_text(players, 32)} | "
+                    f"Version: {display_text(version, MAX_VERSION_CHARS)}")
             f.write(line + "\n")
 
     if skipped_ignored:
@@ -2601,24 +2668,39 @@ def ping_server(entry, proxy=None):
             json_length = varint_decode(sock)
             data = recv_bounded(sock, json_length, MAX_STATUS_RESPONSE_BYTES).decode('utf-8')
             response = json.loads(data)
+            if not isinstance(response, dict):
+                return None
 
-            motd = parse_description(response.get('description', ''))
-            players = response.get('players', {}).get('online', 0)
-            max_players = response.get('players', {}).get('max', 0)
+            motd = parse_description(response.get('description', ''))[:MAX_MOTD_CHARS]
+            players_obj = response.get('players') or {}
+            if not isinstance(players_obj, dict):
+                players_obj = {}
+            try:
+                players = max(0, min(int(players_obj.get('online', 0) or 0),
+                                     MAX_COUNTED_PLAYERS))
+            except Exception:
+                players = 0
+            try:
+                max_players = max(0, min(int(players_obj.get('max', 0) or 0),
+                                         MAX_COUNTED_PLAYERS))
+            except Exception:
+                max_players = 0
             # sample is a list of dicts like {"id": "uuid", "name": "playername"}
-            sample = response.get('players', {}).get('sample', []) or []
+            sample = players_obj.get('sample') or []
+            if not isinstance(sample, list):
+                sample = []
 
             # Normalize sample to list of tuples (id, name)
             players_sample = []
             for p in sample:
                 if len(players_sample) >= MAX_SAMPLE_NAMES:
                     break
-                try:
-                    pid = str(p.get('id') or "")
-                    pname = str(p.get('name') or "")
-                    players_sample.append((pid, pname))
-                except Exception:
+                if not isinstance(p, dict):
                     continue
+                pid = str(p.get('id') or "")[:64]
+                pname = _clean_player_name(p.get('name'))
+                if pname:
+                    players_sample.append((pid, pname))
 
             # cracked detection: if any reported player id matches the offline-mode UUID for that name
             def _offline_uuid_for_name(name: str) -> str:
@@ -2645,14 +2727,19 @@ def ping_server(entry, proxy=None):
                 except Exception:
                     continue
 
+            version_obj = response.get('version') or {}
+            if not isinstance(version_obj, dict):
+                version_obj = {}
+            version = sanitize_motd(version_obj.get('name', 'N/A'))[:MAX_VERSION_CHARS] or "N/A"
+
             result = {
                 'ip': f"{host}:{port}",
                 'players': players,
                 'max_players': max_players,
                 'motd': motd,
-                'version': response.get('version', {}).get('name', 'N/A'),
+                'version': version,
                 'protocol': sanitize_protocol(
-                    response.get('version', {}).get('protocol', PROTOCOL_VERSION),
+                    version_obj.get('protocol', PROTOCOL_VERSION),
                     PROTOCOL_VERSION),
                 'players_sample': players_sample,
                 'cracked': cracked
@@ -2677,8 +2764,11 @@ def format_player_list(sample):
             name = item[1]
         elif isinstance(item, dict):
             name = item.get("name")
-        if isinstance(name, str) and name.strip():
-            names.append(name.strip())
+        cleaned = display_text(_clean_player_name(name), PLAYER_NAME_MAX_LEN)
+        if cleaned:
+            names.append(cleaned)
+        if len(names) >= MAX_SAMPLE_NAMES:
+            break
     return ", ".join(names) if names else "-"
 
 
@@ -2891,7 +2981,7 @@ def detect_modloader_from_channel(channel):
 
 
 def mod_warning_text(loader, detail=""):
-    detail = (detail or "").strip()
+    detail = display_text(detail or "")
     base = f"{loader} modded server"
     if detail and detail.lower() != loader.lower():
         short = detail if len(detail) <= 80 else detail[:77] + "..."
@@ -2934,21 +3024,30 @@ def get_server_status_full(host, port=25565, proxy=None):
         if not isinstance(data, dict):
             data = {}
 
+        version_obj = data.get("version") or {}
+        if not isinstance(version_obj, dict):
+            version_obj = {}
         proto = sanitize_protocol(
-            data.get("version", {}).get("protocol", DEFAULT_STATUS_PROTOCOL),
+            version_obj.get("protocol", DEFAULT_STATUS_PROTOCOL),
             DEFAULT_STATUS_PROTOCOL)
 
         sample_names = []
         sample_hint = None
         players = data.get("players") or {}
+        if not isinstance(players, dict):
+            players = {}
         samples = players.get("sample") or []
+        if not isinstance(samples, list):
+            samples = []
         any_sample = False
         any_offline_match = False
         for player in samples:
             if len(sample_names) >= MAX_SAMPLE_NAMES:
                 break
-            name = player.get("name")
-            pid = player.get("id")
+            if not isinstance(player, dict):
+                continue
+            name = _clean_player_name(player.get("name"))
+            pid = str(player.get("id") or "")[:64]
             if not name or not pid:
                 continue
             any_sample = True
@@ -3069,20 +3168,22 @@ def login_probe(host, port=25565):
 
             if packet_id == 0x00:  # Disconnect
                 reason, _ = read_mc_string_from_bytes(buf, pos)
+                reason = sanitize_motd(reason)[:500]
                 low = (reason or "").lower()
-                clean = sanitize_motd(reason).lower()
+                clean = low
                 if "whitelist" in clean or "white list" in clean:
-                    return True, f"CRACKED (whitelist message: {sanitize_motd(reason)})"
+                    return True, f"CRACKED (whitelist message: {display_text(reason, 500)})"
                 if "outdated client" in low or "outdated server" in low:
                     return None, "VERSION MISMATCH (outdated client or server)"
                 if "rate" in low and "limit" in low:
                     return None, "RATE-LIMITED, slow down probes"
 
+                shown = display_text(reason, 200)
                 if sample_offline_hint is True:
-                    return True, f"CRACKED by players.sample UUID (disconnect: {reason})"
+                    return True, f"CRACKED by players.sample UUID (disconnect: {shown})"
                 if sample_offline_hint is False and saw_encryption_request:
-                    return False, f"ONLINE-MODE (disconnect: {reason})"
-                return None, f"UNKNOWN MODE (disconnect: {reason})"
+                    return False, f"ONLINE-MODE (disconnect: {shown})"
+                return None, f"UNKNOWN MODE (disconnect: {shown})"
 
             # Unknown login packets are ignored.
 
@@ -3121,7 +3222,7 @@ def build_authenticated_login_start(account, protocol):
 def parse_disconnect_reason(buf, pos):
     try:
         reason, _ = read_mc_string_from_bytes(buf, pos)
-        return minecraft_text_component_to_plain(reason)
+        return minecraft_text_component_to_plain(reason)[:500]
     except Exception:
         return ""
 
@@ -3130,7 +3231,7 @@ def read_login_plugin_channel(buf, pos):
     try:
         _msg_id, pos = read_varint_from_bytes(buf, pos)
         channel, _ = read_mc_string_from_bytes(buf, pos)
-        return channel or ""
+        return (channel or "")[:64]
     except Exception:
         return ""
 
@@ -3334,16 +3435,17 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
 
                     if packet_id == 0x00:
                         reason = parse_disconnect_reason(buf, pos)
+                        shown_reason = display_text(reason, 200)
                         low = reason.lower()
                         if "whitelist" in low or "white list" in low or "not whitelisted" in low:
-                            msg = f"WHITELISTED ({reason})"
+                            msg = f"WHITELISTED ({shown_reason})"
                             if not mojang_used and not saw_encryption:
                                 msg += " [offline-mode]"
                             return True, append_mod_warning(msg, mod_warning), "done"
                         if "throttl" in low:
-                            return None, append_mod_warning(f"Connection throttled, retry later ({reason})", mod_warning), "done"
+                            return None, append_mod_warning(f"Connection throttled, retry later ({shown_reason})", mod_warning), "done"
                         if "outdated client" in low or "outdated server" in low:
-                            return None, append_mod_warning(f"Version mismatch ({reason})", mod_warning), "retry_version"
+                            return None, append_mod_warning(f"Version mismatch ({shown_reason})", mod_warning), "retry_version"
                         if (
                             "multiplayer is disabled" in low or
                             "authentication" in low or
@@ -3351,14 +3453,14 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                             "verify username" in low or
                             "unverified_username" in low
                         ):
-                            return None, append_mod_warning(f"Auth/session rejected ({reason})", mod_warning), "done"
+                            return None, append_mod_warning(f"Auth/session rejected ({shown_reason})", mod_warning), "done"
                         # Modded servers often kick here with mod/channel mismatch text.
                         extra_warning = mod_warning
                         for marker in ("neoforge", "forge", "fml", "mod"):
                             if marker in low and marker not in extra_warning.lower():
                                 extra_warning = append_mod_warning("", mod_warning_text("NeoForge" if marker == "neoforge" else "Forge", reason)) or extra_warning
                                 break
-                        msg = f"Not Whitelisted ({reason})"
+                        msg = f"Not Whitelisted ({shown_reason})"
                         if not mojang_used and not saw_encryption:
                             msg += " [offline-mode]"
                         return False, append_mod_warning(msg, extra_warning), "done"
@@ -3470,7 +3572,7 @@ def whitelist_result_label(result, message):
         base = "Not Whitelisted"
     else:
         base = "Unknown"
-    detail = sanitize_motd(message or "").strip()
+    detail = display_text(message or "")
     if not detail:
         return base
     # Preserve modloader warnings (e.g. NeoForge) past the truncation limit.
@@ -3534,8 +3636,8 @@ def log_whitelist_probe(entry, result, message, account=None, scrub=None):
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         ip = entry.get("ip", "")
-        protocol = entry.get("protocol", "")
-        version = sanitize_motd(entry.get("version", ""))
+        protocol = sanitize_protocol(entry.get("protocol"), "")
+        version = display_text(entry.get("version", ""), MAX_VERSION_CHARS)
         token_source = account.get("token_source", "")
         if result is True:
             status = "WHITELIST"
@@ -3543,7 +3645,9 @@ def log_whitelist_probe(entry, result, message, account=None, scrub=None):
             status = "NOT_WHITELISTED"
         else:
             status = "UNKNOWN"
-        body = redact_probe_names(minecraft_text_component_to_plain(message or ""), redact_name, uuid)
+        body = redact_probe_names(minecraft_text_component_to_plain(message or ""),
+                                   redact_name, uuid)
+        body = display_text(body, 500)
         line = (
             f"{ts} | {ip} | protocol={protocol} | version={version} | "
             f"account={account_name} | token={token_source} | {status} | "
@@ -5905,14 +6009,19 @@ class UserLogManager:
         if not sample:
             return
         ip = result.get("ip", "")
-        motd = result.get("motd", "")
+        motd = sanitize_motd(result.get("motd", ""))[:MAX_MOTD_CHARS]
         now = time.time()
         changed = False
         with self._lock:
             for _pid, pname in sample:
-                player = (pname or "").strip()
+                player = _clean_player_name(pname)
                 if not player:
                     continue
+                # A hostile server can keep inventing sample names; cap the
+                # on-disk player log so it cannot grow without bound.
+                if (player not in self._entries
+                        and len(self._entries) >= MAX_USER_LOG_ENTRIES):
+                    break
                 entry = self._entries.get(player)
                 if not entry or entry["ip"] != ip or entry["motd"] != motd:
                     self._entries[player] = {"ip": ip, "motd": motd, "last_seen": now}
@@ -5939,13 +6048,17 @@ class UserLogManager:
             return
         entries = {}
         for row in data:
+            if len(entries) >= MAX_USER_LOG_ENTRIES:
+                break
             try:
-                player = (row.get("player") or "").strip()
+                player = _clean_player_name(row.get("player"))
                 if not player:
                     continue
-                ip = row.get("ip") or ""
-                motd = row.get("motd") or ""
+                ip = str(row.get("ip") or "")[:64]
+                motd = sanitize_motd(row.get("motd", ""))[:MAX_MOTD_CHARS]
                 ts = float(row.get("last_seen") or 0)
+                if not (0 <= ts <= 1e18):
+                    ts = 0.0
                 entries[player] = {"ip": ip, "motd": motd, "last_seen": ts}
             except Exception:
                 continue
@@ -5983,9 +6096,17 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
             data = recv_bounded(sock, json_length, MAX_FAVICON_RESPONSE_BYTES).decode('utf-8')
             response = json.loads(data)
             fav = response.get('favicon')
-            if isinstance(fav, str) and fav.startswith('data:image'):
-                b64 = fav.split(',', 1)[1]
-                return base64.b64decode(b64)
+            if isinstance(fav, str) and fav.startswith('data:image/'):
+                header, sep, payload = fav.partition(',')
+                if not sep or ';base64' not in header.lower():
+                    return None
+                mime = header.split(':', 1)[1].split(';', 1)[0].strip().lower()
+                # Minecraft favicons are PNG (some servers use JPEG). Do not
+                # hand SVG/GIF/other codecs to the image loader just because a
+                # hostile server labels its payload that way.
+                if mime not in ('image/png', 'image/jpeg', 'image/jpg'):
+                    return None
+                return base64.b64decode(payload)
     except Exception:
         pass
     return None
@@ -6027,7 +6148,9 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
 
                 if r:
                     results.append(r)
-                    line = f"{r['ip']} | MOTD: {r['motd']} | Players: {r['players']}/{r['max_players']} | Version: {r['version']}"
+                    line = format_result_line(
+                        r['ip'], r['motd'], r['players'],
+                        r['max_players'], r['version'])
                     if r['players'] > 0:
                         online_lines.append(line)
                     USER_LOG_MANAGER.update_from_result(r)
@@ -6665,7 +6788,25 @@ class _IconManager:
         if not png_bytes:
             return None
         try:
-            img = QImage.fromData(bytes(png_bytes))
+            raw = bytes(png_bytes)
+            if len(raw) > MAX_FAVICON_RESPONSE_BYTES:
+                return None
+            buffer = QBuffer()
+            buffer.setData(QByteArray(raw))
+            if not buffer.open(QBuffer.ReadOnly):
+                return None
+            reader = QImageReader(buffer)
+            fmt = bytes(reader.format()).decode('ascii', errors='ignore').lower()
+            if fmt not in ('png', 'jpeg', 'jpg'):
+                return None
+            size = reader.size()
+            # Reject huge dimensions before decoding: a small PNG can
+            # describe a multi-gigapixel image and exhaust the GUI process.
+            if (not size.isValid()
+                    or size.width() > ICON_MAX_DIM
+                    or size.height() > ICON_MAX_DIM):
+                return None
+            img = reader.read()
             if img.isNull():
                 return None
             pix = QPixmap.fromImage(img)
@@ -7870,9 +8011,9 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         cracked_text = "Yes" if r.get("cracked") else "No"
                     row = (
                         r["ip"],
-                        r["motd"],
+                        display_text(r["motd"], MAX_MOTD_CHARS),
                         f"{r['players']}/{r['max_players']}",
-                        r["version"],
+                        display_text(r["version"], MAX_VERSION_CHARS),
                         cracked_text,
                         "Queued" if check_whitelist else "-",
                         format_player_list(r.get("players_sample"))
@@ -7957,8 +8098,9 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             with lock:
                                 probed_n["n"] += 1
                             if r:
-                                line = (f"{r['ip']} | MOTD: {r['motd']} | Players: "
-                                        f"{r['players']}/{r['max_players']} | Version: {r['version']}")
+                                line = format_result_line(
+                                    r['ip'], r['motd'], r['players'],
+                                    r['max_players'], r['version'])
                                 with lock:
                                     results.append(r)
                                 try:
@@ -8142,8 +8284,9 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                                 record_server_result(hit, source="minescan")
                             except Exception:
                                 pass
-                            line = (f"{hit['ip']} | MOTD: {hit['motd']} | Players: "
-                                    f"{hit['players']}/{hit['max_players']} | Version: {hit['version']}")
+                            line = format_result_line(
+                                hit['ip'], hit['motd'], hit['players'],
+                                hit['max_players'], hit['version'])
                             with lock:
                                 results.append(hit)
                             try:
@@ -8724,7 +8867,7 @@ class ProxyTab(QWidget, QtBaseMixin):
             proxy_str = proxy_display(proxy) if proxy else "-"
             self.after(0, lambda: self.res_tree.insert(
                 "", "end",
-                values=(ip, label, sanitize_motd(message or "")[:160], acc_name, proxy_str)
+                values=(ip, label, display_text(message or "", 160), acc_name, proxy_str)
             ))
 
         def on_progress(done, total):
@@ -9020,27 +9163,41 @@ class ServersTab(QWidget, QtBaseMixin):
         for iid in list(self.tree.get_children()):
             self.tree.delete(iid)
         for e in entries:
-            players = f"{e.get('players_online', 0)}/{e.get('max_players', 0)}"
             try:
-                online_names = ", ".join(_decode_player_list(e.get("players_now"))) or "-"
+                online = max(0, min(int(e.get("players_online", 0) or 0),
+                                     MAX_COUNTED_PLAYERS))
+            except Exception:
+                online = 0
+            try:
+                maximum = max(0, min(int(e.get("max_players", 0) or 0),
+                                     MAX_COUNTED_PLAYERS))
+            except Exception:
+                maximum = 0
+            players = f"{online}/{maximum}"
+            try:
+                online_names = ", ".join(
+                    display_text(n, PLAYER_NAME_MAX_LEN)
+                    for n in _decode_player_list(e.get("players_now"))) or "-"
             except Exception:
                 online_names = "-"
             try:
-                seen_names = ", ".join(_decode_player_list(e.get("players_ever"))) or "-"
+                seen_names = ", ".join(
+                    display_text(n, PLAYER_NAME_MAX_LEN)
+                    for n in _decode_player_list(e.get("players_ever"))) or "-"
             except Exception:
                 seen_names = "-"
             self.tree.insert("", "end", values=(
                 e.get("ip_port", ""),
-                e.get("motd", "") or "",
+                display_text(e.get("motd", ""), MAX_MOTD_CHARS),
                 players,
-                e.get("version", "") or "",
-                e.get("cracked", "") or "",
-                e.get("whitelist", "") or "",
+                display_text(e.get("version", ""), MAX_VERSION_CHARS),
+                display_text(e.get("cracked", ""), 32),
+                display_text(e.get("whitelist", ""), 200),
                 online_names,
                 seen_names,
                 format_db_timestamp(e.get("first_seen", 0)),
                 format_db_timestamp(e.get("last_seen", 0)),
-                str(e.get("times_seen", 1)),
+                display_text(e.get("times_seen", 1), 20),
             ))
         try:
             self.count_label.setText(f"{len(entries)} server(s)")
@@ -9682,7 +9839,7 @@ class ServerMonitorTab(QtBaseMixin, QWidget):
             last_ping = format_timestamp(entry.get("last_ping"))
             version = entry.get("version", "N/A")
             cracked = "Yes" if entry.get("cracked") else "No"
-            motd = sanitize_motd(entry.get("motd", ""))
+            motd = display_text(entry.get("motd", ""), MAX_MOTD_CHARS)
             offline = status.strip().lower() != "online" and status.strip()
             row = self._add_table_row(
                 self.server_tree,
@@ -10371,9 +10528,9 @@ class ShodanTab(QWidget, QtBaseMixin):
                     self.scan_rows.append(
                         (
                             r["ip"],
-                            r["motd"],
+                            display_text(r["motd"], MAX_MOTD_CHARS),
                             f"{r['players']}/{r['max_players']}",
-                            r["version"],
+                            display_text(r["version"], MAX_VERSION_CHARS),
                             "Yes" if r.get("cracked") else "No",
                             "Queued" if check_whitelist else "-",
                             format_player_list(r.get("players_sample")),
@@ -10403,9 +10560,9 @@ class ShodanTab(QWidget, QtBaseMixin):
                     active_players = format_player_list(r.get("players_sample"))
                     vals = (
                         r["ip"],
-                        r["motd"],
+                        display_text(r["motd"], MAX_MOTD_CHARS),
                         f"{r['players']}/{r['max_players']}",
-                        r["version"],
+                        display_text(r["version"], MAX_VERSION_CHARS),
                         cracked_text,
                         whitelist_text,
                         active_players,
@@ -11051,9 +11208,9 @@ class JSONTab(QWidget, QtBaseMixin):
                         return
                     self.scan_rows.append((
                         r['ip'],
-                        r['motd'],
+                        display_text(r['motd'], MAX_MOTD_CHARS),
                         f"{r['players']}/{r['max_players']}",
-                        r['version'],
+                        display_text(r['version'], MAX_VERSION_CHARS),
                         "Yes" if r.get('cracked') else "No",
                         "Queued" if check_whitelist else "-",
                         format_player_list(r.get('players_sample'))
@@ -11080,9 +11237,9 @@ class JSONTab(QWidget, QtBaseMixin):
                     active_players = format_player_list(r.get('players_sample'))
                     vals = (
                         r['ip'],
-                        r['motd'],
+                        display_text(r['motd'], MAX_MOTD_CHARS),
                         f"{r['players']}/{r['max_players']}",
-                        r['version'],
+                        display_text(r['version'], MAX_VERSION_CHARS),
                         cracked_text,
                         whitelist_text,
                         active_players
@@ -11656,9 +11813,9 @@ class UserLogTab(QWidget, QtBaseMixin):
                 "",
                 "end",
                 values=(
-                    entry["player"],
+                    display_text(entry["player"]),
                     entry["ip"],
-                    entry["motd"],
+                    display_text(entry["motd"], MAX_MOTD_CHARS),
                     self._format_last_seen(entry["last_seen"]),
                 ),
             )
@@ -11728,7 +11885,7 @@ class UserLogTab(QWidget, QtBaseMixin):
             with open(path, "w", encoding="utf-8") as f:
                 for entry in self._cached_entries:
                     ts = self._format_last_seen(entry["last_seen"])
-                    motd = sanitize_motd(entry["motd"])
+                    motd = display_text(entry["motd"])
                     f.write(f"{entry['player']} | {entry['ip']} | Last Seen: {ts} | MOTD: {motd}\n")
             self.set_status(f"Exported {len(self._cached_entries)} player(s) to {os.path.basename(path)}.")
         except Exception as e:

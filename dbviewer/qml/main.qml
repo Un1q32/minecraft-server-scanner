@@ -504,6 +504,7 @@ ApplicationWindow {
                                 anchors.rightMargin: 6
                                 verticalAlignment: Text.AlignVCenter
                                 text: display
+                                textFormat: Text.PlainText
                                 color: selected ? pal.highlightedText : pal.text
                                 font.family: window.mono
                                 font.pixelSize: window.monoSize
@@ -755,6 +756,7 @@ ApplicationWindow {
                             width: detailScroll.availableWidth
                             readOnly: true
                             selectByMouse: true
+                            textFormat: TextEdit.PlainText
                             wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
                             font.family: window.mono
                             font.pixelSize: 12
@@ -836,6 +838,7 @@ ApplicationWindow {
                 text: viewer.job_log
                 readOnly: true
                 selectByMouse: true
+                textFormat: TextEdit.PlainText
                 wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
                 font.family: window.mono
                 font.pixelSize: 12

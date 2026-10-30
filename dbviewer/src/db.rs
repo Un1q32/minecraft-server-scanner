@@ -80,17 +80,53 @@ fn col_or(con: &Connection, name: &str, fallback: &str) -> String {
     }
 }
 
+/// Controls/bidi characters hidden from display. U+200C/U+200D are kept so
+/// emoji ZWJ sequences and scripts using ZWNJ/ZWJ render normally.
+fn is_hidden(ch: char) -> bool {
+    matches!(ch,
+        '\u{061c}' | '\u{180e}' | '\u{200b}' | '\u{200e}' | '\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+}
+
+/// Remove terminal/UI control and bidi characters from server-controlled
+/// database text. Newlines/tabs become spaces for single-line cells.
+fn clean_display(value: &str) -> String {
+    value
+        .chars()
+        .filter(|&ch| {
+            matches!(ch, '\n' | '\r' | '\t') || (!ch.is_control() && !is_hidden(ch))
+        })
+        .map(|ch| match ch {
+            '\n' | '\r' | '\t' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// Like [`clean_display`], but keeps newlines for the multi-line detail pane.
+/// Tabs are expanded because Qt's plain-text edit renders them inconsistently.
+fn clean_multiline(value: &str) -> String {
+    value
+        .chars()
+        .filter(|&ch| {
+            matches!(ch, '\n' | '\t') || (!ch.is_control() && !is_hidden(ch))
+        })
+        .flat_map(|ch| match ch {
+            '\t' => "    ".chars().collect::<Vec<_>>(),
+            other => vec![other],
+        })
+        .collect()
+}
+
 /// Copy `value` into `out`, clipped/padded to `width` characters.
 fn push_field(out: &mut String, value: &str, width: usize) {
-    let clipped = value.chars().count() > width;
+    let clean = clean_display(value);
+    let clipped = clean.chars().count() > width;
     // Leave room for an ellipsis so a cut field is visibly cut.
     let limit = if clipped { width.saturating_sub(1) } else { width };
     let mut used = 0;
-    for ch in value.chars().take(limit) {
-        out.push(match ch {
-            '\n' | '\r' | '\t' => ' ',
-            other => other,
-        });
+    for ch in clean.chars().take(limit) {
+        out.push(ch);
         used += 1;
     }
     if clipped {
@@ -128,13 +164,7 @@ fn push_timestamp(out: &mut String, epoch: f64) {
 
 /// Collapse a database string to a single table cell line.
 pub fn one_line(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '\n' | '\r' | '\t' => ' ',
-            other => other,
-        })
-        .collect()
+    clean_display(value)
 }
 
 /// The fixed-width line used by `--selftest`; the GUI draws real columns.
@@ -161,7 +191,8 @@ pub fn names_of(raw: &str) -> String {
         Ok(items) => {
             let names: Vec<String> = items
                 .into_iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
+                .filter_map(|value| value.as_str().map(clean_display))
+                .filter(|name| !name.trim().is_empty())
                 .collect();
             if names.is_empty() {
                 "-".to_string()
@@ -170,7 +201,7 @@ pub fn names_of(raw: &str) -> String {
             }
         }
         Err(_) => {
-            let text = raw.trim();
+            let text = clean_display(raw.trim());
             if text.is_empty() || text == "[]" {
                 "-".to_string()
             } else {
@@ -273,11 +304,14 @@ pub fn detail(path: &str, row: &Row) -> Result<String, String> {
     let names_ever: String = found.get(5).unwrap_or_default();
 
     let mut out = String::with_capacity(512);
-    let _ = writeln!(out, "{}\n", row.ip);
+    let _ = writeln!(out, "{}\n", clean_multiline(&row.ip));
+    let motd = clean_multiline(&row.motd);
+    let version = clean_multiline(&row.version);
+    let whitelist = clean_multiline(&whitelist);
     let _ = writeln!(
         out,
         "MOTD:        {}",
-        if row.motd.is_empty() { "-" } else { &row.motd }
+        if motd.is_empty() { "-" } else { &motd }
     );
     let _ = writeln!(
         out,
@@ -287,13 +321,14 @@ pub fn detail(path: &str, row: &Row) -> Result<String, String> {
     let _ = writeln!(
         out,
         "Version:     {} (protocol {})",
-        if row.version.is_empty() { "-" } else { &row.version },
+        if version.is_empty() { "-" } else { &version },
         protocol
     );
+    let cracked = clean_multiline(&row.cracked);
     let _ = writeln!(
         out,
         "Cracked:     {}",
-        if row.cracked.is_empty() { "-" } else { &row.cracked }
+        if cracked.is_empty() { "-" } else { &cracked }
     );
     let _ = writeln!(
         out,
@@ -315,4 +350,33 @@ pub fn looks_like_db(path: &str) -> bool {
             con.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get::<_, i64>(0))
         })
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_text_strips_controls_and_bidi() {
+        let cleaned = one_line("a\x1b[31m\nb\u{202e}c\u{200b}d\x00e");
+        assert_eq!(cleaned, "a[31m bcde");
+    }
+
+    #[test]
+    fn detail_text_keeps_newlines_but_strips_controls() {
+        let text = clean_multiline("line1\nline2\u{202e}\x1b[31m");
+        assert_eq!(text, "line1\nline2[31m");
+    }
+
+    #[test]
+    fn emoji_zwj_sequences_are_kept() {
+        let emoji = "👨\u{200d}👩\u{200d}👧";
+        assert_eq!(one_line(emoji), emoji);
+    }
+
+    #[test]
+    fn names_are_cleaned() {
+        let names = names_of(r#"["alice", "b\u0000ob", "\u001b[31mcarol"]"#);
+        assert_eq!(names, "alice, bob, [31mcarol");
+    }
 }
