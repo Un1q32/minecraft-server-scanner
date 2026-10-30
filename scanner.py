@@ -193,6 +193,10 @@ MASSCAN_OUTPUT_TIMEOUT_MARGIN = 30
 MAX_STATUS_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_FAVICON_RESPONSE_BYTES = 512 * 1024
 MAX_ICON_CACHE_ENTRIES = 512
+# Minecraft VarInts are signed 32-bit on the wire. Keeping this bound also
+# stops a crafted status response ("protocol": -1) from making varint_encode
+# spin forever (negative numbers never reach zero when shifted right).
+MAX_VARINT_VALUE = 0x7FFFFFFF
 
 _CRACKED_CACHE_LOCK = threading.Lock()
 _WHITELIST_LOG_LOCK = threading.Lock()
@@ -237,10 +241,24 @@ _WHITELIST_LAST_ONLINE_PROBE = {}
 _PROTOCOL_CACHE = {}
 _PROTOCOL_CACHE_LOCK = threading.Lock()
 
-def _remember_protocol(ip_port, protocol):
+def sanitize_protocol(value, default=None):
+    """Return a usable protocol number, or ``default``.
+
+    A server controls this value in its status JSON and it is copied into the
+    DB/cache; it must never be negative or outside the VarInt range before it
+    is fed to varint_encode().
+    """
     try:
-        protocol = int(protocol)
+        protocol = int(value)
     except Exception:
+        return default
+    if protocol < 0 or protocol > MAX_VARINT_VALUE:
+        return default
+    return protocol
+
+def _remember_protocol(ip_port, protocol):
+    protocol = sanitize_protocol(protocol)
+    if protocol is None:
         return
     try:
         with _PROTOCOL_CACHE_LOCK:
@@ -251,7 +269,7 @@ def _remember_protocol(ip_port, protocol):
 def _cached_protocol(ip_port):
     try:
         with _PROTOCOL_CACHE_LOCK:
-            return _PROTOCOL_CACHE.get(ip_port)
+            return sanitize_protocol(_PROTOCOL_CACHE.get(ip_port))
     except Exception:
         return None
 
@@ -278,7 +296,7 @@ def _stored_protocol(ip_port):
                     pass
         if not row or row[0] is None:
             return None
-        return int(row[0])
+        return sanitize_protocol(row[0])
     except Exception:
         return None
 
@@ -286,9 +304,8 @@ def _stored_protocol(ip_port):
 def _persist_protocol(ip_port, protocol):
     """Store a protocol discovered by a probe, so future probes skip the
     status connection. Only updates existing rows (never creates one)."""
-    try:
-        protocol = int(protocol)
-    except Exception:
+    protocol = sanitize_protocol(protocol)
+    if protocol is None:
         return
     try:
         with _SERVER_DB_LOCK:
@@ -622,10 +639,7 @@ def record_server_result(result, source="scan"):
         source = str(source or "")[:MAX_SOURCE_CHARS] or "scan"
     except Exception:
         source = "scan"
-    try:
-        protocol = int(result.get("protocol")) if result.get("protocol") is not None else None
-    except Exception:
-        protocol = None
+    protocol = sanitize_protocol(result.get("protocol"))
     cracked = "Yes" if result.get("cracked") else "No"
     # Player-name lists: the live sample is the current roster; the union of
     # every sample ever seen stays after logout. Minescan hits carry no
@@ -2508,6 +2522,9 @@ def run_cracked_verifier_async(entries, callback, progress_cb=None):
 # ==================== PING ====================
 
 def varint_encode(number):
+    if (not isinstance(number, int) or number < 0
+            or number > MAX_VARINT_VALUE):
+        raise ValueError(f"Invalid VarInt value {number!r}")
     out = bytearray()
     while True:
         temp = number & 0b01111111
@@ -2535,12 +2552,16 @@ def varint_decode(sock):
             break
     return number
 
-def recv_bounded(sock, length, limit):
-    """Read a server-provided payload only after applying a hard size limit."""
+def recv_bounded(sock, length, limit, timeout=15.0):
+    """Read a server-provided payload with a hard size and time limit."""
     if length < 0 or length > limit:
         raise ValueError(f"Packet too large ({length} bytes; limit {limit})")
+    deadline = time.monotonic() + timeout
     data = bytearray()
     while len(data) < length:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Timed out reading {length}-byte payload (limit {limit})")
         chunk = sock.recv(min(65536, length - len(data)))
         if not chunk:
             raise IOError("Socket closed")
@@ -2590,6 +2611,8 @@ def ping_server(entry, proxy=None):
             # Normalize sample to list of tuples (id, name)
             players_sample = []
             for p in sample:
+                if len(players_sample) >= MAX_SAMPLE_NAMES:
+                    break
                 try:
                     pid = str(p.get('id') or "")
                     pname = str(p.get('name') or "")
@@ -2628,7 +2651,9 @@ def ping_server(entry, proxy=None):
                 'max_players': max_players,
                 'motd': motd,
                 'version': response.get('version', {}).get('name', 'N/A'),
-                'protocol': response.get('version', {}).get('protocol', PROTOCOL_VERSION),
+                'protocol': sanitize_protocol(
+                    response.get('version', {}).get('protocol', PROTOCOL_VERSION),
+                    PROTOCOL_VERSION),
                 'players_sample': players_sample,
                 'cracked': cracked
             }
@@ -2660,6 +2685,10 @@ def format_player_list(sample):
 # ==================== CRACKED SERVER CHECKER ====================
 
 PACKET_LENGTH_LIMIT_LOGIN = 100000
+DECOMPRESSED_LIMIT_LOGIN = 2 * 1024 * 1024
+LOGIN_PACKET_BUDGET = 64
+LOGIN_PROBE_DEADLINE = 8.0
+WHITELIST_PROBE_DEADLINE = 20.0
 DEFAULT_STATUS_PROTOCOL = 773
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 # Fixed login name for offline (no-account) probes: a real-looking username
@@ -2682,7 +2711,9 @@ def recv_varint(sock):
         if shift > 35:
             raise ValueError("Varint too big")
 
-def recv_exact(sock, length):
+def recv_exact(sock, length, limit=PACKET_LENGTH_LIMIT_LOGIN):
+    if length < 0 or length > limit:
+        raise ValueError(f"Refusing to read {length} bytes (limit {limit})")
     data = b""
     while len(data) < length:
         chunk = sock.recv(length - len(data))
@@ -2691,8 +2722,10 @@ def recv_exact(sock, length):
         data += chunk
     return data
 
-def recv_mc_string(sock):
+def recv_mc_string(sock, limit=PACKET_LENGTH_LIMIT_LOGIN):
     length = recv_varint(sock)
+    if length < 0 or length > limit:
+        raise ValueError(f"String too long ({length} bytes; limit {limit})")
     raw = recv_exact(sock, length)
     return raw.decode("utf-8", errors="ignore")
 
@@ -2749,12 +2782,33 @@ class EncryptedSocket:
 def send_mc_packet(sock, body):
     sock.sendall(varint_encode(len(body)) + body)
 
+def bounded_decompress(data, declared_len, limit=DECOMPRESSED_LIMIT_LOGIN):
+    """Decompress one zlib login packet without allowing a zip bomb.
+
+    The compressed payload is already capped by PACKET_LENGTH_LIMIT_LOGIN,
+    but that does not cap how much it expands to. The declared length is
+    checked first, and zlib itself is only allowed to produce limit+1 bytes.
+    """
+    if declared_len < 0 or declared_len > limit:
+        raise ValueError(
+            f"Decompressed packet too large ({declared_len} bytes; limit {limit})")
+    decompressor = zlib.decompressobj()
+    out = decompressor.decompress(data, limit + 1)
+    if len(out) > limit or decompressor.unconsumed_tail:
+        raise ValueError(f"Decompressed packet exceeds limit {limit}")
+    if not decompressor.eof:
+        raise ValueError("Compressed packet is truncated")
+    if len(out) != declared_len:
+        raise ValueError(
+            f"Decompressed length {len(out)} != declared {declared_len}")
+    return out
+
 def unpack_login_packet(packet_data, compression_threshold):
     if compression_threshold >= 0:
         data_len, pos = read_varint_from_bytes(packet_data, 0)
         if data_len == 0:
             return packet_data[pos:]
-        return zlib.decompress(packet_data[pos:])
+        return bounded_decompress(packet_data[pos:], data_len)
     return packet_data
 
 def offline_uuid_nodash(name):
@@ -2880,7 +2934,9 @@ def get_server_status_full(host, port=25565, proxy=None):
         if not isinstance(data, dict):
             data = {}
 
-        proto = data.get("version", {}).get("protocol", DEFAULT_STATUS_PROTOCOL)
+        proto = sanitize_protocol(
+            data.get("version", {}).get("protocol", DEFAULT_STATUS_PROTOCOL),
+            DEFAULT_STATUS_PROTOCOL)
 
         sample_names = []
         sample_hint = None
@@ -2889,6 +2945,8 @@ def get_server_status_full(host, port=25565, proxy=None):
         any_sample = False
         any_offline_match = False
         for player in samples:
+            if len(sample_names) >= MAX_SAMPLE_NAMES:
+                break
             name = player.get("name")
             pid = player.get("id")
             if not name or not pid:
@@ -2940,6 +2998,7 @@ def pick_username(sample_names):
 
 def login_probe(host, port=25565):
     protocol, sample_names, sample_offline_hint = get_server_status_info(host, port)
+    protocol = sanitize_protocol(protocol, DEFAULT_STATUS_PROTOCOL)
     username = pick_username(sample_names)
     sock = None
     saw_encryption_request = False
@@ -2960,7 +3019,12 @@ def login_probe(host, port=25565):
         login_start = build_login_start(username, protocol)
         sock.sendall(varint_encode(len(login_start)) + login_start)
 
+        deadline = time.monotonic() + LOGIN_PROBE_DEADLINE
+        packets = 0
         while True:
+            packets += 1
+            if packets > LOGIN_PACKET_BUDGET or time.monotonic() > deadline:
+                raise ValueError("Login probe packet budget exceeded")
             packet_length = recv_varint(sock)
             if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
                 raise ValueError("Packet too large")
@@ -2971,7 +3035,7 @@ def login_probe(host, port=25565):
                 if data_len == 0:
                     buf = packet_data[pos:]
                 else:
-                    buf = zlib.decompress(packet_data[pos:])
+                    buf = bounded_decompress(packet_data[pos:], data_len)
             else:
                 buf = packet_data
                 pos = 0
@@ -3134,6 +3198,7 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
     ip_port = f"{host}:{port}"
     status_data = {}
     did_fresh_status = False
+    protocol = sanitize_protocol(protocol)
     if protocol is None:
         protocol = _cached_protocol(ip_port)
     if protocol is None:
@@ -3155,10 +3220,7 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
             _remember_protocol(ip_port, protocol)
             _persist_protocol(ip_port, protocol)
         did_fresh_status = True
-    try:
-        protocol = int(protocol)
-    except Exception:
-        protocol = DEFAULT_STATUS_PROTOCOL
+    protocol = sanitize_protocol(protocol, DEFAULT_STATUS_PROTOCOL)
     mod_warning = _compute_mod_warning(status_data, version_hint)
 
     def _single_login_attempt(current_protocol):
@@ -3199,7 +3261,12 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                 send_mc_packet(sock, handshake)
                 send_mc_packet(sock, login_start)
 
+                deadline = time.monotonic() + WHITELIST_PROBE_DEADLINE
+                packets = 0
                 while True:
+                    packets += 1
+                    if packets > LOGIN_PACKET_BUDGET or time.monotonic() > deadline:
+                        raise ValueError("Login packet budget exceeded")
                     packet_length = recv_varint(sock)
                     if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
                         raise ValueError("Packet too large")
@@ -3348,12 +3415,9 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
         if action == "retry_version" and not did_fresh_status:
             try:
                 protocol, _, _, status_data = get_server_status_full(host, port, proxy=proxy)
+                protocol = sanitize_protocol(protocol, DEFAULT_STATUS_PROTOCOL)
                 _remember_protocol(ip_port, protocol)
                 _persist_protocol(ip_port, protocol)
-                try:
-                    protocol = int(protocol)
-                except Exception:
-                    protocol = DEFAULT_STATUS_PROTOCOL
                 mod_warning = _compute_mod_warning(status_data, version_hint)
                 did_fresh_status = True
             except Exception:
@@ -3380,11 +3444,7 @@ def _probe_whitelist_entry(entry, account, proxy=None):
         host, port = split_host_port(ip)
     except ValueError as exc:
         return None, str(exc)
-    protocol = entry.get("protocol")
-    try:
-        protocol = int(protocol) if protocol is not None else None
-    except Exception:
-        protocol = None
+    protocol = sanitize_protocol(entry.get("protocol"))
     version_hint = entry.get("version", "") or ""
     result, message = whitelist_login_probe(host, port, account=account, protocol=protocol, proxy=proxy, version_hint=version_hint)
     if whitelist_login_showed_offline(message):
@@ -4966,10 +5026,7 @@ def parse_minescan_hit(line):
         maximum = max(0, int(data.get("players_max", 0) or 0))
     except Exception:
         maximum = 0
-    try:
-        protocol = int(data.get("protocol_version")) if data.get("protocol_version") is not None else None
-    except Exception:
-        protocol = None
+    protocol = sanitize_protocol(data.get("protocol_version"))
     motd = sanitize_motd(data.get("description", "") or "")
     return {"ip": f"{ip}:{port}", "motd": motd, "players": online,
             "max_players": maximum, "version": version, "protocol": protocol,
