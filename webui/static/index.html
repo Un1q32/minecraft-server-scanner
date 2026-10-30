@@ -12,7 +12,7 @@
            placeholder="Search…  e.g. motd:anarchy players&gt;=10 seen&lt;7d -cracked:yes">
     <button id="searchBtn" type="button">Search</button>
     <button id="copyBtn" type="button">Copy IP(s)</button>
-    <button id="syncBtn" type="button">Sync DB</button>
+    <button id="refreshBtn" type="button">Refresh</button>
     <span id="status" class="status">Loading…</span>
   </header>
 
@@ -32,16 +32,6 @@
       <pre id="detail"></pre>
     </aside>
   </main>
-
-  <div id="logOverlay" class="overlay hidden">
-    <div class="logBox">
-      <div class="logHead">
-        <span>mcscan.py output</span>
-        <button id="logClose" type="button">Close</button>
-      </div>
-      <pre id="logText"></pre>
-    </div>
-  </div>
 
   <script src="/core.js"></script>
   <script src="/app.js"></script>

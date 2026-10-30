@@ -42,7 +42,7 @@ times>3 players:0
 const searchInput = document.getElementById("search");
 const searchBtn = document.getElementById("searchBtn");
 const copyBtn = document.getElementById("copyBtn");
-const syncBtn = document.getElementById("syncBtn");
+const refreshBtn = document.getElementById("refreshBtn");
 const statusEl = document.getElementById("status");
 const gridScroll = document.getElementById("gridScroll");
 const grid = document.getElementById("grid");
@@ -50,9 +50,6 @@ const headerRow = document.getElementById("headerRow");
 const bodyEl = document.getElementById("body");
 const rowsEl = document.getElementById("rows");
 const detailEl = document.getElementById("detail");
-const logOverlay = document.getElementById("logOverlay");
-const logText = document.getElementById("logText");
-const logClose = document.getElementById("logClose");
 
 let core = null;
 let mc = null;
@@ -63,9 +60,7 @@ let selected = new Set();
 let anchorRow = -1;
 let searchTimer = null;
 let renderPending = false;
-let syncRunning = false;
-let syncTimer = null;
-let syncAutoLog = false;
+let refreshing = false;
 
 // ------------------------------------------------------------------ helpers
 
@@ -278,7 +273,7 @@ function sortByColumn(key) {
   applySort();
 }
 
-function applySearch() {
+function applySearch(prefix = "") {
   if (!mc) {
     return;
   }
@@ -300,10 +295,10 @@ function applySearch() {
       return;
     }
     const sortMs = Math.round(performance.now() - sortStarted);
-    setStatus(`${plural(rowCount, "row")} sorted by ${sortStackLabel()} in ${sortMs} ms`);
+    setStatus(`${prefix}${plural(rowCount, "row")} sorted by ${sortStackLabel()} in ${sortMs} ms`);
   } else {
     const millis = Math.round(performance.now() - started);
-    setStatus(`${rowCount} of ${totalCount} servers | loaded in ${millis} ms`);
+    setStatus(`${prefix}${rowCount} of ${totalCount} servers | loaded in ${millis} ms`);
   }
   updateHeader();
   setColumns();
@@ -382,78 +377,27 @@ async function loadDatabase() {
   totalCount = mc.total();
 }
 
-async function refreshAfterSync() {
-  await loadDatabase();
-  applySearch();
-}
-
-// --------------------------------------------------------------------- sync
-
-function openLog() {
-  syncAutoLog = true;
-  logOverlay.classList.remove("hidden");
-  logText.scrollTop = logText.scrollHeight;
-}
-
-function closeLog() {
-  syncAutoLog = false;
-  logOverlay.classList.add("hidden");
-}
-
-logClose.addEventListener("click", closeLog);
-
-async function syncDatabase() {
-  if (syncRunning || !core) {
+async function refreshDatabase() {
+  if (refreshing || !core) {
     return;
   }
-  syncRunning = true;
-  syncAutoLog = false;
-  logOverlay.classList.add("hidden");
-  syncBtn.disabled = true;
-  syncBtn.textContent = "Syncing…";
-  setStatus("Running mcscan.py --sync…");
-  logText.textContent = "$ mcscan.py --sync\n(starting...)\n";
-  clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => {
-    if (syncRunning) {
-      openLog();
-    }
-  }, 10000);
-
-  let result = null;
+  refreshing = true;
+  refreshBtn.disabled = true;
+  refreshBtn.textContent = "Refreshing…";
+  setStatus("Reloading servers.db…");
   try {
-    const response = await fetch("/api/sync", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-MC-WebUI": "1" },
-      body: "{}",
-    });
-    result = await response.json();
-    logText.textContent = `$ mcscan.py --sync\n${result.output || "(no output)"}\n`;
-    if (result.ok) {
-      setStatus("Sync complete; reloading…");
-      await refreshAfterSync();
-      if (syncAutoLog) {
-        closeLog();
-      }
-      setStatus("Sync complete.");
-    } else {
-      openLog();
-      setStatus(`Sync failed${result.code === null ? "" : ` (exit ${result.code})`}.`);
-    }
+    await loadDatabase();
+    applySearch("Reloaded: ");
   } catch (error) {
-    logText.textContent = `$ mcscan.py --sync\n${String(error)}\n`;
-    openLog();
-    setStatus(`Sync failed: ${String(error)}`);
+    setStatus(`Refresh failed: ${String(error)}`);
   } finally {
-    clearTimeout(syncTimer);
-    syncRunning = false;
-    syncAutoLog = false;
-    syncBtn.disabled = false;
-    syncBtn.textContent = "Sync DB";
+    refreshing = false;
+    refreshBtn.disabled = false;
+    refreshBtn.textContent = "Refresh";
   }
 }
 
-syncBtn.addEventListener("click", syncDatabase);
+refreshBtn.addEventListener("click", refreshDatabase);
 
 // -------------------------------------------------------------------- boot
 
@@ -465,13 +409,9 @@ document.addEventListener("keydown", (event) => {
     searchInput.select();
     return;
   }
-  if (event.key === "Escape") {
-    if (!logOverlay.classList.contains("hidden")) {
-      closeLog();
-    } else if (searchInput.value.length > 0) {
-      searchInput.value = "";
-      applySearch();
-    }
+  if (event.key === "Escape" && searchInput.value.length > 0) {
+    searchInput.value = "";
+    applySearch();
   }
 });
 

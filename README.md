@@ -417,10 +417,11 @@ in `mc_accounts.json`, exactly like the GUI's Check Whitelist button.
 ## Web DB viewer (`webui`)
 
 A browser UI for the same `servers.db`, for when you want the table without
-launching Qt. It is read-only except for **Sync DB**; there is no Open DB
-picker and no whitelist recheck. The 11 columns, numeric version/IP sorting,
-stacked sort keys, search language, detail pane and Copy IP(s) all match the
-Rust viewer.
+launching Qt. It is read-only: there is no Open DB picker, no whitelist
+recheck, and no scan/sync action. **Refresh** just reloads `servers.db` from
+disk, so it picks up changes written by a scanner running elsewhere. The 11
+columns, numeric version/IP sorting, stacked sort keys, search language,
+detail pane and Copy IP(s) all match the Rust viewer.
 
     python webui/webui.py
     python webui/webui.py --db /path/to/servers.db --port 8080
@@ -435,9 +436,8 @@ The table is virtualized: only the visible rows are drawn, so scrolling
 stays smooth.
 
 `--ports`, scanning and the continuous loop are not part of this UI.
-**Sync DB** runs `mcscan.py --sync` beside the database and reloads the
-current query/sort when it finishes; its output dialog opens only if the
-sync takes more than 10 seconds or exits non-zero.
+**Refresh** re-fetches the current database snapshot and re-applies the
+active query and sort. It never starts a scan or a sync.
 
 The generated WASM is committed. Rebuild it after changing `webui/core.cpp`
 with Emscripten installed:
@@ -450,27 +450,25 @@ works when Emscripten has a frozen cache.
 
 ### Hosting with nginx
 
-Run the app on loopback and let nginx terminate TLS and enforce auth:
+Run the app on loopback and let nginx terminate TLS and proxy requests:
 
     python webui/webui.py --host 127.0.0.1 --port 8080 --no-browser
 
 `webui/nginx.conf.example` is a complete reverse-proxy site (HTTP redirect,
-TLS, optional Basic auth, a 600 s read timeout for sync, and streaming for
-the database snapshot). `webui/mc-webui.service.example` is the matching
-systemd unit. Basic outline:
+TLS, and streaming for the database snapshot). `webui/mc-webui.service.example`
+is the matching systemd unit. Basic outline:
 
     sudo cp webui/nginx.conf.example /etc/nginx/sites-available/mc-webui
     sudo ln -s /etc/nginx/sites-available/mc-webui /etc/nginx/sites-enabled/
-    sudo htpasswd -c /etc/nginx/.htpasswd youruser
     sudo certbot --nginx -d db.example.com
     sudo nginx -t && sudo systemctl reload nginx
 
 Use a dedicated hostname (the page fetches `/core.js`, `/servers.db` and
-`/api/*` from the site root). Do **not** expose port 8080 directly: the page
-has no authentication of its own and **Sync DB** runs `mcscan.py --sync`.
-The example config protects it with Basic auth; an `allow`/`deny` IP filter
-works too. The database snapshot is about 30 MB, so `proxy_buffering off`
-keeps the first load responsive.
+`/api/*` from the site root). The app has no authentication; keep the Python
+server bound to `127.0.0.1` and, if the hostname is reachable beyond a trusted
+LAN, add your own access control in nginx (Basic auth or `allow`/`deny`).
+The database snapshot is about 30 MB, so `proxy_buffering off` keeps the first
+load responsive.
 
 ## Text format
 

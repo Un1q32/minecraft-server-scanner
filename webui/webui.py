@@ -12,9 +12,9 @@ Run:
     python webui/webui.py --db /path/to/servers.db --port 8080
     python webui/webui.py --no-browser
 
-The page is read-only except for the "Sync DB" button, which runs
-``mcscan.py --sync`` in the database directory. No Open DB or whitelist
-recheck controls are exposed.
+The page is read-only: "Refresh" reloads the current servers.db snapshot
+(including changes made by a scanner running elsewhere). Nothing in the web
+UI starts a scan or sync.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import argparse
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import threading
@@ -48,7 +47,6 @@ STATIC_FILES = {
 
 _snapshot_lock = threading.Lock()
 _snapshot = {"key": None, "path": None}
-_sync_lock = threading.Lock()
 
 
 def _db_files(db_path: str) -> list[str]:
@@ -115,44 +113,11 @@ def invalidate_snapshot() -> None:
         _snapshot["path"] = None
 
 
-def run_sync(db_path: str) -> dict:
-    """Run mcscan.py --sync next to the DB. Returns JSON-ready output."""
-    if not _sync_lock.acquire(blocking=False):
-        return {"ok": False, "code": None, "output": "a sync is already running"}
-    try:
-        db_dir = os.path.dirname(os.path.abspath(db_path))
-        script = os.path.join(db_dir, "mcscan.py")
-        if not os.path.isfile(script):
-            script = os.path.join(os.path.dirname(HERE), "mcscan.py")
-        if not os.path.isfile(script):
-            return {"ok": False, "code": None,
-                    "output": f"mcscan.py not found next to {db_path}"}
-        command = [sys.executable, script, "--sync"]
-        try:
-            proc = subprocess.run(
-                command, cwd=db_dir, capture_output=True, text=True,
-                timeout=600,
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = (exc.stdout or "") + (exc.stderr or "")
-            return {"ok": False, "code": None,
-                    "output": output + "\nsync timed out after 600s"}
-        output = (proc.stdout or "") + (proc.stderr or "")
-        if proc.returncode == 0:
-            invalidate_snapshot()
-        return {"ok": proc.returncode == 0, "code": proc.returncode,
-                "output": output or "(no output)"}
-    except Exception as exc:
-        return {"ok": False, "code": None, "output": str(exc)}
-    finally:
-        _sync_lock.release()
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "mc-webui/1.0"
 
     def log_message(self, fmt: str, *args) -> None:
-        # Keep the console quiet; sync output goes to the browser.
+        # Keep the console quiet.
         pass
 
     def _send(self, status: int, body: bytes, content_type: str,
@@ -212,26 +177,6 @@ class Handler(BaseHTTPRequestHandler):
                        "text/plain; charset=utf-8")
             return
         self._send(200, body, content_type)
-
-    def do_POST(self) -> None:
-        path = urlparse(self.path).path
-        if path != "/api/sync":
-            self._send(404, b"not found", "text/plain; charset=utf-8")
-            return
-        # Requiring a custom header means a cross-origin page cannot trigger
-        # a sync without a CORS preflight, which this server never allows.
-        if self.headers.get("X-MC-WebUI") != "1":
-            self._send(403, b"forbidden", "text/plain; charset=utf-8")
-            return
-        # Drain any body so keep-alive connections do not desync.
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length:
-            self.rfile.read(min(length, 1 << 20))
-        self._json(200, run_sync(self.server.db_path))
-
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="local web UI for servers.db")

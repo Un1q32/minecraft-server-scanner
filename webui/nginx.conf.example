@@ -3,7 +3,7 @@
 # Run the app on loopback only:
 #   python webui/webui.py --host 127.0.0.1 --port 8080 --no-browser
 #
-# Replace db.example.com, the certificate paths and the htpasswd path.
+# Replace db.example.com and the certificate paths.
 # Install with:
 #   sudo cp webui/nginx.conf.example /etc/nginx/sites-available/mc-webui
 #   sudo ln -s /etc/nginx/sites-available/mc-webui /etc/nginx/sites-enabled/
@@ -26,15 +26,11 @@ server {
     ssl_certificate     /etc/letsencrypt/live/db.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/db.example.com/privkey.pem;
 
-    # The database is effectively private scanner data, and Sync DB can
-    # start a process. Keep this behind auth unless it is LAN-only.
-    auth_basic           "MC server DB";
-    auth_basic_user_file /etc/nginx/.htpasswd;
-
-    client_max_body_size 1m;
+    # No application auth is implemented. Keep the Python server on
+    # 127.0.0.1; add nginx auth here if the hostname is not LAN-only.
 
     # Simplest setup: let the Python server send both the page and the
-    # snapshot. Nginx provides TLS, auth and timeouts.
+    # snapshot. Nginx provides TLS and timeouts.
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
@@ -42,10 +38,6 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Sync DB can run for up to ten minutes.
-        proxy_read_timeout 600s;
-        proxy_send_timeout 600s;
 
         # Stream the ~30 MB database snapshot instead of buffering it first.
         proxy_buffering off;
@@ -66,9 +58,6 @@ server {
 #     ssl_certificate     /etc/letsencrypt/live/db.example.com/fullchain.pem;
 #     ssl_certificate_key /etc/letsencrypt/live/db.example.com/privkey.pem;
 #
-#     auth_basic           "MC server DB";
-#     auth_basic_user_file /etc/nginx/.htpasswd;
-#
 #     root /home/uniq/devel/minecraft-server-scanner/webui/static;
 #     index index.html;
 #     types { application/wasm wasm; }
@@ -83,9 +72,6 @@ server {
 #     location /api/ {
 #         proxy_pass http://127.0.0.1:8080;
 #         proxy_set_header Host $host;
-#         client_max_body_size 1m;
-#         proxy_read_timeout 600s;
-#         proxy_send_timeout 600s;
 #     }
 #
 #     location / {
