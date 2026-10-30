@@ -97,6 +97,36 @@ function sortStackLabel() {
     .join(", ");
 }
 
+const WIDTH_KEY = "mc-webui.column-widths";
+
+function loadWidths() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(WIDTH_KEY) || "null");
+    if (!Array.isArray(saved) || saved.length !== COLUMNS.length) {
+      return;
+    }
+    for (let i = 0; i < COLUMNS.length; i += 1) {
+      const width = Number(saved[i]);
+      if (Number.isFinite(width)) {
+        COLUMNS[i].width = Math.max(40, Math.min(1200, Math.round(width)));
+      }
+    }
+  } catch (error) {
+    // Ignore unreadable/corrupt saved widths.
+  }
+}
+
+function saveWidths() {
+  try {
+    localStorage.setItem(
+      WIDTH_KEY,
+      JSON.stringify(COLUMNS.map((column) => column.width)),
+    );
+  } catch (error) {
+    // Storage can be disabled; resizing still works for this page.
+  }
+}
+
 function setColumns() {
   const spec = COLUMNS.map((column) => `${column.width}px`).join(" ");
   grid.style.setProperty("--cols", spec);
@@ -130,9 +160,58 @@ function buildHeader() {
     cell.dataset.key = column.key;
     cell.title = column.key;
     cell.addEventListener("click", () => sortByColumn(column.key));
+
+    const label = document.createElement("span");
+    label.className = "hlabel";
+    cell.appendChild(label);
+
+    const handle = document.createElement("span");
+    handle.className = "resizer";
+    handle.dataset.index = String(i);
+    handle.title = "Drag to resize";
+    handle.addEventListener("mousedown", beginResize);
+    handle.addEventListener("click", (event) => event.stopPropagation());
+    cell.appendChild(handle);
+
     headerRow.appendChild(cell);
   }
   updateHeader();
+}
+
+function beginResize(event) {
+  if (event.button !== 0) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  const index = Number(event.currentTarget.dataset.index);
+  if (!Number.isInteger(index) || index < 0 || index >= COLUMNS.length) {
+    return;
+  }
+  const startX = event.clientX;
+  const startWidth = COLUMNS[index].width;
+  document.body.classList.add("resizing");
+
+  function move(moveEvent) {
+    const width = Math.max(
+      40,
+      Math.min(1200, Math.round(startWidth + moveEvent.clientX - startX)),
+    );
+    if (COLUMNS[index].width !== width) {
+      COLUMNS[index].width = width;
+      setColumns();
+    }
+  }
+
+  function finish() {
+    window.removeEventListener("mousemove", move);
+    window.removeEventListener("mouseup", finish);
+    document.body.classList.remove("resizing");
+    saveWidths();
+  }
+
+  window.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", finish);
 }
 
 function updateHeader() {
@@ -143,7 +222,10 @@ function updateHeader() {
     if (key === primary) {
       text += sortStack[sortStack.length - 1].desc ? " ▼" : " ▲";
     }
-    cell.textContent = text;
+    const label = cell.querySelector(".hlabel");
+    if (label) {
+      label.textContent = text;
+    }
     cell.classList.toggle("active", key === primary);
   }
 }
@@ -446,6 +528,7 @@ async function boot() {
     }
 
     await loadDatabase();
+    loadWidths();
     buildHeader();
     setColumns();
     relayout();

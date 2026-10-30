@@ -433,7 +433,8 @@ snapshot into `webui/static/core.wasm`, a small Emscripten/SQLite build, so
 filtering, sorting and formatting run in the browser. A 120k-row database
 opens in roughly 100-170 ms and sorts in roughly 60-110 ms on a desktop.
 The table is virtualized: only the visible rows are drawn, so scrolling
-stays smooth.
+stays smooth. Drag the divider on the right edge of a header to resize a
+column; widths persist in the browser.
 
 `--ports`, scanning and the continuous loop are not part of this UI.
 **Refresh** re-fetches the current database snapshot and re-applies the

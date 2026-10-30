@@ -117,9 +117,10 @@ button:disabled {
 }
 
 .hcell {
+  position: relative;
   display: flex;
   align-items: center;
-  padding: 0 6px;
+  padding: 0 10px 0 6px;
   border-right: 1px solid var(--border);
   color: var(--btn-text);
   font-weight: bold;
@@ -128,6 +129,30 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
+  user-select: none;
+}
+
+.hlabel {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+}
+
+body.resizing {
+  cursor: col-resize;
+}
+
+body.resizing * {
   user-select: none;
 }
 
