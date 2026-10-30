@@ -22,7 +22,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sqlite3
+from pathlib import Path
 import sys
 import tempfile
 import threading
@@ -64,6 +66,50 @@ def _db_key(db_path: str):
     return tuple(key)
 
 
+def _backup_to(source: sqlite3.Connection, dest_path: str) -> None:
+    dest = sqlite3.connect(dest_path)
+    try:
+        source.backup(dest)
+    finally:
+        dest.close()
+
+
+def _copy_database(db_path: str, dest_path: str) -> None:
+    """Read-only backup attempt; never writes to the source database."""
+    uri = Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    source = sqlite3.connect(uri, uri=True, timeout=10)
+    try:
+        source.execute("PRAGMA busy_timeout=10000")
+        _backup_to(source, dest_path)
+    finally:
+        source.close()
+
+
+def _copy_database_via_temp(db_path: str, dest_path: str) -> None:
+    """Fallback for a read-only WAL database.
+
+    SQLite cannot open a WAL-mode file read-only unless its -shm file is
+    already available and writable enough for locking. Copy the database
+    (and its WAL) to a writable temp directory, let SQLite recover it there,
+    then back that up. The source is only ever read.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="mc-webui-src-")
+    try:
+        copy_path = os.path.join(tmpdir, "servers.db")
+        shutil.copyfile(db_path, copy_path)
+        wal = db_path + "-wal"
+        if os.path.isfile(wal):
+            shutil.copyfile(wal, copy_path + "-wal")
+        source = sqlite3.connect(copy_path, timeout=10)
+        try:
+            source.execute("PRAGMA busy_timeout=10000")
+            _backup_to(source, dest_path)
+        finally:
+            source.close()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def make_snapshot(db_path: str) -> str:
     """Copy the live DB (including its WAL) to a consistent temp file."""
     if not os.path.isfile(db_path):
@@ -76,16 +122,29 @@ def make_snapshot(db_path: str) -> str:
         fd, path = tempfile.mkstemp(prefix="mc-webui-", suffix=".db")
         os.close(fd)
         try:
-            source = sqlite3.connect(db_path, timeout=10)
-            try:
-                dest = sqlite3.connect(path)
+            last_error = None
+            for attempt in range(5):
                 try:
-                    source.backup(dest)
-                    dest.execute("PRAGMA journal_mode=DELETE")
-                finally:
-                    dest.close()
-            finally:
-                source.close()
+                    _copy_database(db_path, path)
+                    last_error = None
+                    break
+                except sqlite3.OperationalError as exc:
+                    last_error = exc
+                    text = str(exc).lower()
+                    if "locked" in text or "busy" in text:
+                        time.sleep(0.25 * (attempt + 1))
+                        continue
+                    # A read-only WAL database may need its -shm rebuilt;
+                    # do that on a writable copy instead of the source.
+                    _copy_database_via_temp(db_path, path)
+                    last_error = None
+                    break
+                except sqlite3.DatabaseError:
+                    _copy_database_via_temp(db_path, path)
+                    last_error = None
+                    break
+            if last_error is not None:
+                raise last_error
         except Exception:
             try:
                 os.unlink(path)
@@ -148,8 +207,12 @@ class Handler(BaseHTTPRequestHandler):
                 with open(snapshot, "rb") as f:
                     body = f.read()
             except Exception as exc:
-                self._send(500, f"could not read database: {exc}".encode(),
-                           "text/plain; charset=utf-8")
+                print(f"snapshot failed for {self.server.db_path}: {exc}",
+                      file=sys.stderr, flush=True)
+                message = f"could not read database: {exc}"
+                if "unable to open" in str(exc).lower():
+                    message += " (check that the webui user can read servers.db)"
+                self._send(500, message.encode(), "text/plain; charset=utf-8")
                 return
             self._send(200, body, "application/octet-stream")
             return

@@ -362,7 +362,8 @@ async function loadDatabase() {
   setStatus("Loading database…");
   const response = await fetch(`/servers.db?ts=${Date.now()}`, { cache: "no-store" });
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status} loading servers.db`);
+    const detail = (await response.text().catch(() => "")).trim();
+    throw new Error(`HTTP ${response.status} loading servers.db${detail ? `: ${detail}` : ""}`);
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
   core.FS.writeFile("/servers.db", bytes);

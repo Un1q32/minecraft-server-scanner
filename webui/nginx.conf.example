@@ -9,9 +9,6 @@
 #   sudo ln -s /etc/nginx/sites-available/mc-webui /etc/nginx/sites-enabled/
 #   sudo nginx -t && sudo systemctl reload nginx
 
-# Optional rate limit; remove if you do not want it.
-limit_req_zone $binary_remote_addr zone=mcweb:10m rate=20r/s;
-
 server {
     listen 80;
     server_name db.example.com;
@@ -41,8 +38,6 @@ server {
 
         # Stream the ~30 MB database snapshot instead of buffering it first.
         proxy_buffering off;
-
-        limit_req zone=mcweb burst=40 nodelay;
     }
 }
 
