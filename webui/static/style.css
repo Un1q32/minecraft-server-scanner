@@ -242,8 +242,10 @@ body.resizing * {
   }
 
   .detailPane {
-    flex: 0 0 38vh;
+    flex: 0 0 auto;
     width: 100%;
+    max-height: 26vh;
+    min-height: 0;
     border-top: 1px solid var(--border);
   }
 }
