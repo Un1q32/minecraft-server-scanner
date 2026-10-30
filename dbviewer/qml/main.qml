@@ -834,6 +834,7 @@ ApplicationWindow {
             clip: true
 
             TextArea {
+                id: jobText
                 width: jobScroll.availableWidth
                 text: viewer.job_log
                 readOnly: true
@@ -843,6 +844,12 @@ ApplicationWindow {
                 font.family: window.mono
                 font.pixelSize: 12
                 padding: 8
+
+                // Replacing the bound text resets the cursor to position 0,
+                // which makes the view jump to the top. Keep the cursor at
+                // the end so new mcscan.py output stays visible at the
+                // bottom (whitelist rechecks can append thousands of lines).
+                onTextChanged: cursorPosition = length
             }
         }
     }
