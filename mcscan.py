@@ -10,6 +10,7 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --recheck-whitelist IP:PORT ...
                                     probe whitelist status for those servers
+  mcscan.py --rescan IP:PORT ...    re-ping those servers, update local DB
   mcscan.py --scan 1.0.0.0/8 ...    scan, print hits live, then sync
   mcscan.py --export out.csv        dump the full local DB to CSV
   mcscan.py --continuous            self-tuning forever scan (matscan-style)
@@ -181,6 +182,51 @@ def cmd_recheck_whitelist(ips):
         print("error: whitelist recheck timed out", flush=True)
         return 1
     print(f"whitelist recheck complete: {len(entries)} server(s)", flush=True)
+    return 0
+
+
+def cmd_rescan(ips):
+    """Re-ping selected servers and update the local DB (no masscan/sync).
+
+    Mirrors the GUI's "Rescan Selected": status ping only, so it also
+    refreshes MOTD/version/player counts and player samples.
+    """
+    targets = []
+    seen = set()
+    for raw in ips or []:
+        ip = scanner.strict_ip_port(raw)
+        if not ip:
+            print(f"skip {raw!r}: not a valid ip:port", flush=True)
+            continue
+        if ip in seen:
+            continue
+        seen.add(ip)
+        targets.append(ip)
+    if not targets:
+        print("error: no valid servers to rescan", flush=True)
+        return 2
+
+    print(f"rescanning {len(targets)} server(s)...", flush=True)
+
+    def on_result(result, line):
+        print(line, flush=True)
+
+    def on_progress(done, total):
+        if done >= total:
+            print(f"  progress: {done}/{total}", flush=True)
+
+    try:
+        results, _ = scanner.scan_servers_gui(
+            targets, on_result=on_result, on_progress=on_progress)
+    except scanner.ScanStopped:
+        print("rescan stopped.", flush=True)
+        return 130
+    except Exception as exc:
+        print(f"error: rescan failed: {exc}", flush=True)
+        return 1
+
+    print(f"rescan complete. Responded: {len(results)}/{len(targets)}.",
+          flush=True)
     return 0
 
 
@@ -636,6 +682,10 @@ def main(argv=None):
         help="probe whitelist status for these servers and update the DB "
              "(same probes as the GUI's Check Whitelist)")
     parser.add_argument(
+        "--rescan", nargs="+", metavar="IP:PORT", default=None,
+        help="re-ping these servers and update the local DB (status ping "
+             "only; no masscan and no shared-DB sync)")
+    parser.add_argument(
         "--export", metavar="FILE",
         help="write the full local DB to FILE as CSV")
     parser.add_argument(
@@ -695,7 +745,7 @@ def main(argv=None):
 
     if not args.sync and args.targets is None and not args.export \
             and args.init_db is None and not args.continuous \
-            and args.recheck_whitelist is None:
+            and args.recheck_whitelist is None and args.rescan is None:
         parser.print_help()
         return 2
     install_signal_handlers()
@@ -711,6 +761,8 @@ def main(argv=None):
             rc = cmd_sync() or rc
         if args.recheck_whitelist is not None:
             rc = cmd_recheck_whitelist(args.recheck_whitelist) or rc
+        if args.rescan is not None:
+            rc = cmd_rescan(args.rescan) or rc
         if args.continuous:
             rc = cmd_continuous(args) or rc
         if args.targets is not None:

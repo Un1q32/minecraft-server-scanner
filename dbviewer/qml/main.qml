@@ -342,6 +342,24 @@ ApplicationWindow {
                 }
 
                 Button {
+                    text: viewer.busy ? "Working…" : "Rescan"
+                    enabled: !viewer.busy && viewer.db_path.length > 0
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Re-ping the selected rows and update servers.db"
+                    onClicked: {
+                        var ips = window.selectedIps()
+                        var error = viewer.startRescan(ips.join(","))
+                        if (error.length === 0) {
+                            jobDialog.autoShown = false
+                            jobShowTimer.restart()
+                        } else {
+                            jobDialog.autoShown = false
+                            jobDialog.open()
+                        }
+                    }
+                }
+
+                Button {
                     text: viewer.busy ? "Working…" : "Sync DB"
                     enabled: !viewer.busy && viewer.db_path.length > 0
                     ToolTip.visible: hovered

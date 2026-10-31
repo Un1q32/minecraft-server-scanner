@@ -216,6 +216,7 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
     python mcscan.py --recheck-whitelist 1.2.3.4:25565  # probe whitelist status
+    python mcscan.py --rescan 1.2.3.4:25565  # re-ping, update local DB
 
 Useful flags: `--backend {auto,masscan,minescan,python}` (default `auto`,
 masscan first like the GUI), `--ports 25565,25566`, `--rate`, `--wait`,
@@ -316,9 +317,10 @@ The Python GUI builds a widget per server, which becomes slow once the
 shared DB has tens of thousands of rows. `dbviewer/` is a small Rust + Qt 6
 (QML) application that only views `servers.db`: it opens the database
 read-only, exposes the rows through a `QAbstractTableModel`, and lets Qt's
-`TableView` ask for just the visible cells. Scanning is not implemented
-there, but **Sync DB** runs `mcscan.py --sync` and **Recheck whitelist**
-runs the same probes as the GUI for the selected rows.
+`TableView` ask for just the visible cells. There is no masscan sweep in
+the viewer, but **Rescan** re-pings the selected rows and updates the local
+DB, **Sync DB** runs `mcscan.py --sync`, and **Recheck whitelist** runs the
+same login probes as the GUI for the selected rows.
 
 On a 113k-row database, the release build opens the whole table in about
 80–110 ms; searches take 45–90 ms and sorting is in memory (a few ms to
@@ -396,6 +398,18 @@ directory; the interpreter is `python3` (`python` on Windows), or whatever
 `DBVIEWER_PYTHON` names:
 
     DBVIEWER_PYTHON=py dbviewer          # Windows launcher, if needed
+
+### Rescan
+
+Select one or more rows and click **Rescan**. The viewer runs
+
+    <python> mcscan.py --rescan IP:PORT ...
+
+in the database's directory. This is a status ping only: no masscan sweep
+and no shared-DB sync. It refreshes MOTD, version, player counts/samples and
+`last_seen`, and the table reloads and re-applies the active sort when it
+finishes. The job log follows the same 10-second / non-zero-exit rule as
+**Sync DB**.
 
 ### Recheck whitelist
 

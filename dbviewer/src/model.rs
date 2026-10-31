@@ -107,6 +107,11 @@ pub mod qobject {
         #[cxx_name = "startRecheck"]
         fn start_recheck(self: Pin<&mut ViewerModel>, ips: QString) -> QString;
 
+        /// Re-ping a comma-separated list of ip:port and update the local DB.
+        #[qinvokable]
+        #[cxx_name = "startRescan"]
+        fn start_rescan(self: Pin<&mut ViewerModel>, ips: QString) -> QString;
+
         /// Poll the running job. Returns true while it is still running.
         #[qinvokable]
         #[cxx_name = "pollJob"]
@@ -375,6 +380,28 @@ impl qobject::ViewerModel {
         self.as_mut().start_job(
             args,
             &format!("rechecking whitelist for {count} server(s)..."),
+        )
+    }
+
+    pub fn start_rescan(mut self: Pin<&mut Self>, ips: QString) -> QString {
+        let ips: Vec<String> = ips
+            .to_string()
+            .split(',')
+            .map(str::trim)
+            .filter(|ip| !ip.is_empty())
+            .map(str::to_string)
+            .collect();
+        if ips.is_empty() {
+            let message = "select one or more server rows first";
+            self.as_mut().set_status(qs(message));
+            return qs(message);
+        }
+        let count = ips.len();
+        let mut args = vec!["--rescan".to_string()];
+        args.extend(ips);
+        self.as_mut().start_job(
+            args,
+            &format!("rescanning {count} server(s)..."),
         )
     }
 
