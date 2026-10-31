@@ -494,9 +494,16 @@ ApplicationWindow {
 
                             implicitWidth: 100
                             implicitHeight: window.rowHeight
+                            // Do not use palette.alternateBase here: on macOS it can
+                            // be pure white even in dark mode, leaving white text on a
+                            // white row. Tint the base with the text colour instead, so
+                            // the stripe always has the correct contrast.
                             color: selected
                                    ? pal.highlight
-                                   : (row % 2 === 0 ? pal.base : pal.alternateBase)
+                                   : (row % 2 === 0
+                                      ? "transparent"
+                                      : Qt.rgba(pal.text.r, pal.text.g,
+                                                pal.text.b, 0.055))
 
                             Text {
                                 anchors.fill: parent
