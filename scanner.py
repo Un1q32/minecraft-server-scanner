@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # === Minecraft Scanner by Cev-API ===
 
 try:
