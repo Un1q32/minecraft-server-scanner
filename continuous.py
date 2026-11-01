@@ -848,9 +848,21 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                 print(f"error: {exc}")
                 return 2
             shard_manager = ShardManager(
-                url, token, shard_node, stop_event, log=print)
+                url, token, shard_node, stop_event, log=shard_log)
         else:
             print("auto-shard: no shared-DB URL/token; sharding disabled")
+
+    # Auto-shard heartbeats log from another thread. Route them through the
+    # round's LiveStatus so they erase/redraw its bar instead of printing over
+    # it (which made peer changes disappear).
+    current_status = {"value": None}
+
+    def shard_log(message):
+        status = current_status["value"]
+        if status is not None:
+            status.note(message)
+        else:
+            print(message, flush=True)
 
     picker = StrategyPicker(state_path, strategies)
     bodies = ["normal"] + (["rescan"] if do_rescan else [])
@@ -971,11 +983,13 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     print(f"  {carved_n} target spec(s){note}, "
                           f"{len(ports)} port(s)")
                 status.start(label)
+                current_status["value"] = status
                 try:
                     results, fatal = do_round(ranges, ports, on_hit=on_hit,
                                               log=status.note)
                 finally:
                     status.stop()
+                    current_status["value"] = None
                 if fatal:
                     _sync_now(url, token)
                     return 1
@@ -996,6 +1010,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     for spec, port in targets:
                         by_port.setdefault(port, []).append(spec)
                     status.start(f"round {rounds} rescan")
+                    current_status["value"] = status
                     try:
                         for port, specs in sorted(by_port.items()):
                             if stop_event.is_set():
@@ -1010,6 +1025,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                                 return 1
                     finally:
                         status.stop()
+                        current_status["value"] = None
                 else:
                     print("  nothing due")
 
