@@ -29,6 +29,14 @@ random-order sweep of a slice of the internet, not a full 4-billion-host
 sweep. The shared DB is synced on a cadence (``--sync-every``) so peers
 see new finds promptly.
 
+When shared-DB credentials exist, continuous nodes also auto-shard: each
+heartbeats ``/api/continuous`` every 10 seconds, and the DB server returns
+its 1-based index plus the current node count. Nodes are ordered by
+registration time, so adding one appends a shard without disturbing the
+others. A node expires after 30 seconds without a heartbeat, and a clean
+stop sends an explicit leave. The latest index is applied at the next
+round boundary. ``--shard I/N`` opts out and uses a fixed manual slice.
+
 Discovery only: status pings, no logins. masscan is strongly recommended
 (the /32 strategies scan 63k ports per host); without it the module falls
 back to the Python handshake pool and skips rounds that are too large.
@@ -37,6 +45,9 @@ back to the Python handshake pool and skips rounds that are too large.
 import json
 import os
 import random
+import re
+import secrets
+import socket
 import sys
 import threading
 import time
@@ -57,6 +68,8 @@ PY_MAX_PROBES = 250_000         # refuse bigger rounds on the Python backend
 RANDOM_EXPLORE = 0.10
 STATUS_INTERVAL = 0.3           # live status redraw (seconds)
 STATUS_LOG_INTERVAL = 15.0      # redraw cadence when output is piped
+SHARD_HEARTBEAT = 10.0          # auto-shard heartbeat interval (seconds)
+NODE_ID_FILE = "continuous_node_id"
 
 STRATEGY_NAMES = (
     "slash0", "slash16a", "slash16b",
@@ -663,11 +676,153 @@ def _sync_now(url, token):
     return True
 
 
+def _valid_node_id(node):
+    return bool(node) and len(node) <= 128 and re.fullmatch(
+        r"[A-Za-z0-9._:-]+", node) is not None
+
+
+def _node_id_path(state_path):
+    return os.path.join(os.path.dirname(os.path.abspath(state_path)),
+                        NODE_ID_FILE)
+
+
+def load_node_id(state_path, provided=None):
+    """Stable per-machine id for auto-sharding; persisted with mode 0600."""
+    if provided:
+        node = str(provided).strip()
+        if not _valid_node_id(node):
+            raise ValueError(
+                "node id must be 1-128 characters of A-Z, a-z, 0-9, . _ : -")
+        return node
+
+    path = _node_id_path(state_path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            node = f.read().strip()
+        if _valid_node_id(node):
+            return node
+    except Exception:
+        pass
+
+    host = re.sub(r"[^A-Za-z0-9._-]+", "-", socket.gethostname()).strip("-")
+    node = f"{host[:48] or 'scanner'}-{secrets.token_hex(8)}"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+            if _valid_node_id(existing):
+                return existing
+        except Exception:
+            pass
+        # Corrupt/empty id file: replace it with this generated id.
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(node + "\n")
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return node
+    except Exception as exc:
+        print(f"warning: could not save node id to {path}: {exc}")
+        return node
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(node + "\n")
+    except Exception:
+        pass
+    return node
+
+
+class ShardManager:
+    """Heartbeat the shared DB and keep this node's auto-shard current.
+
+    The DB server assigns 1-based indices for all currently registered
+    continuous nodes. The heartbeat runs in its own thread so a long scan
+    round does not let this node expire. A clean stop sends a leave request,
+    so other nodes can take over this slice immediately instead of waiting
+    for the TTL.
+    """
+
+    def __init__(self, url, token, node_id, stop_event, *,
+                 interval=SHARD_HEARTBEAT, log=None):
+        self.url = url
+        self.token = token
+        self.node_id = node_id
+        self.interval = max(2.0, float(interval))
+        self.stop_event = stop_event
+        self.log = log or print
+        self._shard = None
+        self._last_label = None
+        self._last_error = None
+        self._lock = threading.Lock()
+        self._local_stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self.refresh()
+        self._thread = threading.Thread(
+            target=self._run, name="mcscan-shard-heartbeat", daemon=True)
+        self._thread.start()
+
+    def refresh(self, leave=False):
+        try:
+            data = scanner.netdb_continuous_heartbeat(
+                self.url, self.token, self.node_id,
+                timeout=2 if leave else 5, leave=leave)
+        except Exception as exc:
+            text = str(exc)
+            if not leave and text != self._last_error:
+                self.log(f"auto-shard heartbeat failed: {text}")
+            self._last_error = text
+            return
+        if leave:
+            return
+        try:
+            index = int(data.get("index") or 0)
+            total = int(data.get("total") or 0)
+        except Exception:
+            index = total = 0
+        if not (1 <= index <= total):
+            text = "invalid shard response from DB server"
+            if text != self._last_error:
+                self.log(f"auto-shard heartbeat failed: {text}")
+            self._last_error = text
+            return
+        self._last_error = None
+        with self._lock:
+            self._shard = (index, total)
+        label = f"{index}/{total}"
+        if label != self._last_label:
+            self._last_label = label
+            peers = max(0, total - 1)
+            self.log(f"auto-shard: {label} ({peers} peer(s))")
+
+    def _run(self):
+        while not self._local_stop.wait(self.interval):
+            if self.stop_event.is_set():
+                break
+            self.refresh()
+
+    def shard(self):
+        with self._lock:
+            return self._shard
+
+    def stop(self):
+        # Stop the heartbeat thread first so it cannot re-register this node
+        # after the leave request.
+        self._local_stop.set()
+        if self._thread:
+            self._thread.join(timeout=self.interval + 2.0)
+        self.refresh(leave=True)
+
+
 def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                    sync_every=DEFAULT_SYNC_EVERY, state_path="strategies.json",
                    backend="auto", strategies=None, do_rescan=True,
                    stop_event=None, max_rounds=None, shard=None, seed=None,
-                   base_ports=None):
+                   base_ports=None, auto_shard=False, node_id=None):
     """The forever loop. Returns a process exit code."""
     base_ports = _base_ports(base_ports)
     if backend == "minescan":
@@ -683,11 +838,25 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     except Exception:
         pass
 
+    shard_state = {"value": shard}
+    shard_manager = None
+    if auto_shard and shard is None:
+        if url and token:
+            try:
+                shard_node = load_node_id(state_path, node_id)
+            except Exception as exc:
+                print(f"error: {exc}")
+                return 2
+            shard_manager = ShardManager(
+                url, token, shard_node, stop_event, log=print)
+        else:
+            print("auto-shard: no shared-DB URL/token; sharding disabled")
+
     picker = StrategyPicker(state_path, strategies)
     bodies = ["normal"] + (["rescan"] if do_rescan else [])
     shard_note = (f" shard={shard[0]}/{shard[1]}"
                   f" seed={seed if seed is not None else scanner.DEFAULT_SHARD_SEED}"
-                  if shard else "")
+                  if shard else (" shard=auto" if shard_manager else ""))
     ports_note = ("" if base_ports == [25565]
                   else f" ports={','.join(str(p) for p in base_ports)}")
     print(f"continuous mode: strategies={','.join(picker.enabled)} "
@@ -696,6 +865,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
           f"{ports_note}{shard_note}")
     print(f"shared-DB sync every {sync_every}s "
           f"({'enabled' if url and token else 'skipped: no netdb.json'})")
+    if shard_manager:
+        shard_manager.start()
+        shard_state["value"] = shard_manager.shard()
 
     rounds = 0
     last_sync = 0.0
@@ -712,6 +884,13 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
         masscan failure retries the round with the Python backend.
         """
         _log = log or print
+        if shard_manager:
+            current_shard = shard_manager.shard()
+            if current_shard != shard_state["value"]:
+                shard_state["value"] = current_shard
+                if current_shard:
+                    _log(f"  auto-shard now "
+                         f"{current_shard[0]}/{current_shard[1]}")
         for attempt in range(2):
             current = state["backend"]
             try:
@@ -719,7 +898,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     ranges, ports, rate=rate, wait=wait,
                     scan_duration=duration or scan_duration,
                     stop_event=stop_event, backend=current,
-                    on_hit=on_hit, log=_log, shard=shard,
+                    on_hit=on_hit, log=_log, shard=shard_state["value"],
                     seed=seed), False)
             except (PermissionError, FileNotFoundError) as exc:
                 if current == "masscan":
@@ -741,6 +920,13 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
 
     try:
         while not stop_event.is_set():
+            if shard_manager:
+                current_shard = shard_manager.shard()
+                if current_shard != shard_state["value"]:
+                    shard_state["value"] = current_shard
+                    if current_shard:
+                        print(f"  auto-shard now "
+                              f"{current_shard[0]}/{current_shard[1]}")
             body = bodies[rounds % len(bodies)]
             rounds += 1
             print(f"\n=== round {rounds} ({body}) {time.strftime('%H:%M:%S')} ===")
@@ -868,6 +1054,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
         print("skipping the final sync (run --sync when convenient); "
               "findings are already in the local DB.")
         return 130
+    finally:
+        if shard_manager:
+            shard_manager.stop()
     if stop_event.is_set():
         # Ctrl+C / SIGTERM: a sync can take many seconds per request, so
         # don't make the user wait for it. Unsent rows stay dirty.

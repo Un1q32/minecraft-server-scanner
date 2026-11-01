@@ -13,7 +13,8 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --rescan IP:PORT ...    re-ping those servers, update local DB
   mcscan.py --scan 1.0.0.0/8 ...    scan, print hits live, then sync
   mcscan.py --export out.csv        dump the full local DB to CSV
-  mcscan.py --continuous            self-tuning forever scan (matscan-style)
+  mcscan.py --continuous            self-tuning forever scan (matscan-style;
+                                    auto-shards against the shared DB)
 
 Discovery only (status ping + player sample) unless --recheck-whitelist
 is used, which runs the same login probes as the GUI's Check Whitelist
@@ -88,7 +89,6 @@ def cmd_init_db(url, token):
         return 1
     print(f"saved shared-DB URL and token to {scanner.NETDB_CONFIG_FILE}")
     return 0
-
 
 def cmd_sync():
     """Sync the shared DB using netdb.json. Returns exit code."""
@@ -659,6 +659,9 @@ def cmd_continuous(args):
         shard=shard,
         seed=getattr(args, "scan_seed", None),
         base_ports=_parse_ports(getattr(args, "ports", "25565")),
+        auto_shard=(not getattr(args, "no_auto_shard", False)
+                    and shard is None),
+        node_id=getattr(args, "node_id", None),
     )
 
 
@@ -712,13 +715,21 @@ def main(argv=None):
         help="--continuous: skip the rescan half of the loop")
     parser.add_argument(
         "--shard", metavar="I/N", default=None,
-        help="--continuous: this machine's slice of the scan space, e.g. "
-             "1/3 on the first of three machines; use a different I on "
-             "each machine (they share the default seed so slices are "
-             "disjoint)")
+        help="--continuous: manual slice of the scan space (e.g. 1/3); "
+             "overrides automatic sharding. By default continuous nodes "
+             "register with the shared DB and are assigned shards "
+             "automatically")
+    parser.add_argument(
+        "--no-auto-shard", action="store_true",
+        help="--continuous: do not register with the shared DB for "
+             "automatic sharding (use --shard for a fixed slice)")
+    parser.add_argument(
+        "--node-id", metavar="ID", default=None,
+        help="--continuous: stable id for automatic sharding; default is "
+             "stored in continuous_node_id next to --state-file")
     parser.add_argument(
         "--scan-seed", type=int, default=None, metavar="N",
-        help="--continuous --shard: masscan shuffle seed; all machines "
+        help="--continuous sharding: masscan shuffle seed; all machines "
              "must use the same value (default: a fixed constant)")
     parser.add_argument(
         "--rounds", type=int, default=None, metavar="N",

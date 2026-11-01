@@ -948,7 +948,6 @@ def netdb_save_config(url, token, last_sync=0.0, last_seq=0):
     except Exception:
         pass
 
-
 def _netdb_auth_headers(method, path, body, token):
     """HMAC auth headers; token never sent, only the signature."""
     ts = str(int(time.time()))
@@ -993,6 +992,25 @@ def _netdb_request(url, token, method="GET", payload=None, timeout=None):
             detail = ""
         raise ConnectionError(f"HTTP {exc.code}{(': ' + detail) if detail else ''}")
 
+
+def netdb_continuous_heartbeat(url, token, node_id, timeout=None, leave=False):
+    """Tell the shared DB this node is in continuous mode; get its shard.
+
+    Uses the normal shared-DB token: anyone with write access is trusted.
+    Returns the server's JSON (``index`` and ``total``); indices are 1-based
+    and suitable directly for masscan's ``--shard I/N``. ``leave=True``
+    removes the node immediately on a clean shutdown instead of waiting for
+    expiry.
+    """
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        raise ConnectionError("enter the shared-DB URL and token first")
+    payload = {"node": str(node_id or "").strip()}
+    if leave:
+        payload["leave"] = True
+    return _netdb_request(url + "/api/continuous", token, method="POST",
+                          payload=payload, timeout=timeout)
 
 def netdb_collect_dirty():
     """Rows needing upload (needs_sync=1). Returns (rows, watermark).

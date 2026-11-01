@@ -45,3 +45,6 @@ desktop.ini
 
 # Web UI build inputs (downloaded SQLite amalgamation)
 /webui/.sqlite/
+
+# auto-shard node identity (per machine)
+continuous_node_id

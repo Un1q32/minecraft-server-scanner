@@ -166,7 +166,8 @@ Multiple scanner clients can pool their finds through one central server:
    mode 0600). Forward TCP 8777 to that machine.
 2. In every client's Servers tab, paste the server URL
    (e.g. `http://your-host:8777`) and the token into the Shared DB row,
-   then press **Sync DB**. That is the whole setup.
+   then press **Sync DB**. That is the whole setup. The same token is used
+   for automatic shard registration.
 
 Each sync uploads the servers this client has seen since its last sync and
 downloads everything other clients added, merging first-seen (oldest wins)
@@ -182,6 +183,11 @@ for curl debugging), nonces are single-use, timestamps must be within
 ±5 minutes, and 5 bad logins from one IP earns a 1-minute throttle (HTTP 429).
 Traffic is plain HTTP so setup stays trivial; pass `--tls-cert/--tls-key`
 (or run behind Caddy/nginx/Tailscale) if your list is sensitive.
+
+Continuous-mode clients also use the shared DB for automatic sharding:
+each node heartbeats `POST /api/continuous`, and the server returns its
+current 1-based index and the active node count. No other machine needs to
+be reconfigured when a scanner joins or leaves.
 
 ## Requirements
 
@@ -288,12 +294,34 @@ Python backend skips rounds whose probe count exceeds its cap.
 Continuous mode is deterministic where it matters (ranges come from the
 DB, and the best-scoring strategy wins), so independent machines would
 otherwise overlap — especially at bootstrap, where every fresh DB picks
-`slash0` and sweeps the same address space. Give each machine a distinct
-slice instead:
+`slash0` and sweeps the same address space.
 
-    mcscan.py --continuous --shard 1/3     # machine 1
-    mcscan.py --continuous --shard 2/3     # machine 2
-    mcscan.py --continuous --shard 3/3     # machine 3
+With shared-DB credentials configured, sharding is automatic. Just run the
+same command on every machine:
+
+    mcscan.py --continuous
+
+Each node registers with the DB server on startup and heartbeats every 10
+seconds. The server keeps the active-node list, expires a node after 30
+seconds without a heartbeat, and returns a 1-based shard index plus the
+current node count. Nodes apply the latest index at the start of each round,
+so:
+
+- adding a machine needs no changes to the other machines;
+- stopping one machine lets the others renumber and take over its slice;
+- a clean Ctrl-C sends a leave request immediately, so the remaining nodes
+  rebalance on their next heartbeat instead of waiting for the 30 s timeout.
+
+A machine that dies mid-round can leave its slice uncovered until that round
+ends, but the next round uses the updated shard map. The node id is stored
+in `continuous_node_id` next to `--state-file` (`--node-id ID` overrides it);
+keep that file per-machine rather than copying it around.
+
+Manual shards still work and override automatic mode:
+
+    mcscan.py --continuous --shard 1/3
+    mcscan.py --continuous --shard 2/3
+    mcscan.py --continuous --no-auto-shard
 
 masscan divides the space itself (`--shard I/N`), and all machines must
 shuffle from the same seed or their shards will drift into each other, so
@@ -302,8 +330,8 @@ value everywhere). The Python backend, which has no native sharding, takes
 every Nth expanded target instead. Strategy ties are also broken randomly
 per machine, so hosts with similar histories diversify over time.
 
-Do not mix shard counts mid-run: a machine at `1/3` and one at `1/2` are
-not disjoint.
+Do not mix manual and automatic machines in the same pool: manual nodes are
+not registered, so they can overlap the automatic slices.
 
 `exclude.conf` applies to every round, to both halves: strategy ranges and
 rescan targets (including padded /20s) are carved before any backend runs,

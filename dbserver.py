@@ -47,6 +47,14 @@ Protocol
 --------
 * ``GET  /api/health``               -> ``{"ok": true, "servers": N, "now": T}``
 * ``GET  /api/servers?since=<ts>``   -> ``{"servers": [...], "now": T, "total": N}``
+* ``POST /api/continuous`` ``{"node": "<id>"}``
+  registers a continuous scanner for automatic sharding and returns its
+  1-based shard index and the current node count::
+
+      {"ok": true, "index": I, "total": N, "ttl": 30}
+
+  Send ``"leave": true`` for an immediate clean-shutdown unregister.
+
 * ``POST /api/sync`` ``{"servers": [...], "since": <ts>}``
   merges the upload, then returns rows with ``last_seen > since``::
 
@@ -128,8 +136,12 @@ SCHEMA = (
 PLAYERS_EVER_MAX = 500  # per-server cap on the ever-seen name list
 PLAYER_NAME_MAX_LEN = 32
 MAX_VARINT_VALUE = 0x7FFFFFFF
+CONTINUOUS_TTL = 30.0        # seconds without a heartbeat before a node expires
+CONTINUOUS_HEARTBEAT = 10.0  # suggested client heartbeat interval
 
 _db_lock = threading.Lock()
+_continuous_lock = threading.Lock()
+_continuous_nodes = {}  # node id -> monotonic last heartbeat
 _nonce_lock = threading.Lock()
 _seen_nonces = {}  # nonce -> expiry timestamp
 _fail_lock = threading.Lock()
@@ -138,6 +150,31 @@ _auth_failures = {}  # ip -> {"count": int, "window_start": float, "banned_until
 
 def _utcnow():
     return time.time()
+
+
+def register_continuous(node_id, leave=False):
+    """Register/heartbeat a continuous scanner; return its 1-based shard.
+
+    Nodes are ordered by registration time: adding a node appends a slot and
+    does not disturb existing indices. Removing one compacts the slots after
+    it, so the remaining shards still cover 1..N. Expired nodes are pruned
+    first. Returns {"index", "total"} (or {"left": ...} on leave).
+    """
+    now = time.monotonic()
+    with _continuous_lock:
+        expired = [node for node, last in _continuous_nodes.items()
+                   if now - last > CONTINUOUS_TTL]
+        for node in expired:
+            _continuous_nodes.pop(node, None)
+        if leave:
+            left = _continuous_nodes.pop(node_id, None) is not None
+            total = len(_continuous_nodes)
+            return {"left": left, "index": 0, "total": total}
+        _continuous_nodes[node_id] = now
+        nodes = list(_continuous_nodes)
+        total = len(nodes)
+        index = nodes.index(node_id) + 1
+    return {"index": index, "total": total}
 
 
 # --------------------------------------------------------------------------- #
@@ -722,7 +759,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/api/sync":
+        if parsed.path not in ("/api/sync", "/api/continuous"):
             self._send_json(404, {"error": "not found"})
             return
         body = self._read_body()
@@ -738,6 +775,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(payload, dict):
             self._send_json(400, {"error": "invalid JSON"})
+            return
+        if parsed.path == "/api/continuous":
+            node = str(payload.get("node", "") or "").strip()
+            if (not node or len(node) > 128
+                    or not re.fullmatch(r"[A-Za-z0-9._:-]+", node)):
+                self._send_json(400, {"error": "bad node id"})
+                return
+            leave = bool(payload.get("leave", False))
+            shard = register_continuous(node, leave=leave)
+            self._send_json(200, {
+                "ok": True,
+                "node": node,
+                "left": shard.get("left", False),
+                "index": shard["index"],
+                "total": shard["total"],
+                "ttl": CONTINUOUS_TTL,
+                "heartbeat": CONTINUOUS_HEARTBEAT,
+                "now": _utcnow(),
+            })
             return
         incoming = payload.get("servers", [])
         if not isinstance(incoming, list) or len(incoming) > MAX_SERVERS_PER_REQUEST:
