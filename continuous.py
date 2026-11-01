@@ -746,16 +746,16 @@ class ShardManager:
     """
 
     def __init__(self, url, token, node_id, stop_event, *,
-                 interval=SHARD_HEARTBEAT, log=None):
+                 interval=SHARD_HEARTBEAT):
         self.url = url
         self.token = token
         self.node_id = node_id
         self.interval = max(2.0, float(interval))
         self.stop_event = stop_event
-        self.log = log or print
         self._shard = None
         self._last_label = None
         self._last_error = None
+        self._messages = []
         self._lock = threading.Lock()
         self._local_stop = threading.Event()
         self._thread = None
@@ -774,8 +774,9 @@ class ShardManager:
         except Exception as exc:
             text = str(exc)
             if not leave and text != self._last_error:
-                self.log(f"auto-shard heartbeat failed: {text}")
-            self._last_error = text
+                with self._lock:
+                    self._messages.append(f"auto-shard heartbeat failed: {text}")
+                self._last_error = text
             return
         if leave:
             return
@@ -787,17 +788,19 @@ class ShardManager:
         if not (1 <= index <= total):
             text = "invalid shard response from DB server"
             if text != self._last_error:
-                self.log(f"auto-shard heartbeat failed: {text}")
+                with self._lock:
+                    self._messages.append(f"auto-shard heartbeat failed: {text}")
             self._last_error = text
             return
         self._last_error = None
+        label = f"{index}/{total}"
         with self._lock:
             self._shard = (index, total)
-        label = f"{index}/{total}"
-        if label != self._last_label:
-            self._last_label = label
-            peers = max(0, total - 1)
-            self.log(f"auto-shard: {label} ({peers} peer(s))")
+            if label != self._last_label:
+                self._last_label = label
+                peers = max(0, total - 1)
+                self._messages.append(
+                    f"auto-shard: {label} ({peers} peer(s))")
 
     def _run(self):
         while not self._local_stop.wait(self.interval):
@@ -808,6 +811,13 @@ class ShardManager:
     def shard(self):
         with self._lock:
             return self._shard
+
+    def drain_messages(self):
+        """Messages collected by the heartbeat thread for end-of-round output."""
+        with self._lock:
+            messages = self._messages
+            self._messages = []
+            return messages
 
     def stop(self):
         # Stop the heartbeat thread first so it cannot re-register this node
@@ -848,21 +858,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                 print(f"error: {exc}")
                 return 2
             shard_manager = ShardManager(
-                url, token, shard_node, stop_event, log=shard_log)
+                url, token, shard_node, stop_event)
         else:
             print("auto-shard: no shared-DB URL/token; sharding disabled")
-
-    # Auto-shard heartbeats log from another thread. Route them through the
-    # round's LiveStatus so they erase/redraw its bar instead of printing over
-    # it (which made peer changes disappear).
-    current_status = {"value": None}
-
-    def shard_log(message):
-        status = current_status["value"]
-        if status is not None:
-            status.note(message)
-        else:
-            print(message, flush=True)
 
     picker = StrategyPicker(state_path, strategies)
     bodies = ["normal"] + (["rescan"] if do_rescan else [])
@@ -897,12 +895,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
         """
         _log = log or print
         if shard_manager:
-            current_shard = shard_manager.shard()
-            if current_shard != shard_state["value"]:
-                shard_state["value"] = current_shard
-                if current_shard:
-                    _log(f"  auto-shard now "
-                         f"{current_shard[0]}/{current_shard[1]}")
+            shard_state["value"] = shard_manager.shard()
         for attempt in range(2):
             current = state["backend"]
             try:
@@ -933,12 +926,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     try:
         while not stop_event.is_set():
             if shard_manager:
-                current_shard = shard_manager.shard()
-                if current_shard != shard_state["value"]:
-                    shard_state["value"] = current_shard
-                    if current_shard:
-                        print(f"  auto-shard now "
-                              f"{current_shard[0]}/{current_shard[1]}")
+                shard_state["value"] = shard_manager.shard()
             body = bodies[rounds % len(bodies)]
             rounds += 1
             print(f"\n=== round {rounds} ({body}) {time.strftime('%H:%M:%S')} ===")
@@ -983,13 +971,11 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     print(f"  {carved_n} target spec(s){note}, "
                           f"{len(ports)} port(s)")
                 status.start(label)
-                current_status["value"] = status
                 try:
                     results, fatal = do_round(ranges, ports, on_hit=on_hit,
                                               log=status.note)
                 finally:
                     status.stop()
-                    current_status["value"] = None
                 if fatal:
                     _sync_now(url, token)
                     return 1
@@ -1010,7 +996,6 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     for spec, port in targets:
                         by_port.setdefault(port, []).append(spec)
                     status.start(f"round {rounds} rescan")
-                    current_status["value"] = status
                     try:
                         for port, specs in sorted(by_port.items()):
                             if stop_event.is_set():
@@ -1025,7 +1010,6 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                                 return 1
                     finally:
                         status.stop()
-                        current_status["value"] = None
                 else:
                     print("  nothing due")
 
@@ -1042,6 +1026,10 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                               * 3600.0 / (elapsed + 30.0))
                 print(f"  score for {name}: {score}")
                 picker.update(name, score)
+
+            if shard_manager:
+                for message in shard_manager.drain_messages():
+                    print(f"  {message}", flush=True)
 
             now = _now()
             if (sync_every and not stop_event.is_set()
