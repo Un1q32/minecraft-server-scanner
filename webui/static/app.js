@@ -40,7 +40,6 @@ times>3 players:0
   terms combine with AND`;
 
 const searchInput = document.getElementById("search");
-const searchBtn = document.getElementById("searchBtn");
 const copyBtn = document.getElementById("copyBtn");
 const refreshBtn = document.getElementById("refreshBtn");
 const statusEl = document.getElementById("status");
@@ -417,11 +416,6 @@ searchInput.addEventListener("keydown", (event) => {
     clearTimeout(searchTimer);
     applySearch();
   }
-});
-
-searchBtn.addEventListener("click", () => {
-  clearTimeout(searchTimer);
-  applySearch();
 });
 
 // --------------------------------------------------------------- clipboard

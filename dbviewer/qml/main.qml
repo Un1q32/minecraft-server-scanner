@@ -415,18 +415,6 @@ ApplicationWindow {
                 }
 
                 SquareButton {
-                    text: "Search"
-                    enabled: searchField.text.length > 0
-                    onClicked: window.applySearch()
-                }
-
-                SquareButton {
-                    text: "Clear"
-                    enabled: searchField.text.length > 0
-                    onClicked: { searchField.text = ""; window.applySearch() }
-                }
-
-                SquareButton {
                     text: "Copy IP(s)"
                     enabled: viewer.db_path.length > 0
                     ToolTip.visible: hovered
