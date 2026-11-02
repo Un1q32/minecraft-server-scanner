@@ -71,6 +71,19 @@ fn has_column(con: &Connection, name: &str) -> bool {
     found
 }
 
+fn cracked_expr(con: &Connection) -> String {
+    if has_column(con, "cracked") {
+        "CASE WHEN cracked IS NULL OR cracked = '' THEN '' \
+         WHEN typeof(cracked) = 'integer' THEN \
+             (CASE WHEN cracked != 0 THEN 'Yes' ELSE 'No' END) \
+         WHEN lower(CAST(cracked AS TEXT)) LIKE 'yes%' THEN 'Yes' \
+         ELSE 'No' END"
+            .to_string()
+    } else {
+        "''".to_string()
+    }
+}
+
 fn col_or(con: &Connection, name: &str, fallback: &str) -> String {
     if has_column(con, name) {
         format!("COALESCE({name}, {fallback})")
@@ -226,7 +239,7 @@ pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
         col_or(&con, "players_online", "0"),
         col_or(&con, "max_players", "0"),
         col_or(&con, "version", "''"),
-        col_or(&con, "cracked", "''"),
+        cracked_expr(&con),
         col_or(&con, "whitelist", "''"),
         col_or(&con, "players_now", "'[]'"),
         col_or(&con, "players_ever", "'[]'"),

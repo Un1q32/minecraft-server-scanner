@@ -105,6 +105,14 @@ fn parse_duration(value: &str) -> Option<i64> {
     num.parse::<i64>().ok().map(|n| n * mult)
 }
 
+fn cracked_value(value: &str) -> Option<i64> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "true" | "1" => Some(1),
+        "no" | "false" | "0" => Some(0),
+        _ => None,
+    }
+}
+
 fn like_param(value: &str) -> String {
     // Escape LIKE wildcards so a search for "100%" is literal.
     let mut s = String::with_capacity(value.len() + 2);
@@ -264,23 +272,35 @@ pub fn compile(input: &str) -> Result<(String, Vec<Value>), String> {
             Some(f) => {
                 if let Some(col) = text_column(f) {
                     let negated = matches!(op, "!=" | "!~");
-                    let status = if col == "whitelist"
-                        && matches!(op, "=" | ":" | "!=" | "!~")
+                    let want = if col == "cracked"
+                        && matches!(op, "=" | ":" | "~" | "!=" | "!~")
                     {
-                        whitelist_prefix(&value)
+                        cracked_value(&value)
                     } else {
                         None
                     };
-                    let pat = if let Some(prefix) = status {
-                        prefix.to_string()
-                    } else if op == "^" || (col == "ip_port" && op == ":") {
-                        prefix_param(&value)
+                    if let Some(want) = want {
+                        params.push(Value::Integer(want));
+                        format!("(cracked {} ?)", if negated { "!=" } else { "=" })
                     } else {
-                        like_param(&value)
-                    };
-                    params.push(Value::Text(pat));
-                    format!("({col} {} ? ESCAPE '\\')",
-                            if negated { "NOT LIKE" } else { "LIKE" })
+                        let status = if col == "whitelist"
+                            && matches!(op, "=" | ":" | "!=" | "!~")
+                        {
+                            whitelist_prefix(&value)
+                        } else {
+                            None
+                        };
+                        let pat = if let Some(prefix) = status {
+                            prefix.to_string()
+                        } else if op == "^" || (col == "ip_port" && op == ":") {
+                            prefix_param(&value)
+                        } else {
+                            like_param(&value)
+                        };
+                        params.push(Value::Text(pat));
+                        format!("({col} {} ? ESCAPE '\\')",
+                                if negated { "NOT LIKE" } else { "LIKE" })
+                    }
                 } else if let Some(col) = numeric_column(f) {
                     match cmp_sql(op, col, &value, &mut params) {
                         Some(c) => c,
@@ -424,12 +444,18 @@ mod tests {
     }
 
     #[test]
-    fn text_equality_is_still_a_contains_match() {
+    fn cracked_equality_uses_the_boolean_column() {
         let (sql, params) = compile("cracked=yes").unwrap();
-        assert!(sql.contains("cracked LIKE"));
+        assert!(sql.contains("cracked = ?"));
         match &params[0] {
-            Value::Text(t) => assert_eq!(t, "%yes%"),
-            _ => panic!(),
+            Value::Integer(v) => assert_eq!(*v, 1),
+            _ => panic!("expected integer param"),
+        }
+        let (sql, params) = compile("cracked=no").unwrap();
+        assert!(sql.contains("cracked = ?"));
+        match &params[0] {
+            Value::Integer(v) => assert_eq!(*v, 0),
+            _ => panic!("expected integer param"),
         }
     }
 }

@@ -21,7 +21,7 @@ try {
     New-Item -ItemType Directory -Path $appFolder -Force | Out-Null
     $executable = Join-Path $appFolder 'dbviewer.exe'
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\dbviewer.exe') -Destination $executable -Force
-    foreach ($backendFile in 'mcscan.py','scanner.py','qt_helpers.py') {
+    foreach ($backendFile in 'mcscan.py','scanner.py','qt_helpers.py','db_format.py') {
         Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) $backendFile) -Destination $appFolder -Force
     }
     Set-Content -LiteralPath (Join-Path $appFolder 'python-path.txt') -Value (Join-Path $toolsRoot 'python\Scripts\python.exe') -Encoding utf8NoBOM

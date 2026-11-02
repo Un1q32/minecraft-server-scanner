@@ -169,6 +169,14 @@ std::string lower_text(const std::string &s) {
     return out;
 }
 
+int cracked_value(const std::string &value) {
+    std::string v = lower_text(trim(value));
+    if (v == "yes" || v == "true" || v == "1") return 1;
+    if (v == "no" || v == "false" || v == "0") return 0;
+    return -1;
+}
+
+
 // ------------------------------------------------------------- JSON name list
 
 bool parse_json_string(const std::string &s, size_t &i, std::string &out) {
@@ -795,21 +803,31 @@ bool compile_search(const std::string &input, std::string &where_sql,
             clause = bare_clause(value, params);
         } else if (const char *col = text_column(field)) {
             bool negated = op == "!=" || op == "!~";
-            const char *status = nullptr;
-            if (std::string(col) == "whitelist" &&
-                (op == "=" || op == ":" || op == "!=" || op == "!~")) {
-                status = whitelist_prefix(value);
+            int cracked = -1;
+            if (std::string(col) == "cracked" &&
+                (op == "=" || op == ":" || op == "~" || op == "!=" || op == "!~")) {
+                cracked = cracked_value(value);
             }
-            std::string pattern;
-            if (status) {
-                pattern = status;
-            } else if (op == "^" || (std::string(col) == "ip_port" && op == ":")) {
-                pattern = prefix_param(value);
+            if (cracked >= 0) {
+                push_int(params, cracked);
+                clause = std::string("(cracked ") + (negated ? "!= ?)" : "= ?)");
             } else {
-                pattern = like_param(value);
+                const char *status = nullptr;
+                if (std::string(col) == "whitelist" &&
+                    (op == "=" || op == ":" || op == "!=" || op == "!~")) {
+                    status = whitelist_prefix(value);
+                }
+                std::string pattern;
+                if (status) {
+                    pattern = status;
+                } else if (op == "^" || (std::string(col) == "ip_port" && op == ":")) {
+                    pattern = prefix_param(value);
+                } else {
+                    pattern = like_param(value);
+                }
+                push_text(params, pattern);
+                clause = std::string("(") + col + (negated ? " NOT LIKE ? ESCAPE '\\'" : " LIKE ? ESCAPE '\\'") + ")";
             }
-            push_text(params, pattern);
-            clause = std::string("(") + col + (negated ? " NOT LIKE ? ESCAPE '\\'" : " LIKE ? ESCAPE '\\'") + ")";
         } else if (const char *col = numeric_column(field)) {
             bool ok = false;
             clause = cmp_sql(op, col, value, params, ok);
@@ -868,6 +886,17 @@ bool has_column(const char *name) {
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+std::string cracked_expr() {
+    if (has_column("cracked")) {
+        return "CASE WHEN cracked IS NULL OR cracked = '' THEN '' "
+               "WHEN typeof(cracked) = 'integer' THEN "
+               "(CASE WHEN cracked != 0 THEN 'Yes' ELSE 'No' END) "
+               "WHEN lower(CAST(cracked AS TEXT)) LIKE 'yes%' THEN 'Yes' "
+               "ELSE 'No' END";
+    }
+    return "''";
 }
 
 std::string col_or(const char *name, const char *fallback) {
@@ -980,7 +1009,7 @@ int mc_apply(const char *query) {
     std::string select =
         "SELECT ip_port, " + col_or("motd", "''") + ", " +
         col_or("players_online", "0") + ", " + col_or("max_players", "0") + ", " +
-        col_or("version", "''") + ", " + col_or("cracked", "''") + ", " +
+        col_or("version", "''") + ", " + cracked_expr() + ", " +
         col_or("whitelist", "''") + ", " + col_or("players_now", "'[]'") + ", " +
         col_or("players_ever", "'[]'") + ", " + col_or("first_seen", "0") + ", " +
         col_or("last_seen", "0") + ", " + col_or("times_seen", "0") + ", " +

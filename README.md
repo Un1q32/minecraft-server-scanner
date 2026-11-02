@@ -513,6 +513,29 @@ LAN, add your own access control in nginx (Basic auth or `allow`/`deny`).
 The database snapshot is about 30 MB, so `proxy_buffering off` keeps the first
 load responsive.
 
+## Database format
+
+`servers.db` and the shared DB use format 2, marked with
+`PRAGMA user_version=2`.
+
+Changes from format 1:
+
+- `cracked` is an integer bool (`0` = No, `1` = Yes) instead of a display
+  string. Legacy `Yes (cached)` and `Yes (heuristic)` become `1`.
+- `host` is `NULL`; it is redundant with `ip_port` and is derived when
+  needed.
+- Empty `players_now` and `players_ever` lists are `NULL` instead of `"[]"`.
+
+Existing local and server databases are converted once on startup, then
+`VACUUM`ed. On the current data this reduced the DB from about 46 MB to
+36 MB.
+
+Sync clients send `"format": 2` in `/api/sync`; a missing field means a
+format-1 client. The server converts rows at the sync boundary, so old
+clients can still sync against a format-2 server and new clients can sync
+against an old server. The conversion is per row and does not require a
+full-table pass.
+
 ## Text format
 
 The standard exported server line is:

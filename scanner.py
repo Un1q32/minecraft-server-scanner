@@ -119,6 +119,8 @@ import base64
 import io      
 import hmac
 import secrets
+
+import db_format
 try:
     from PIL import Image
     _PIL_AVAILABLE = True
@@ -531,10 +533,10 @@ def _decode_player_list(value):
 
 def _encode_player_list(names):
     try:
-        return json.dumps(sorted({n for n in (names or []) if n}, key=str.lower),
-                          ensure_ascii=False)
+        names = sorted({n for n in (names or []) if n}, key=str.lower)
+        return json.dumps(names, ensure_ascii=False) if names else None
     except Exception:
-        return "[]"
+        return None
 
 
 def _merge_player_lists(old, new):
@@ -580,15 +582,15 @@ def init_server_db():
                 " max_players INTEGER DEFAULT 0,"
                 " version TEXT DEFAULT '',"
                 " protocol INTEGER,"
-                " cracked TEXT DEFAULT '',"
+                " cracked INTEGER DEFAULT 0,"
                 " whitelist TEXT DEFAULT '',"
                 " first_seen REAL DEFAULT 0,"
                 " last_seen REAL DEFAULT 0,"
                 " times_seen INTEGER DEFAULT 1,"
                 " last_source TEXT DEFAULT '',"
                 " needs_sync INTEGER DEFAULT 1,"
-                " players_now TEXT DEFAULT '[]',"
-                " players_ever TEXT DEFAULT '[]'"
+                " players_now TEXT,"
+                " players_ever TEXT"
                 ")"
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen ON servers(last_seen DESC)")
@@ -597,6 +599,7 @@ def init_server_db():
             _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
             _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
             con.commit()
+            db_format.ensure_format(con)
             # One-time cleanup: bogons (loopback/LAN test servers) are no
             # longer persisted, so drop any rows from before this rule
             # (the sync-import filter keeps them from coming back).
@@ -657,7 +660,7 @@ def record_server_result(result, source="scan"):
     except Exception:
         source = "scan"
     protocol = sanitize_protocol(result.get("protocol"))
-    cracked = "Yes" if result.get("cracked") else "No"
+    cracked = 1 if result.get("cracked") else 0
     # Player-name lists: the live sample is the current roster; the union of
     # every sample ever seen stays after logout. Minescan hits carry no
     # sample (webscan doesn't report one), so they must not blank the list
@@ -677,7 +680,7 @@ def record_server_result(result, source="scan"):
                     " first_seen, last_seen, times_seen, last_source,"
                     " players_now, players_ever)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?)",
-                    (ip_port, host, port, motd, online, maximum, version,
+                    (ip_port, None, port, motd, online, maximum, version,
                      protocol, cracked, now, now, source,
                      _encode_player_list(sample_names if has_sample else []),
                      _encode_player_list(sample_names)),
@@ -688,13 +691,11 @@ def record_server_result(result, source="scan"):
                     times_seen = int(times_seen or 0) + 1
                 except Exception:
                     times_seen = 1
-                # Preserve a confirmed cracked/whitelist verdict; only the
-                # status-ping heuristic ("Yes"/"No") refreshes otherwise.
+                # Preserve a confirmed cracked verdict; a plain sighting
+                # never downgrades it.
                 keep_cracked = old_cracked or cracked
-                if old_cracked in ("Yes", "Yes (cached)"):
-                    keep_cracked = old_cracked
                 now_json = (_encode_player_list(sample_names) if has_sample
-                            else (old_now if old_now else "[]"))
+                            else old_now)
                 ever_json = _encode_player_list(
                     _merge_player_lists(old_ever, sample_names))
                 con.execute(
@@ -702,7 +703,7 @@ def record_server_result(result, source="scan"):
                     " max_players=?, version=?, protocol=COALESCE(?, protocol),"
                     " cracked=?, needs_sync=1, last_seen=?, times_seen=?,"
                     " last_source=?, players_now=?, players_ever=? WHERE ip_port=?",
-                    (host, port, motd, online, maximum, version, protocol,
+                    (None, port, motd, online, maximum, version, protocol,
                      keep_cracked, now, times_seen, source, now_json, ever_json, ip_port),
                 )
             con.commit()
@@ -726,7 +727,7 @@ def update_server_cracked(ip_port, cracked_label, message=""):
     except Exception:
         return
     now = time.time()
-    label = sanitize_motd(cracked_label or "")[:32] or "Yes"
+    cracked = db_format.cracked_bool(cracked_label or "Yes")
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
@@ -739,11 +740,11 @@ def update_server_cracked(ip_port, cracked_label, message=""):
                 con.execute(
                     "INSERT INTO servers (ip_port, host, port, cracked, first_seen,"
                     " last_seen, times_seen, last_source) VALUES (?, ?, ?, ?, ?, ?, 1, 'cracked')",
-                    (ip_port, host, port, label, now, now),
+                    (ip_port, None, port, cracked, now, now),
                 )
             else:
                 con.execute("UPDATE servers SET cracked=?, needs_sync=1, last_seen=? WHERE ip_port=?",
-                            (label, now, ip_port))
+                            (cracked, now, ip_port))
             con.commit()
         finally:
             con.close()
@@ -776,7 +777,7 @@ def update_server_whitelist(ip_port, whitelist_label):
                 con.execute(
                     "INSERT INTO servers (ip_port, host, port, whitelist, first_seen,"
                     " last_seen, times_seen, last_source) VALUES (?, ?, ?, ?, ?, ?, 1, 'whitelist')",
-                    (ip_port, host, port, label, now, now),
+                    (ip_port, None, port, label, now, now),
                 )
             else:
                 con.execute("UPDATE servers SET whitelist=?, needs_sync=1, last_seen=? WHERE ip_port=?",
@@ -861,6 +862,20 @@ def format_db_timestamp(ts):
         return "-"
 
 
+def cracked_display(value):
+    """Format-2 bool or legacy label -> Yes/No for the table display."""
+    if isinstance(value, (bool, int)):
+        return "Yes" if value else "No"
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("yes"):
+        return "Yes"
+    if text.lower() == "no":
+        return "No"
+    return text
+
+
 def _timestamp_display_key(value):
     """Sort displayed timestamps by actual time, not lexically."""
     text = str(value or "").strip()
@@ -890,21 +905,22 @@ def _ensure_server_db():
                     " max_players INTEGER DEFAULT 0,"
                     " version TEXT DEFAULT '',"
                     " protocol INTEGER,"
-                    " cracked TEXT DEFAULT '',"
+                    " cracked INTEGER DEFAULT 0,"
                     " whitelist TEXT DEFAULT '',"
                     " first_seen REAL DEFAULT 0,"
                     " last_seen REAL DEFAULT 0,"
                     " times_seen INTEGER DEFAULT 1,"
                     " last_source TEXT DEFAULT '',"
                     " needs_sync INTEGER DEFAULT 1,"
-                    " players_now TEXT DEFAULT '[]',"
-                    " players_ever TEXT DEFAULT '[]'"
+                    " players_now TEXT,"
+                    " players_ever TEXT"
                     ")"
                 )
                 _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
                 _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
                 _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
                 con.commit()
+                db_format.ensure_format(con)
             finally:
                 con.close()
     except Exception:
@@ -1148,12 +1164,12 @@ def netdb_merge_remote(servers, upload_watermark=None):
                         " first_seen, last_seen, times_seen, last_source, needs_sync,"
                         " players_now, players_ever)"
                         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                        (ip_port, host, port,
+                        (ip_port, None, port,
                          sanitize_motd(raw.get("motd", "")),
                          int(raw.get("players_online", 0) or 0),
                          int(raw.get("max_players", 0) or 0),
                          sanitize_motd(raw.get("version", "") or ""),
-                         raw.get("protocol"), str(raw.get("cracked", "") or ""),
+                         raw.get("protocol"), db_format.cracked_bool(raw.get("cracked")),
                          str(raw.get("whitelist", "") or ""),
                          r_first or r_last, r_last or r_first, max(1, r_times),
                          str(raw.get("last_source", "") or "netdb"),
@@ -1197,12 +1213,13 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     motd, online, maximum = o_motd, o_on, o_max
                     version, protocol = o_ver, o_proto
                     src = o_src
-                if o_cracked in ("Yes", "Yes (cached)"):
-                    cracked = o_cracked
-                elif remote_newer and raw.get("cracked"):
-                    cracked = str(raw.get("cracked"))
+                remote_cracked = db_format.cracked_bool(raw.get("cracked"))
+                if o_cracked:
+                    cracked = 1
+                elif remote_newer and remote_cracked:
+                    cracked = 1
                 else:
-                    cracked = o_cracked or str(raw.get("cracked", "") or "")
+                    cracked = 1 if (o_cracked or remote_cracked) else 0
                 if remote_newer and raw.get("whitelist"):
                     whitelist = str(raw.get("whitelist"))
                 else:
@@ -1231,7 +1248,7 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     " cracked=?, whitelist=?, first_seen=?, last_seen=?,"
                     " times_seen=?, last_source=?, needs_sync=?,"
                     " players_now=?, players_ever=? WHERE ip_port=?",
-                    (host, port, motd, online, maximum, version, protocol,
+                    (None, port, motd, online, maximum, version, protocol,
                      cracked, whitelist, first_seen, last_seen, times_seen,
                      src, still_dirty, _encode_player_list(now_names),
                      _encode_player_list(ever_names), ip_port))
@@ -1271,6 +1288,16 @@ def netdb_get_credentials():
         return "", ""
 
 
+def _netdb_server_format(url, token, timeout=None):
+    """Advertised server DB format; legacy servers (and failures) are 1."""
+    try:
+        health = _netdb_request(url.rstrip("/") + "/api/health", token,
+                                method="GET", timeout=timeout)
+        return 2 if int(health.get("format", 1) or 1) >= 2 else 1
+    except Exception:
+        return 1
+
+
 def netdb_sync_once(url, token, timeout=None):
     """Bidirectional sync, no row caps. Returns summary dict. Raises ConnectionError.
 
@@ -1285,9 +1312,16 @@ def netdb_sync_once(url, token, timeout=None):
     cfg = netdb_load_config()
     since = cfg.get("last_sync", 0) or 0
     last_seq = cfg.get("last_seq", 0) or 0
+    server_format = _netdb_server_format(url, token, timeout=timeout)
 
     def post(servers, cursor, cursor_seq=None):
-        payload = {"servers": servers, "since": cursor}
+        if servers and server_format >= 2:
+            wire_rows = servers
+        else:
+            wire_rows = [db_format.row_for_format(r, server_format)
+                         for r in servers]
+        payload = {"servers": wire_rows, "since": cursor,
+                   "format": db_format.CURRENT_FORMAT}
         if cursor_seq is not None:
             payload["since_seq"] = cursor_seq
         return _netdb_request(url + "/api/sync", token, method="POST",
@@ -1341,6 +1375,8 @@ def netdb_sync_once(url, token, timeout=None):
         batch = resp.get("servers", []) if isinstance(resp, dict) else []
         if not batch:
             break
+        batch = [db_format.row_for_format(r, db_format.CURRENT_FORMAT)
+                 for r in batch if isinstance(r, dict)]
         fresh = 0
         top_ts = cursor
         top_seq = cursor_seq
@@ -9222,7 +9258,7 @@ class ServersTab(QWidget, QtBaseMixin):
                 display_text(e.get("motd", ""), MAX_MOTD_CHARS),
                 players,
                 display_text(e.get("version", ""), MAX_VERSION_CHARS),
-                display_text(e.get("cracked", ""), 32),
+                cracked_display(e.get("cracked", "")),
                 display_text(e.get("whitelist", ""), 200),
                 online_names,
                 seen_names,

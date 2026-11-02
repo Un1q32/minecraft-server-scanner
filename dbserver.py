@@ -45,7 +45,7 @@ Security model (deliberately simple for non-technical users):
 
 Protocol
 --------
-* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "now": T}``
+* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "format": 2, "now": T}``
 * ``GET  /api/servers?since=<ts>``   -> ``{"servers": [...], "now": T, "total": N}``
 * ``POST /api/continuous`` ``{"node": "<id>"}``
   registers a continuous scanner for automatic sharding and returns its
@@ -55,8 +55,10 @@ Protocol
 
   Send ``"leave": true`` for an immediate clean-shutdown unregister.
 
-* ``POST /api/sync`` ``{"servers": [...], "since": <ts>}``
-  merges the upload, then returns rows with ``last_seen > since``::
+* ``POST /api/sync`` ``{"servers": [...], "since": <ts>, "format": 2}``
+  merges the upload, then returns rows with ``last_seen > since``. A
+  missing ``format`` means a format-1 client; rows are converted to that
+  client's schema and the reply reports ``"format": 2``::
 
       {"servers": [...deltas...], "now": T, "merged": M, "total": N}
 
@@ -102,6 +104,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import db_format
+
 IP_PORT_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$")
 MAX_BODY_BYTES = 25 * 1024 * 1024
 MAX_SERVERS_PER_REQUEST = 20000
@@ -121,14 +125,14 @@ SCHEMA = (
     " max_players INTEGER DEFAULT 0,"
     " version TEXT DEFAULT '',"
     " protocol INTEGER,"
-    " cracked TEXT DEFAULT '',"
+    " cracked INTEGER DEFAULT 0,"
     " whitelist TEXT DEFAULT '',"
     " first_seen REAL DEFAULT 0,"
     " last_seen REAL DEFAULT 0,"
     " times_seen INTEGER DEFAULT 1,"
     " last_source TEXT DEFAULT '',"
-    " players_now TEXT DEFAULT '[]',"
-    " players_ever TEXT DEFAULT '[]',"
+    " players_now TEXT,"
+    " players_ever TEXT,"
     " seq INTEGER DEFAULT 0"
     ")"
 )
@@ -289,6 +293,7 @@ def init_db(db_path):
             pass
         con.execute("CREATE INDEX IF NOT EXISTS idx_servers_seq ON servers(seq ASC)")
         con.commit()
+        db_format.ensure_format(con)
     finally:
         con.close()
 
@@ -342,12 +347,14 @@ def _clean_player_list(value):
         else:
             parsed = value
         if not isinstance(parsed, list):
-            return "[]"
+            return None
         names = sorted({_clean_player_name(n) for n in parsed} -
                        {""}, key=str.lower)
+        if not names:
+            return None
         return json.dumps(names[:PLAYERS_EVER_MAX], ensure_ascii=False)
     except Exception:
-        return "[]"
+        return None
 
 
 def _merge_player_lists(old, new):
@@ -371,7 +378,7 @@ def _merge_player_lists(old, new):
             merged.append(name)
         return _clean_player_list(merged)
     except Exception:
-        return "[]"
+        return None
 
 
 def sanitize_row(raw):
@@ -389,7 +396,6 @@ def sanitize_row(raw):
             return None
     except Exception:
         return None
-    host = _clamp_str(raw.get("host") or ip_port.rsplit(":", 1)[0], 253)
     try:
         port = int(raw.get("port", port))
         if not 0 < port < 65536:
@@ -433,14 +439,14 @@ def sanitize_row(raw):
         times_seen = 1
     return {
         "ip_port": ip_port,
-        "host": host,
+        "host": None,
         "port": port,
         "motd": _clamp_str(raw.get("motd", ""), 500),
         "players_online": min(online, 1000000),
         "max_players": min(maximum, 1000000),
         "version": _clamp_str(raw.get("version", ""), 100),
         "protocol": protocol,
-        "cracked": _clamp_str(raw.get("cracked", ""), 32),
+        "cracked": db_format.cracked_bool(raw.get("cracked")),
         "whitelist": _clamp_str(raw.get("whitelist", ""), 200),
         "first_seen": first_seen,
         "last_seen": last_seen,
@@ -468,7 +474,7 @@ def merge_row(con, row):
             " seq)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
             " (SELECT COALESCE(MAX(seq), 0) + 1 FROM servers))",
-            (row["ip_port"], row["host"], row["port"], row["motd"],
+            (row["ip_port"], None, row["port"], row["motd"],
              row["players_online"], row["max_players"], row["version"],
              row["protocol"], row["cracked"], row["whitelist"],
              row["first_seen"] or row["last_seen"] or _utcnow(),
@@ -508,12 +514,12 @@ def merge_row(con, row):
         if protocol is None:
             protocol = row["protocol"]
     # Never downgrade a confirmed cracked verdict via an older/plain sighting.
-    if o_cracked in ("Yes", "Yes (cached)"):
-        cracked = o_cracked
+    if o_cracked:
+        cracked = 1
     elif incoming_newer and row["cracked"]:
-        cracked = row["cracked"]
+        cracked = 1
     else:
-        cracked = o_cracked or row["cracked"]
+        cracked = 1 if (o_cracked or row["cracked"]) else 0
     if incoming_newer and row["whitelist"]:
         whitelist = row["whitelist"]
     else:
@@ -524,7 +530,7 @@ def merge_row(con, row):
     # Player lists: current roster follows the newer sighting; ever-seen is
     # the union of both sides (capped). Fold each side's current roster into
     # its ever list first, so no observed name is ever lost.
-    now = row["players_now"] if incoming_newer else (o_now or "[]")
+    now = row["players_now"] if incoming_newer else (o_now or None)
     ever = _merge_player_lists(
         _merge_player_lists(o_ever, o_now), _merge_player_lists(row["players_ever"], row["players_now"]))
     if (motd, online, maximum, version, protocol, cracked, whitelist,
@@ -539,7 +545,7 @@ def merge_row(con, row):
         " players_now=?, players_ever=?,"
         " seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM servers)"
         " WHERE ip_port=?",
-        (row["host"], row["port"], motd, online, maximum, version, protocol,
+        (None, row["port"], motd, online, maximum, version, protocol,
          cracked, whitelist, first_seen, last_seen, times_seen, src,
          now, ever, row["ip_port"]))
     return True
@@ -723,9 +729,12 @@ class Handler(BaseHTTPRequestHandler):
                     con = db_connect(self.server.db_path)
                     try:
                         n = con.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
+                        db_format_value = db_format.detect_format(con)
                     finally:
                         con.close()
-                self._send_json(200, {"ok": True, "servers": n, "now": _utcnow()})
+                self._send_json(200, {"ok": True, "servers": n,
+                                      "format": db_format_value,
+                                      "now": _utcnow()})
                 return
             qs = parse_qs(parsed.query or "")
             raw_seq = (qs.get("since_seq") or [None])[0]
@@ -795,6 +804,14 @@ class Handler(BaseHTTPRequestHandler):
                 "now": _utcnow(),
             })
             return
+        # A missing format means a legacy client (format 1); new clients
+        # send 2. Rows are converted at this boundary either way.
+        try:
+            client_format = int(payload.get("format", 1) or 1)
+        except Exception:
+            client_format = 1
+        if client_format not in (1, 2):
+            client_format = 1
         incoming = payload.get("servers", [])
         if not isinstance(incoming, list) or len(incoming) > MAX_SERVERS_PER_REQUEST:
             self._send_json(400, {"error": "bad 'servers' list"})
@@ -827,12 +844,15 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT * FROM servers WHERE last_seen > ?"
                         " ORDER BY last_seen ASC LIMIT ?",
                         (since, MAX_SERVERS_PER_RESPONSE))
-                deltas = [dict(r) for r in cur.fetchall()]
+                deltas = [db_format.row_for_format(dict(r), client_format)
+                          for r in cur.fetchall()]
                 total = con.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
             finally:
                 con.close()
         self._send_json(200, {"servers": deltas, "now": _utcnow(),
                               "merged": merged, "total": total,
+                              "format": db_format.CURRENT_FORMAT,
+                              "client_format": client_format,
                               "has_seq": True})
 
 
