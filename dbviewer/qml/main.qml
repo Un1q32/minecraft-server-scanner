@@ -1,5 +1,5 @@
 import QtQuick
-import QtQuick.Controls
+import QtQuick.Controls.Basic
 import QtQuick.Dialogs
 import QtQuick.Layouts
 import QtQml.Models
@@ -10,18 +10,31 @@ ApplicationWindow {
 
     width: 1440
     height: 860
-    minimumWidth: 900
+    minimumWidth: 1050
     minimumHeight: 480
     visible: true
     title: "MC Server DB Viewer"
     color: pal.window
+    font.family: Qt.platform.os === "windows" ? "Segoe UI" : "sans-serif"
+    font.pixelSize: 13
+    palette.window: pal.window
+    palette.windowText: pal.text
+    palette.base: pal.base
+    palette.alternateBase: pal.alternateBase
+    palette.text: pal.text
+    palette.button: pal.button
+    palette.buttonText: pal.text
+    palette.highlight: pal.highlight
+    palette.highlightedText: pal.highlightedText
+    palette.mid: pal.mid
+    property int selectedCount: 0
 
     // Row used as the anchor for Shift-click range selection.
     property int anchorRow: -1
 
-    readonly property string mono: "monospace"
+    readonly property string mono: Qt.platform.os === "windows" ? "Consolas" : "monospace"
     readonly property int monoSize: 12
-    readonly property int rowHeight: Math.max(18, Math.round(monoSize * 1.55))
+    readonly property int rowHeight: 24
     property real columnsWidth: 0
 
     // Same widths as the Python Servers tab.
@@ -29,12 +42,40 @@ ApplicationWindow {
         170, 260, 110, 120, 90, 180, 200, 200, 130, 130, 90
     ]
 
-    // Follow the desktop's Qt palette (light or dark), including live theme
-    // switches. Using the Inactive group when the window loses focus matches
-    // native widgets.
-    SystemPalette {
+    QtObject {
         id: pal
-        colorGroup: window.active ? SystemPalette.Active : SystemPalette.Inactive
+        readonly property color window: "#202020"
+        readonly property color windowText: "#e0e0e0"
+        readonly property color base: "#252525"
+        readonly property color alternateBase: "#2b2b2b"
+        readonly property color text: "#e0e0e0"
+        readonly property color button: "#333333"
+        readonly property color buttonText: "#e0e0e0"
+        readonly property color mid: "#505050"
+        readonly property color highlight: "#3b536b"
+        readonly property color highlightedText: "#ffffff"
+    }
+
+    component SquareButton: Button {
+        id: control
+        implicitHeight: 28
+        leftPadding: 9
+        rightPadding: 9
+        hoverEnabled: true
+        font.pixelSize: 12
+        contentItem: Text {
+            text: control.text
+            font: control.font
+            color: control.enabled ? pal.text : "#777777"
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            radius: 0
+            color: control.down ? "#444444" : control.hovered ? "#3b3b3b" : pal.button
+            border.width: 1
+            border.color: control.activeFocus ? "#b0b0b0" : "#606060"
+        }
     }
 
     ViewerModel {
@@ -85,6 +126,7 @@ ApplicationWindow {
 
     function clearSelection() {
         window.anchorRow = -1
+        window.selectedCount = 0
         if (table.selectionModel)
             table.selectionModel.clear()
         detailView.text = helpText
@@ -121,6 +163,7 @@ ApplicationWindow {
 
         table.selectionModel.setCurrentIndex(index, ItemSelectionModel.NoUpdate)
         detailView.text = viewer.detail(row)
+        window.selectedCount = window.selectedIps().length
     }
 
     function applySearch() {
@@ -165,6 +208,22 @@ ApplicationWindow {
             ips.push(viewer.ipAt(row))
         }
         return ips
+    }
+
+    function runAction(action) {
+        jobDialog.validationMessage = ""
+        jobDialog.actionTitle = action === "sync" ? "Database sync"
+                              : action === "rescan" ? "Server rescan" : "Whitelist check"
+        var error = action === "sync" ? viewer.startSync()
+                  : action === "rescan" ? viewer.startRescan(window.selectedIps().join(","))
+                  : viewer.startRecheck(window.selectedIps().join(","))
+        jobDialog.autoShown = false
+        if (error.length === 0) {
+            jobShowTimer.restart()
+        } else {
+            jobDialog.validationMessage = error
+            jobDialog.open()
+        }
     }
 
     readonly property string helpText:
@@ -257,12 +316,39 @@ ApplicationWindow {
         }
     }
     Shortcut {
+        sequence: "F5"
+        enabled: viewer.db_path.length > 0
+        onActivated: window.applySearch()
+    }
+    Shortcut {
         sequence: "Escape"
         onActivated: {
             if (searchField.text.length > 0) {
                 searchField.text = ""
                 window.applySearch()
             }
+        }
+    }
+
+    Timer {
+        interval: 1800
+        running: Qt.application.arguments.indexOf("--export-preview") >= 0
+        onTriggered: {
+            var index = Qt.application.arguments.indexOf("--export-preview")
+            if (Qt.application.arguments.indexOf("--preview-select-first") >= 0) {
+                window.selectRow(0, false, false)
+                console.log("PREVIEW_SELECTION", window.selectedCount, window.selectedIps().length)
+            }
+            var validationPreview = Qt.application.arguments.indexOf("--preview-error") >= 0
+            if (validationPreview) {
+                window.runAction("whitelist")
+                console.log("PREVIEW_VALIDATION", jobDialog.validationMessage)
+            }
+            var surface = validationPreview ? jobDialog.contentItem : captureSurface
+            surface.grabToImage(function(result) {
+                result.saveToFile(Qt.application.arguments[index + 1])
+                Qt.quit()
+            })
         }
     }
 
@@ -280,13 +366,14 @@ ApplicationWindow {
     }
 
     ColumnLayout {
+        id: captureSurface
         anchors.fill: parent
         spacing: 0
 
         // ---------------------------------------------------------------- toolbar
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 52
+            Layout.preferredHeight: 42
             color: pal.window
 
             Rectangle {
@@ -298,19 +385,35 @@ ApplicationWindow {
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 10
-                anchors.rightMargin: 10
-                spacing: 8
+                anchors.leftMargin: 6
+                anchors.rightMargin: 6
+                spacing: 6
 
-                Button {
+                SquareButton {
                     text: "Open DB…"
                     onClicked: fileDialog.open()
                 }
 
+                SquareButton {
+                    text: "Refresh"
+                    enabled: viewer.db_path.length > 0
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Reload the local database (F5)"
+                    onClicked: window.applySearch()
+                }
+
                 TextField {
                     id: searchField
+                    implicitHeight: 28
+                    leftPadding: 6; rightPadding: 6
+                    color: pal.text
+                    placeholderTextColor: "#aaaaaa"
+                    background: Rectangle {
+                        radius: 0; color: pal.base; border.width: 1
+                        border.color: searchField.activeFocus ? "#8b8b8b" : pal.mid
+                    }
                     Layout.fillWidth: true
-                    placeholderText: "Search…  e.g. motd:anarchy players>=10 seen<7d -cracked:yes"
+                    placeholderText: "Search…  motd:anarchy players>=10 seen<7d"
                     selectByMouse: true
                     onTextChanged: searchTimer.restart()
                     onAccepted: window.applySearch()
@@ -319,13 +422,19 @@ ApplicationWindow {
                     ToolTip.text: "Bare words match ip, motd, version, whitelist and player names."
                 }
 
-                Button {
+                SquareButton {
                     text: "Search"
                     enabled: searchField.text.length > 0
                     onClicked: window.applySearch()
                 }
 
-                Button {
+                SquareButton {
+                    text: "Clear"
+                    enabled: searchField.text.length > 0
+                    onClicked: { searchField.text = ""; window.applySearch() }
+                }
+
+                SquareButton {
                     text: "Copy IP(s)"
                     enabled: viewer.db_path.length > 0
                     ToolTip.visible: hovered
@@ -341,57 +450,22 @@ ApplicationWindow {
                     }
                 }
 
-                Button {
+                SquareButton {
                     text: viewer.busy ? "Working…" : "Rescan"
                     enabled: !viewer.busy && viewer.db_path.length > 0
-                    ToolTip.visible: hovered
-                    ToolTip.text: "Re-ping the selected rows and update servers.db"
-                    onClicked: {
-                        var ips = window.selectedIps()
-                        var error = viewer.startRescan(ips.join(","))
-                        if (error.length === 0) {
-                            jobDialog.autoShown = false
-                            jobShowTimer.restart()
-                        } else {
-                            jobDialog.autoShown = false
-                            jobDialog.open()
-                        }
-                    }
+                    onClicked: window.runAction("rescan")
                 }
 
-                Button {
+                SquareButton {
                     text: viewer.busy ? "Working…" : "Sync DB"
                     enabled: !viewer.busy && viewer.db_path.length > 0
-                    ToolTip.visible: hovered
-                    ToolTip.text: "Run mcscan.py --sync in the database folder"
-                    onClicked: {
-                        var error = viewer.startSync()
-                        if (error.length === 0) {
-                            jobDialog.autoShown = false
-                            jobShowTimer.restart()
-                        } else {
-                            jobDialog.autoShown = false
-                            jobDialog.open()
-                        }
-                    }
+                    onClicked: window.runAction("sync")
                 }
 
-                Button {
+                SquareButton {
                     text: viewer.busy ? "Working…" : "Recheck whitelist"
                     enabled: !viewer.busy && viewer.db_path.length > 0
-                    ToolTip.visible: hovered
-                    ToolTip.text: "Probe whitelist status for the selected rows"
-                    onClicked: {
-                        var ips = window.selectedIps()
-                        var error = viewer.startRecheck(ips.join(","))
-                        if (error.length === 0) {
-                            jobDialog.autoShown = false
-                            jobShowTimer.restart()
-                        } else {
-                            jobDialog.autoShown = false
-                            jobDialog.open()
-                        }
-                    }
+                    onClicked: window.runAction("whitelist")
                 }
             }
         }
@@ -452,7 +526,7 @@ ApplicationWindow {
                                 anchors.left: parent.left
                                 anchors.leftMargin: 6
                                 anchors.right: parent.right
-                                anchors.rightMargin: 10
+                                anchors.rightMargin: 6
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: display
                                     + (viewer.sort_column === key
@@ -495,7 +569,7 @@ ApplicationWindow {
                         clip: true
 
                         model: viewer
-                        selectionModel: ItemSelectionModel {}
+                        selectionModel: ItemSelectionModel { model: viewer }
                         selectionBehavior: TableView.SelectRows
                         selectionMode: TableView.ExtendedSelection
                         pointerNavigationEnabled: false
@@ -580,7 +654,7 @@ ApplicationWindow {
                                 height: Math.max(24,
                                     tableVBar.height * table.height
                                     / Math.max(1, table.contentHeight))
-                                radius: 4
+                                radius: 0
                                 x: (tableVBar.width - width) / 2
                                 y: {
                                     var travel = table.contentHeight - table.height
@@ -659,7 +733,7 @@ ApplicationWindow {
                                 width: Math.max(30,
                                     (tableHBar.width - 4) * table.width
                                     / Math.max(1, table.contentWidth))
-                                radius: 4
+                                radius: 0
                                 y: (tableHBar.height - height) / 2
                                 x: {
                                     var travel = table.contentWidth - table.width
@@ -730,7 +804,7 @@ ApplicationWindow {
             }
 
             Rectangle {
-                SplitView.preferredWidth: 430
+                SplitView.preferredWidth: 360
                 SplitView.minimumWidth: 240
                 color: pal.window
 
@@ -759,11 +833,13 @@ ApplicationWindow {
                             font.letterSpacing: 1
                         }
 
-                        Button {
+                        SquareButton {
                             text: "Log"
                             flat: true
                             enabled: viewer.job_log.length > 0
                             onClicked: {
+                                jobDialog.validationMessage = ""
+                                jobDialog.actionTitle = "Activity log"
                                 jobDialog.autoShown = false
                                 jobDialog.open()
                             }
@@ -778,6 +854,10 @@ ApplicationWindow {
 
                         TextArea {
                             id: detailView
+                            color: pal.text
+                            selectionColor: pal.highlight
+                            selectedTextColor: pal.highlightedText
+                            background: Rectangle { color: pal.base; radius: 0; border.color: pal.mid }
                             width: detailScroll.availableWidth
                             readOnly: true
                             selectByMouse: true
@@ -807,12 +887,12 @@ ApplicationWindow {
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 10
-                anchors.rightMargin: 10
+                anchors.leftMargin: 6
+                anchors.rightMargin: 6
                 spacing: 16
 
                 Text {
-                    text: viewer.status
+                    text: window.selectedCount + " selected  |  " + viewer.status
                     color: pal.windowText
                     opacity: 0.8
                     font.bold: viewer.busy
@@ -847,12 +927,25 @@ ApplicationWindow {
 
     Dialog {
         id: jobDialog
-        title: "mcscan.py output"
+        title: actionTitle
+        property string actionTitle: "Activity log"
+        property string validationMessage: ""
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        background: Rectangle { color: pal.window; radius: 0; border.color: pal.mid }
         property bool autoShown: false
-        width: 800
-        height: 460
+        width: Math.min(window.width - 48, 880)
+        height: Math.min(window.height - 48, 500)
         modal: false
-        standardButtons: Dialog.Close
+        footer: Item {
+            implicitHeight: 40
+            SquareButton {
+                anchors.right: parent.right; anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Close"
+                onClicked: jobDialog.close()
+            }
+        }
 
         contentItem: ScrollView {
             id: jobScroll
@@ -861,7 +954,11 @@ ApplicationWindow {
             TextArea {
                 id: jobText
                 width: jobScroll.availableWidth
-                text: viewer.job_log
+                text: jobDialog.validationMessage.length > 0 ? jobDialog.validationMessage : viewer.job_log
+                color: pal.text
+                selectionColor: pal.highlight
+                selectedTextColor: pal.highlightedText
+                background: Rectangle { color: pal.base; radius: 0; border.color: pal.mid }
                 readOnly: true
                 selectByMouse: true
                 textFormat: TextEdit.PlainText

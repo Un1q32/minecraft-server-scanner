@@ -29,7 +29,10 @@ impl JobHandle {
     /// Spawn `<python> mcscan.py <args...>` in the database's directory.
     pub fn start(target: &Target, args: &[String]) -> Result<Self, String> {
         let mut cmd = Command::new(&target.python);
-        cmd.arg(&target.script)
+        cmd.env("PYTHONIOENCODING", "utf-8:backslashreplace")
+            .env("PYTHONUTF8", "1")
+            .arg("-u")
+            .arg(&target.script)
             .args(args)
             .current_dir(&target.cwd)
             .stdin(Stdio::null())
@@ -48,7 +51,7 @@ impl JobHandle {
             .spawn()
             .map_err(|e| format!("could not run {}: {e}", target.python))?;
 
-        let mut header = format!("$ {} {}", target.python, target.script.display());
+        let mut header = format!("$ {} -u {}", target.python, target.script.display());
         for arg in args {
             header.push(' ');
             header.push_str(arg);
@@ -106,10 +109,22 @@ fn spawn_reader<R: Read + Send + 'static>(
     log: Arc<Mutex<String>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            let Ok(line) = line else { break };
+        let mut reader = BufReader::new(pipe);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+            // A malformed byte must not close the pipe and crash Python on
+            // its next print. Python is UTF-8, but raw server/tool bytes can
+            // still reach stdout.buffer.
+            let line = String::from_utf8_lossy(&bytes);
             let Ok(mut text) = log.lock() else { break };
-            text.push_str(&line);
+            text.push_str(line.trim_end_matches(&['\r', '\n'][..]));
             text.push('\n');
             if text.len() > MAX_LOG_BYTES {
                 // Trim whole lines from the front, on a char boundary.
@@ -128,6 +143,76 @@ fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn captured(bytes: Vec<u8>) -> String {
+        let log = Arc::new(Mutex::new(String::new()));
+        spawn_reader(Cursor::new(bytes), Arc::clone(&log)).join().unwrap();
+        let result = log.lock().unwrap().clone();
+        result
+    }
+
+    #[test]
+    fn invalid_utf8_does_not_truncate_following_output() {
+        let text = captured(b"before\r\nlegacy:\x96\r\nafter\n".to_vec());
+        assert_eq!(text, "before\nlegacy:\u{fffd}\nafter\n");
+    }
+
+    #[test]
+    fn multilingual_output_and_last_unterminated_line_are_preserved() {
+        let text = captured("caf\u{e9} \u{2014} \u{a7}a \u{4e2d}\u{6587} \u{1f3ae}\r\nlast".as_bytes().to_vec());
+        assert_eq!(text, "caf\u{e9} \u{2014} \u{a7}a \u{4e2d}\u{6587} \u{1f3ae}\nlast\n");
+    }
+
+    #[test]
+    fn large_multilingual_logs_keep_the_final_result() {
+        let mut bytes = "caf\u{e9} \u{1f3ae} output line\n".repeat(10000).into_bytes();
+        bytes.extend_from_slice(b"FINAL RESULT\n");
+        let text = captured(bytes);
+        assert!(text.len() <= MAX_LOG_BYTES);
+        assert!(text.ends_with("FINAL RESULT\n"));
+    }
+
+    #[test]
+    #[ignore = "requires Python; set DBVIEWER_TEST_PYTHON"]
+    fn python_twenty_target_job_survives_unicode_and_malformed_bytes() {
+        let python = std::env::var("DBVIEWER_TEST_PYTHON")
+            .expect("set DBVIEWER_TEST_PYTHON to a Python executable");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("dbviewer-output-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let script = directory.join("output_fixture.py");
+        std::fs::write(&script, r#"import sys
+assert sys.stdout.encoding.lower().replace('-', '') == 'utf8'
+assert len(sys.argv[2:]) == 20
+for i in range(20):
+    print(f'{i}: caf\u00e9 \u2014 \u00a7a \u4e2d\u6587 \U0001f3ae', flush=True)
+sys.stdout.buffer.write(b'legacy:\x96\n')
+sys.stdout.buffer.flush()
+print('AFTER MALFORMED BYTES', flush=True)
+"#).unwrap();
+        let target = Target { script: script.clone(), cwd: directory.clone(), python };
+        let mut args = vec!["--rescan".to_string()];
+        args.extend((1..=20).map(|i| format!("192.0.2.{i}:25565")));
+        let mut job = JobHandle::start(&target, &args).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (log, code) = loop {
+            let (running, log, code) = job.poll();
+            if !running { break (log, code); }
+            assert!(std::time::Instant::now() < deadline, "fixture did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(code, Some(0), "{log}");
+        assert!(log.contains("caf\u{e9} \u{2014} \u{a7}a \u{4e2d}\u{6587} \u{1f3ae}"), "{log}");
+        assert!(log.contains("AFTER MALFORMED BYTES"), "{log}");
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+}
+
 /// Locate `mcscan.py` for the given DB path and the Python interpreter to use.
 pub fn find(db_path: &str) -> Result<Target, String> {
     let db = Path::new(db_path);
@@ -139,6 +224,11 @@ pub fn find(db_path: &str) -> Result<Target, String> {
     let mut candidates = vec![cwd.join("mcscan.py")];
     if let Some(parent) = cwd.parent() {
         candidates.push(parent.join("mcscan.py"));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            candidates.push(directory.join("mcscan.py"));
+        }
     }
     candidates.push(PathBuf::from("mcscan.py"));
 
@@ -162,6 +252,12 @@ fn python_exe() -> String {
     std::env::var("DBVIEWER_PYTHON")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let executable = std::env::current_exe().ok()?;
+            let path = std::fs::read_to_string(executable.with_file_name("python-path.txt")).ok()?;
+            let path = path.trim().to_string();
+            (!path.is_empty()).then_some(path)
+        })
         .unwrap_or_else(|| {
             if cfg!(windows) {
                 "python".to_string()

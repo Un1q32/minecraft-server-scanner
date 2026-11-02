@@ -48,7 +48,6 @@ fn open_read_only(path: &str) -> Result<Connection, String> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .or_else(|_| Connection::open(path))
     .map_err(|e| format!("cannot open {path}: {e}"))?;
     con.busy_timeout(std::time::Duration::from_millis(3000))
         .map_err(|e| e.to_string())?;

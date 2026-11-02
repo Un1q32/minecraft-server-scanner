@@ -4,6 +4,8 @@
 //! and exposes them through a QAbstractTableModel, so Qt's TableView only
 //! touches the visible cells and a 100k+ row database stays responsive.
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod db;
 mod job;
 mod model;

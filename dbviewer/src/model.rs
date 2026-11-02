@@ -370,8 +370,9 @@ impl qobject::ViewerModel {
             .map(str::to_string)
             .collect();
         if ips.is_empty() {
-            let message = "select one or more server rows first";
+            let message = "Select one or more server rows first, then click Recheck whitelist.";
             self.as_mut().set_status(qs(message));
+            self.as_mut().set_job_log(qs(message));
             return qs(message);
         }
         let count = ips.len();
@@ -392,8 +393,9 @@ impl qobject::ViewerModel {
             .map(str::to_string)
             .collect();
         if ips.is_empty() {
-            let message = "select one or more server rows first";
+            let message = "Select one or more server rows first, then click Rescan.";
             self.as_mut().set_status(qs(message));
+            self.as_mut().set_job_log(qs(message));
             return qs(message);
         }
         let count = ips.len();
@@ -662,6 +664,9 @@ fn launch() -> &'static Launch {
                         launch.sort = column;
                         launch.desc = desc;
                     }
+                }
+                "--export-preview" => {
+                    args.next();
                 }
                 other if !other.starts_with('-') => launch.db = other.to_string(),
                 _ => {}
