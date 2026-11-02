@@ -754,7 +754,7 @@ class ShardManager:
         self.interval = max(2.0, float(interval))
         self.stop_event = stop_event
         self._shard = None
-        self._last_label = None
+        self._reported_total = None
         self._last_error = None
         self._messages = []
         self._lock = threading.Lock()
@@ -811,14 +811,8 @@ class ShardManager:
             self._last_error = text
             return
         self._last_error = None
-        label = f"{index}/{total}"
         with self._lock:
             self._shard = (index, total)
-            if label != self._last_label:
-                self._last_label = label
-                peers = max(0, total - 1)
-                self._messages.append(
-                    f"auto-shard: {label} ({peers} peer(s))")
 
     def _run(self):
         self.refresh()
@@ -833,10 +827,23 @@ class ShardManager:
             return self._shard
 
     def drain_messages(self):
-        """Messages collected by the heartbeat thread for end-of-round output."""
+        """End-of-round output: errors plus one line if the peer count changed.
+
+        Heartbeats may see a peer expire and re-register within a long round.
+        Only the final total is reported, and only when it differs from the
+        last reported total, so transient membership flaps do not produce a
+        misleading 0-peer line after every round.
+        """
         with self._lock:
-            messages = self._messages
+            messages = list(self._messages)
             self._messages = []
+            if self._shard is not None:
+                index, total = self._shard
+                if self._reported_total != total:
+                    self._reported_total = total
+                    messages.append(
+                        f"auto-shard: {index}/{total} "
+                        f"({max(0, total - 1)} peer(s))")
             return messages
 
     def stop(self):
