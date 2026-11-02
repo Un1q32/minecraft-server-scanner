@@ -181,8 +181,9 @@ writes get 401 and reveal nothing. Clients sign requests with HMAC-SHA256
 (the token itself never travels on the wire; plain `Bearer` is also accepted
 for curl debugging), nonces are single-use, timestamps must be within
 ±5 minutes, and 5 bad logins from one IP earns a 1-minute throttle (HTTP 429).
-Traffic is plain HTTP so setup stays trivial; pass `--tls-cert/--tls-key`
-(or run behind Caddy/nginx/Tailscale) if your list is sensitive.
+Traffic is plain HTTP by default so setup stays trivial. Enable HTTPS with
+`--tls-cert fullchain.pem --tls-key privkey.pem` (clients then use an
+`https://` URL), or run it behind Caddy/nginx/Tailscale.
 
 Continuous-mode clients also use the shared DB for automatic sharding:
 each node heartbeats `POST /api/continuous`, and the server returns its
@@ -469,9 +470,13 @@ detail pane and Copy IP(s) all match the Rust viewer.
     python webui/webui.py --db /path/to/servers.db --port 8080
     python webui/webui.py --no-browser
 
-It binds to `127.0.0.1` by default. The Python server takes a consistent
-SQLite snapshot (including the WAL) and serves it; the page loads that
-snapshot into `webui/static/core.wasm`, a small Emscripten/SQLite build, so
+It binds to `127.0.0.1` by default. HTTPS is enabled with
+`--tls-cert cert.pem --tls-key privkey.pem`, or by dropping those two files
+in the working directory; otherwise it serves plain HTTP. Use a
+trusted/real certificate because browsers will warn about self-signed ones.
+The Python server serves the existing `servers.db` directly (plus its
+`servers.db-wal` sidecar if present); the page loads that
+data into `webui/static/core.wasm`, a small Emscripten/SQLite build, so
 filtering, sorting and formatting run in the browser. A 120k-row database
 opens in roughly 100-170 ms and sorts in roughly 60-110 ms on a desktop.
 The table is virtualized: only the visible rows are drawn, so scrolling
@@ -479,7 +484,7 @@ stays smooth. Drag the divider on the right edge of a header to resize a
 column; widths persist in the browser.
 
 `--ports`, scanning and the continuous loop are not part of this UI.
-**Refresh** re-fetches the current database snapshot and re-applies the
+**Refresh** re-fetches the current database file and re-applies the
 active query and sort. It never starts a scan or a sync.
 
 The generated WASM is committed. Rebuild it after changing `webui/core.cpp`
@@ -498,7 +503,7 @@ Run the app on loopback and let nginx terminate TLS and proxy requests:
     python webui/webui.py --host 127.0.0.1 --port 8080 --no-browser
 
 `webui/nginx.conf.example` is a complete reverse-proxy site (HTTP redirect,
-TLS, and streaming for the database snapshot). `webui/mc-webui.service.example`
+TLS, and streaming for the database file). `webui/mc-webui.service.example`
 is the matching systemd unit. Basic outline:
 
     sudo cp webui/nginx.conf.example /etc/nginx/sites-available/mc-webui
@@ -510,7 +515,7 @@ Use a dedicated hostname (the page fetches `/core.js`, `/servers.db` and
 `/api/*` from the site root). The app has no authentication; keep the Python
 server bound to `127.0.0.1` and, if the hostname is reachable beyond a trusted
 LAN, add your own access control in nginx (Basic auth or `allow`/`deny`).
-The database snapshot is about 30 MB, so `proxy_buffering off` keeps the first
+The database is tens of MB, so `proxy_buffering off` keeps the first
 load responsive.
 
 ## Database format

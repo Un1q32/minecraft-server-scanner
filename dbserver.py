@@ -655,7 +655,17 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "MCNetDB/1.0"
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (_client_ip(self), fmt % args))
+        try:
+            text = fmt % args
+        except Exception:
+            text = str(fmt)
+        if "Bad request version" in text or "Bad request syntax" in text:
+            text = "400 bad request (non-HTTP or TLS on the HTTP port)"
+        # Never send raw request bytes to the journal: a TLS ClientHello or
+        # malformed request would otherwise show up as [blob data] noise.
+        text = re.sub(r"[^\x20-\x7e]", "?", text)
+        text = text.replace("\n", " ").replace("\r", " ")[:300]
+        sys.stderr.write("%s - %s\n" % (_client_ip(self), text))
 
     def _send_json(self, code, obj):
         raw = json.dumps(obj).encode("utf-8")

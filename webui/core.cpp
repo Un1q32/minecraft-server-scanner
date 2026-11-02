@@ -961,7 +961,9 @@ int mc_open(const char *path) {
         sqlite3_close(g_db);
         g_db = nullptr;
     }
-    if (sqlite3_open_v2(path, &g_db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+    // The path is the in-memory snapshot loaded into MEMFS, never the live
+    // file. Open it read-write so SQLite can apply/recover a copied WAL.
+    if (sqlite3_open_v2(path, &g_db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
         g_error = g_db ? sqlite3_errmsg(g_db) : "could not open database";
         if (g_db) {
             sqlite3_close(g_db);

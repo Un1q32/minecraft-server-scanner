@@ -468,6 +468,21 @@ async function loadDatabase() {
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
   core.FS.writeFile("/servers.db", bytes);
+
+  // WAL mode keeps recent commits in servers.db-wal until a checkpoint.
+  // Serve that existing file too; it is not a snapshot, just the live sidecar.
+  const wal = await fetch(assetUrl(`servers.db-wal?ts=${Date.now()}`),
+                          { cache: "no-store" });
+  if (wal.ok) {
+    core.FS.writeFile("/servers.db-wal", new Uint8Array(await wal.arrayBuffer()));
+  } else {
+    try {
+      core.FS.unlink("/servers.db-wal");
+    } catch (error) {
+      // No stale WAL to remove.
+    }
+  }
+
   if (mc.open("/servers.db") !== 0) {
     throw new Error(mc.error() || "could not open database");
   }

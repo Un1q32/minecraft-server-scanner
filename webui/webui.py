@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Local web UI for servers.db.
 
-Serves a small static page plus a SQLite snapshot of the scanner database.
-The page loads the snapshot into a WebAssembly core (core.wasm), so all
-filtering, sorting and row formatting happen in the browser at native-ish
-speed while the server only hands out bytes.
+Serves a small static page plus the existing servers.db file. The page
+loads that file into a WebAssembly core (core.wasm), so all filtering,
+sorting and row formatting happen in the browser at native-ish speed while
+the server only hands out bytes.
 
 Run:
 
@@ -12,9 +12,8 @@ Run:
     python webui/webui.py --db /path/to/servers.db --port 8080
     python webui/webui.py --no-browser
 
-The page is read-only: "Refresh" reloads the current servers.db snapshot
-(including changes made by a scanner running elsewhere). Nothing in the web
-UI starts a scan or sync.
+The page is read-only: "Refresh" reloads servers.db from disk. Nothing in
+the web UI starts a scan or sync, and the server never creates a copy.
 """
 
 from __future__ import annotations
@@ -22,11 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
-import sqlite3
-from pathlib import Path
 import sys
-import tempfile
 import threading
 import time
 import webbrowser
@@ -46,131 +41,6 @@ STATIC_FILES = {
     "/core.js": ("core.js", "text/javascript; charset=utf-8"),
     "/core.wasm": ("core.wasm", "application/wasm"),
 }
-
-_snapshot_lock = threading.Lock()
-_snapshot = {"key": None, "path": None}
-
-
-def _db_files(db_path: str) -> list[str]:
-    return [db_path, db_path + "-wal", db_path + "-shm"]
-
-
-def _db_key(db_path: str):
-    key = []
-    for path in _db_files(db_path):
-        try:
-            st = os.stat(path)
-            key.append((st.st_mtime_ns, st.st_size))
-        except OSError:
-            key.append(None)
-    return tuple(key)
-
-
-def _backup_to(source: sqlite3.Connection, dest_path: str) -> None:
-    dest = sqlite3.connect(dest_path)
-    try:
-        source.backup(dest)
-    finally:
-        dest.close()
-
-
-def _copy_database(db_path: str, dest_path: str) -> None:
-    """Read-only backup attempt; never writes to the source database."""
-    uri = Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
-    source = sqlite3.connect(uri, uri=True, timeout=10)
-    try:
-        source.execute("PRAGMA busy_timeout=10000")
-        _backup_to(source, dest_path)
-    finally:
-        source.close()
-
-
-def _copy_database_via_temp(db_path: str, dest_path: str) -> None:
-    """Fallback for a read-only WAL database.
-
-    SQLite cannot open a WAL-mode file read-only unless its -shm file is
-    already available and writable enough for locking. Copy the database
-    (and its WAL) to a writable temp directory, let SQLite recover it there,
-    then back that up. The source is only ever read.
-    """
-    tmpdir = tempfile.mkdtemp(prefix="mc-webui-src-")
-    try:
-        copy_path = os.path.join(tmpdir, "servers.db")
-        shutil.copyfile(db_path, copy_path)
-        wal = db_path + "-wal"
-        if os.path.isfile(wal):
-            shutil.copyfile(wal, copy_path + "-wal")
-        source = sqlite3.connect(copy_path, timeout=10)
-        try:
-            source.execute("PRAGMA busy_timeout=10000")
-            _backup_to(source, dest_path)
-        finally:
-            source.close()
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def make_snapshot(db_path: str) -> str:
-    """Copy the live DB (including its WAL) to a consistent temp file."""
-    if not os.path.isfile(db_path):
-        raise FileNotFoundError(db_path)
-    key = _db_key(db_path)
-    with _snapshot_lock:
-        if _snapshot["key"] == key and _snapshot["path"] and os.path.exists(_snapshot["path"]):
-            return _snapshot["path"]
-        old = _snapshot["path"]
-        fd, path = tempfile.mkstemp(prefix="mc-webui-", suffix=".db")
-        os.close(fd)
-        try:
-            last_error = None
-            for attempt in range(5):
-                try:
-                    _copy_database(db_path, path)
-                    last_error = None
-                    break
-                except sqlite3.OperationalError as exc:
-                    last_error = exc
-                    text = str(exc).lower()
-                    if "locked" in text or "busy" in text:
-                        time.sleep(0.25 * (attempt + 1))
-                        continue
-                    # A read-only WAL database may need its -shm rebuilt;
-                    # do that on a writable copy instead of the source.
-                    _copy_database_via_temp(db_path, path)
-                    last_error = None
-                    break
-                except sqlite3.DatabaseError:
-                    _copy_database_via_temp(db_path, path)
-                    last_error = None
-                    break
-            if last_error is not None:
-                raise last_error
-        except Exception:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            raise
-        _snapshot["key"] = key
-        _snapshot["path"] = path
-        if old and old != path:
-            try:
-                os.unlink(old)
-            except OSError:
-                pass
-        return path
-
-
-def invalidate_snapshot() -> None:
-    with _snapshot_lock:
-        if _snapshot["path"]:
-            try:
-                os.unlink(_snapshot["path"])
-            except OSError:
-                pass
-        _snapshot["key"] = None
-        _snapshot["path"] = None
-
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "mc-webui/1.0"
@@ -201,18 +71,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
-        if path == "/servers.db":
+        if path in ("/servers.db", "/servers.db-wal"):
+            file_path = self.server.db_path
+            if path == "/servers.db-wal":
+                file_path += "-wal"
             try:
-                snapshot = make_snapshot(self.server.db_path)
-                with open(snapshot, "rb") as f:
+                with open(file_path, "rb") as f:
                     body = f.read()
+            except FileNotFoundError:
+                self._send(404, b"not found", "text/plain; charset=utf-8")
+                return
             except Exception as exc:
-                print(f"snapshot failed for {self.server.db_path}: {exc}",
+                print(f"could not read {file_path}: {exc}",
                       file=sys.stderr, flush=True)
-                message = f"could not read database: {exc}"
-                if "unable to open" in str(exc).lower():
-                    message += " (check that the webui user can read servers.db)"
-                self._send(500, message.encode(), "text/plain; charset=utf-8")
+                self._send(500, f"could not read database: {exc}".encode(),
+                           "text/plain; charset=utf-8")
                 return
             self._send(200, body, "application/octet-stream")
             return
@@ -251,6 +124,10 @@ def main(argv=None) -> int:
                         help="port (default: 8080)")
     parser.add_argument("--no-browser", action="store_true",
                         help="do not open a browser window")
+    parser.add_argument("--tls-cert", default="",
+                        help="PEM certificate chain for https://")
+    parser.add_argument("--tls-key", default="",
+                        help="PEM private key for https://")
     args = parser.parse_args(argv)
 
     db_path = os.path.abspath(os.path.expanduser(args.db))
@@ -265,7 +142,33 @@ def main(argv=None) -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.db_path = db_path  # type: ignore[attr-defined]
-    url = f"http://{args.host}:{args.port}/"
+
+    tls_cert, tls_key = args.tls_cert, args.tls_key
+    if not (tls_cert and tls_key):
+        # Same zero-config convention as dbserver.py.
+        if os.path.isfile("cert.pem") and os.path.isfile("privkey.pem"):
+            tls_cert, tls_key = "cert.pem", "privkey.pem"
+    scheme = "http"
+    if tls_cert and tls_key:
+        import ssl
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(tls_cert, tls_key)
+        except Exception as exc:
+            print(f"error: could not load TLS cert/key ({tls_cert}, {tls_key}): {exc}",
+                  file=sys.stderr)
+            server.server_close()
+            return 1
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+        print(f"TLS enabled ({tls_cert}, {tls_key})")
+    elif tls_cert or tls_key:
+        print("error: --tls-cert and --tls-key must be given together",
+              file=sys.stderr)
+        server.server_close()
+        return 1
+
+    url = f"{scheme}://{args.host}:{args.port}/"
     print(f"serving {db_path}")
     print(f"open {url}  (Ctrl-C to stop)")
 
@@ -281,7 +184,6 @@ def main(argv=None) -> int:
         print("\nstopped")
     finally:
         server.server_close()
-        invalidate_snapshot()
     return 0
 
 
