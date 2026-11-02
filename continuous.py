@@ -69,6 +69,7 @@ RANDOM_EXPLORE = 0.10
 STATUS_INTERVAL = 0.3           # live status redraw (seconds)
 STATUS_LOG_INTERVAL = 15.0      # redraw cadence when output is piped
 SHARD_HEARTBEAT = 10.0          # auto-shard heartbeat interval (seconds)
+SHARD_TIMEOUT = 8.0             # per-heartbeat HTTP timeout (seconds)
 NODE_ID_FILE = "continuous_node_id"
 
 STRATEGY_NAMES = (
@@ -758,27 +759,44 @@ class ShardManager:
         self._messages = []
         self._lock = threading.Lock()
         self._local_stop = threading.Event()
+        self._ready = threading.Event()
         self._thread = None
 
     def start(self):
-        self.refresh()
+        # Do the first heartbeat in the worker thread and wait only briefly.
+        # A stuck DNS/socket lookup must not hang scanner startup.
         self._thread = threading.Thread(
             target=self._run, name="mcscan-shard-heartbeat", daemon=True)
         self._thread.start()
+        self._ready.wait(timeout=5.0)
 
     def refresh(self, leave=False):
-        try:
-            data = scanner.netdb_continuous_heartbeat(
-                self.url, self.token, self.node_id,
-                timeout=2 if leave else 5, leave=leave)
-        except Exception as exc:
-            text = str(exc)
-            if not leave and text != self._last_error:
-                with self._lock:
-                    self._messages.append(f"auto-shard heartbeat failed: {text}")
-                self._last_error = text
-            return
-        if leave:
+        # One retry for a transient timeout. The status bar log is deferred to
+        # the end of the round, so a slow DB server does not spam the console.
+        attempts = 1 if leave else 2
+        data = None
+        for attempt in range(attempts):
+            try:
+                data = scanner.netdb_continuous_heartbeat(
+                    self.url, self.token, self.node_id,
+                    timeout=2 if leave else SHARD_TIMEOUT, leave=leave)
+                break
+            except Exception as exc:
+                text = str(exc)
+                transient = ("timed out" in text.lower()
+                             or "timeout" in text.lower())
+                if attempt + 1 < attempts and transient:
+                    time.sleep(0.5)
+                    continue
+                if not leave and text != self._last_error:
+                    if transient:
+                        text = "timed out; will retry next heartbeat"
+                    with self._lock:
+                        self._messages.append(
+                            f"auto-shard heartbeat failed: {text}")
+                    self._last_error = text
+                return
+        if leave or data is None:
             return
         try:
             index = int(data.get("index") or 0)
@@ -803,6 +821,8 @@ class ShardManager:
                     f"auto-shard: {label} ({peers} peer(s))")
 
     def _run(self):
+        self.refresh()
+        self._ready.set()
         while not self._local_stop.wait(self.interval):
             if self.stop_event.is_set():
                 break
@@ -820,12 +840,19 @@ class ShardManager:
             return messages
 
     def stop(self):
-        # Stop the heartbeat thread first so it cannot re-register this node
-        # after the leave request.
+        # Never let a stuck network call hold up shutdown. Stop the heartbeat
+        # thread, then send the leave request from a short-lived daemon thread
+        # (best effort; the server's TTL is the fallback).
         self._local_stop.set()
         if self._thread:
-            self._thread.join(timeout=self.interval + 2.0)
-        self.refresh(leave=True)
+            self._thread.join(timeout=1.0)
+            if self._thread.is_alive():
+                # Stuck in DNS/socket: let the server TTL expire this node
+                # rather than blocking exit or racing a late heartbeat.
+                return
+        threading.Thread(
+            target=self.refresh, kwargs={"leave": True}, daemon=True
+        ).start()
 
 
 def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
