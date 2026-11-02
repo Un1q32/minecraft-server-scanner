@@ -9085,10 +9085,10 @@ class ServersTab(QWidget, QtBaseMixin):
 
         self.tree = ResultTable(self, columns=list(self.COLS))
         self.tree.setHorizontalHeaderLabels([c.upper() for c in self.COLS])
-        widths = {"ip": 170, "motd": 260, "players": 110, "version": 120,
-                  "cracked": 90, "whitelist": 180, "online_names": 200,
+        widths = {"ip": 170, "motd": 260, "players": 90, "version": 120,
+                  "cracked": 75, "whitelist": 180, "online_names": 200,
                   "seen_names": 200,
-                  "first_seen": 130, "last_seen": 130, "times_seen": 90}
+                  "first_seen": 165, "last_seen": 165, "times_seen": 90}
         for i, c in enumerate(self.COLS):
             self.tree.setColumnWidth(i, widths.get(c, 150))
         self.tree.setSortingEnabled(True)

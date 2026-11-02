@@ -3,14 +3,14 @@
 const COLUMNS = [
   { key: "ip_port", label: "IP / PORT", width: 170 },
   { key: "motd", label: "MOTD", width: 260 },
-  { key: "players", label: "PLAYERS", width: 110 },
+  { key: "players", label: "PLAYERS", width: 90 },
   { key: "version", label: "VERSION", width: 120 },
-  { key: "cracked", label: "CRACKED", width: 90 },
+  { key: "cracked", label: "CRACKED", width: 75 },
   { key: "whitelist", label: "WHITELIST", width: 180 },
   { key: "online_names", label: "ONLINE NAMES", width: 200 },
   { key: "seen_names", label: "SEEN NAMES", width: 200 },
-  { key: "first_seen", label: "FIRST SEEN", width: 130 },
-  { key: "last_seen", label: "LAST SEEN", width: 130 },
+  { key: "first_seen", label: "FIRST SEEN", width: 165 },
+  { key: "last_seen", label: "LAST SEEN", width: 165 },
   { key: "times_seen", label: "TIMES SEEN", width: 90 },
 ];
 

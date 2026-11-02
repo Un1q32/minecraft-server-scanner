@@ -39,7 +39,7 @@ ApplicationWindow {
 
     // Same widths as the Python Servers tab.
     readonly property var defaultWidths: [
-        170, 260, 110, 120, 90, 180, 200, 200, 130, 130, 90
+        170, 260, 90, 120, 75, 180, 200, 200, 165, 165, 90
     ]
 
     QtObject {

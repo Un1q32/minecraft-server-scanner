@@ -137,17 +137,6 @@ fn push_field(out: &mut String, value: &str, width: usize) {
     }
 }
 
-pub fn cracked_short(cracked: &str) -> &'static str {
-    match cracked.to_ascii_lowercase().as_str() {
-        "" => "",
-        "no" => "no",
-        "yes" => "yes",
-        "yes (cached)" => "yes*",
-        "yes (heuristic)" => "yes?",
-        _ => "yes",
-    }
-}
-
 fn push_timestamp(out: &mut String, epoch: f64) {
     if epoch <= 0.0 {
         out.push('-');
@@ -178,7 +167,7 @@ pub fn display_line(row: &Row) -> String {
     out.push(' ');
     push_field(&mut out, &row.version, VERSION_W);
     out.push(' ');
-    push_field(&mut out, cracked_short(&row.cracked), CRACKED_W);
+    push_field(&mut out, &row.cracked, CRACKED_W);
     out.push(' ');
     push_timestamp(&mut out, row.last_seen);
     out
