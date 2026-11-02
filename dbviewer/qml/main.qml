@@ -394,14 +394,6 @@ ApplicationWindow {
                     onClicked: fileDialog.open()
                 }
 
-                SquareButton {
-                    text: "Refresh"
-                    enabled: viewer.db_path.length > 0
-                    ToolTip.visible: hovered
-                    ToolTip.text: "Reload the local database (F5)"
-                    onClicked: window.applySearch()
-                }
-
                 TextField {
                     id: searchField
                     implicitHeight: 28
