@@ -892,7 +892,7 @@ std::string timestamp_text(double epoch) {
     localtime_r(&t, &tmv);
 #endif
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tmv);
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %I:%M %p", &tmv);
     return buf;
 }
 

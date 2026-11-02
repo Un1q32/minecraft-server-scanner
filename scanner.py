@@ -856,9 +856,21 @@ def format_db_timestamp(ts):
         ts = float(ts)
         if ts <= 0:
             return "-"
-        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        return time.strftime("%Y-%m-%d %I:%M %p", time.localtime(ts))
     except Exception:
         return "-"
+
+
+def _timestamp_display_key(value):
+    """Sort displayed timestamps by actual time, not lexically."""
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d %I:%M:%S %p", "%Y-%m-%d %I:%M %p",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except Exception:
+            continue
+    return 0.0
 
 
 def _ensure_server_db():
@@ -6271,7 +6283,7 @@ def format_timestamp(ts):
     if not ts:
         return "n/a"
     try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        return time.strftime("%Y-%m-%d %I:%M:%S %p", time.localtime(ts))
     except Exception:
         return str(ts)
 
@@ -9090,8 +9102,8 @@ class ServersTab(QWidget, QtBaseMixin):
                 "whitelist": lambda v: str(v).lower(),
                 "online_names": lambda v: str(v).lower(),
                 "seen_names": lambda v: str(v).lower(),
-                "first_seen": lambda v: str(v),
-                "last_seen": lambda v: str(v),
+                "first_seen": _timestamp_display_key,
+                "last_seen": _timestamp_display_key,
                 "times_seen": lambda v: int(str(v)) if str(v).isdigit() else -1,
             })
         except Exception:
@@ -11794,7 +11806,7 @@ class UserLogTab(QWidget, QtBaseMixin):
             "player": lambda v: str(v).lower(),
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
-            "last_seen": lambda v: str(v),
+            "last_seen": _timestamp_display_key,
         })
 
         self.status_label = QLabel("Ready.")
@@ -11858,7 +11870,7 @@ class UserLogTab(QWidget, QtBaseMixin):
 
     def _format_last_seen(self, ts):
         try:
-            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            return time.strftime("%Y-%m-%d %I:%M:%S %p", time.localtime(ts))
         except Exception:
             return "-"
 

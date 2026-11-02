@@ -155,7 +155,7 @@ fn push_timestamp(out: &mut String, epoch: f64) {
     }
     match chrono::Local.timestamp_opt(epoch as i64, 0) {
         chrono::LocalResult::Single(dt) => {
-            let _ = write!(out, "{}", dt.format("%Y-%m-%d %H:%M"));
+            let _ = write!(out, "{}", dt.format("%Y-%m-%d %I:%M %p"));
         }
         _ => out.push('-'),
     }
