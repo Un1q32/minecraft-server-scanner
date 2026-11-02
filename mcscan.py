@@ -7,6 +7,7 @@ IPs, CIDRs, start-end ranges, ASNs, hostnames, comma/space/newline
 separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
 
   mcscan.py --sync                  sync shared DB (creds from netdb.json)
+  mcscan.py --download-db           replace local DB with the latest shared DB
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --recheck-whitelist IP:PORT ...
                                     probe whitelist status for those servers
@@ -89,6 +90,30 @@ def cmd_init_db(url, token):
         return 1
     print(f"saved shared-DB URL and token to {scanner.NETDB_CONFIG_FILE}")
     return 0
+
+def cmd_download_db():
+    """Download every shared-DB row and replace the local servers table."""
+    url, token = _sync_creds()
+    if not url or not token:
+        print("error: netdb.json has no URL/token yet -- run "
+              "'mcscan.py --init-db URL TOKEN' first.")
+        return 2
+    print(f"downloading shared DB at {url} ...", flush=True)
+    try:
+        rows, max_seq, now = scanner.netdb_download_all(url, token)
+    except Exception as exc:
+        print(f"error: download failed: {exc}", flush=True)
+        return 1
+    try:
+        count = scanner.netdb_replace_all(rows)
+    except Exception as exc:
+        print(f"error: could not replace local DB: {exc}", flush=True)
+        return 1
+    scanner.netdb_save_config(url, token, now, max_seq)
+    print(f"download complete: {count} server(s), last_seq={max_seq}",
+          flush=True)
+    return 0
+
 
 def cmd_sync():
     """Sync the shared DB using netdb.json. Returns exit code."""
@@ -677,6 +702,10 @@ def main(argv=None):
         "--sync", action="store_true",
         help="sync the shared DB using creds in netdb.json")
     parser.add_argument(
+        "--download-db", action="store_true",
+        help="replace the local servers.db with the full latest shared DB "
+             "and update netdb.json's seq watermark")
+    parser.add_argument(
         "--scan", nargs="+", metavar="TARGET", dest="targets",
         help="scan targets (same syntax as the GUI box): IPs, CIDRs, "
              "ranges (a-b), ASNs, hostnames")
@@ -756,7 +785,8 @@ def main(argv=None):
 
     if not args.sync and args.targets is None and not args.export \
             and args.init_db is None and not args.continuous \
-            and args.recheck_whitelist is None and args.rescan is None:
+            and args.recheck_whitelist is None and args.rescan is None \
+            and not args.download_db:
         parser.print_help()
         return 2
     install_signal_handlers()
@@ -768,6 +798,8 @@ def main(argv=None):
     try:
         if args.init_db is not None:
             rc = cmd_init_db(*args.init_db) or rc
+        if args.download_db:
+            rc = cmd_download_db() or rc
         if args.sync:
             rc = cmd_sync() or rc
         if args.recheck_whitelist is not None:

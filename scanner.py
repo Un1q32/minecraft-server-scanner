@@ -1298,6 +1298,129 @@ def _netdb_server_format(url, token, timeout=None):
         return 1
 
 
+def netdb_download_all(url, token, timeout=None):
+    """Download every server row from the shared DB using the seq cursor."""
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        raise ConnectionError("enter the shared-DB URL and token first")
+    cursor_seq = 0
+    rows = {}
+    max_seq = 0
+    now = time.time()
+    for _ in range(NETDB_MAX_ROUNDS):
+        resp = _netdb_request(
+            url + "/api/sync", token, method="POST",
+            payload={"servers": [], "since": 0, "since_seq": cursor_seq,
+                     "format": db_format.CURRENT_FORMAT},
+            timeout=timeout)
+        if not isinstance(resp, dict) or not resp.get("has_seq"):
+            raise ConnectionError(
+                "server does not support seq-based full downloads")
+        try:
+            now = float(resp.get("now", now) or now)
+        except Exception:
+            pass
+        batch = [db_format.row_for_format(r, db_format.CURRENT_FORMAT)
+                 for r in (resp.get("servers") or [])
+                 if isinstance(r, dict)]
+        if not batch:
+            break
+        top_seq = cursor_seq
+        for r in batch:
+            try:
+                seq = int(r.get("seq", 0) or 0)
+            except Exception:
+                seq = 0
+            if seq > top_seq:
+                top_seq = seq
+            if seq > max_seq:
+                max_seq = seq
+            ip = str(r.get("ip_port", "") or "")
+            if ip:
+                rows[ip] = r
+        if top_seq <= cursor_seq:
+            break
+        cursor_seq = top_seq
+        if len(batch) < NETDB_PAGE_SIZE:
+            break
+    return list(rows.values()), max_seq, now
+
+
+def netdb_replace_all(rows):
+    """Replace the local servers table with exactly the supplied rows."""
+    _ensure_server_db()
+    inserted = 0
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM servers")
+            for raw in rows or []:
+                if not isinstance(raw, dict):
+                    continue
+                ip_port = strict_ip_port(raw.get("ip_port"))
+                if not ip_port:
+                    continue
+                try:
+                    host, port = split_host_port(ip_port)
+                except Exception:
+                    host, port = ip_port, 25565
+                try:
+                    online = max(0, min(int(raw.get("players_online", 0) or 0),
+                                        MAX_COUNTED_PLAYERS))
+                except Exception:
+                    online = 0
+                try:
+                    maximum = max(0, min(int(raw.get("max_players", 0) or 0),
+                                        MAX_COUNTED_PLAYERS))
+                except Exception:
+                    maximum = 0
+                try:
+                    first_seen = max(0.0, float(raw.get("first_seen", 0) or 0))
+                except Exception:
+                    first_seen = 0.0
+                try:
+                    last_seen = max(0.0, float(raw.get("last_seen", 0) or 0))
+                except Exception:
+                    last_seen = 0.0
+                try:
+                    times_seen = max(1, int(raw.get("times_seen", 1) or 1))
+                except Exception:
+                    times_seen = 1
+                con.execute(
+                    "INSERT OR REPLACE INTO servers (ip_port, host, port, motd,"
+                    " players_online, max_players, version, protocol, cracked,"
+                    " whitelist, first_seen, last_seen, times_seen, last_source,"
+                    " needs_sync, players_now, players_ever)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    (ip_port, None, port,
+                     sanitize_motd(raw.get("motd", ""))[:MAX_MOTD_CHARS],
+                     online, maximum,
+                     sanitize_motd(raw.get("version", "") or "")[:MAX_VERSION_CHARS],
+                     sanitize_protocol(raw.get("protocol")),
+                     db_format.cracked_bool(raw.get("cracked")),
+                     sanitize_motd(raw.get("whitelist", ""))[:200],
+                     first_seen or last_seen, last_seen or first_seen,
+                     times_seen,
+                     str(raw.get("last_source", "") or "netdb")[:MAX_SOURCE_CHARS],
+                     _encode_player_list(_decode_player_list(raw.get("players_now"))),
+                     _encode_player_list(_decode_player_list(raw.get("players_ever")))),
+                )
+                inserted += 1
+            con.commit()
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            con.close()
+    _notify_server_db_tab()
+    return inserted
+
+
 def netdb_sync_once(url, token, timeout=None):
     """Bidirectional sync, no row caps. Returns summary dict. Raises ConnectionError.
 

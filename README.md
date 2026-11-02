@@ -219,6 +219,7 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
 
     python mcscan.py --init-db URL TOKEN    # save shared-DB creds to netdb.json
     python mcscan.py --sync                  # sync shared DB (netdb.json creds)
+    python mcscan.py --download-db           # replace local DB with the full shared DB
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
@@ -237,6 +238,12 @@ and keeps results found so far — it abandons queued probes rather than
 waiting for them, skips the end-of-scan sync, and a second Ctrl-C forces
 an immediate exit. The GUI behaves the same (closing the window also
 stops in-flight scans).
+
+`--download-db` pages through every row on the shared DB using its `seq`
+cursor, replaces the local `servers` table with exactly those rows, and
+updates `netdb.json`'s `last_seq` watermark. Use it to seed a new machine
+or recover a local DB that was deleted or got out of sync; a normal
+`--sync` afterwards is then an incremental no-op.
 
 #### Continuous mode
 
