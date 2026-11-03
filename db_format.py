@@ -58,6 +58,16 @@ def cracked_text(value) -> str:
     return "Yes" if cracked_bool(value) else "No"
 
 
+def source_is_cracked_verdict(source) -> bool:
+    """True when last_source marks an authoritative cracked/online verdict.
+
+    ``cracked`` rows are written by the explicit cracked checker (or the
+    whitelist probe).  Plain scan sources are heuristic and must never
+    overwrite an existing verdict.
+    """
+    return str(source or "").strip().lower() == "cracked"
+
+
 def _host_for(ip_port: str) -> str:
     return str(ip_port or "").rsplit(":", 1)[0]
 

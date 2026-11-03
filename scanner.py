@@ -670,7 +670,7 @@ def record_server_result(result, source="scan"):
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            cur = con.execute("SELECT first_seen, times_seen, cracked, whitelist, players_now, players_ever FROM servers WHERE ip_port=?",
+            cur = con.execute("SELECT first_seen, times_seen, cracked, whitelist, last_source, players_now, players_ever FROM servers WHERE ip_port=?",
                               (ip_port,))
             row = cur.fetchone()
             if row is None:
@@ -686,14 +686,21 @@ def record_server_result(result, source="scan"):
                      _encode_player_list(sample_names)),
                 )
             else:
-                first_seen, times_seen, old_cracked, old_whitelist, old_now, old_ever = row
+                (first_seen, times_seen, old_cracked, old_whitelist,
+                 old_source, old_now, old_ever) = row
                 try:
                     times_seen = int(times_seen or 0) + 1
                 except Exception:
                     times_seen = 1
-                # Preserve a confirmed cracked verdict; a plain sighting
-                # never downgrades it.
-                keep_cracked = old_cracked or cracked
+                # A plain status ping never changes an existing cracked
+                # verdict.  Only the explicit cracked checker (or a login
+                # probe during a whitelist check) may do that, via
+                # update_server_cracked().  This is the pre-format behavior;
+                # the heuristic is only used when a row is first inserted.
+                keep_cracked = 1 if old_cracked else 0
+                if (db_format.source_is_cracked_verdict(old_source)
+                        and not db_format.source_is_cracked_verdict(source)):
+                    source = old_source
                 now_json = (_encode_player_list(sample_names) if has_sample
                             else old_now)
                 ever_json = _encode_player_list(
@@ -727,6 +734,11 @@ def update_server_cracked(ip_port, cracked_label, message=""):
     except Exception:
         return
     now = time.time()
+    label = str(cracked_label or "Yes").strip().lower()
+    if label == "unknown":
+        # Inconclusive probe (timeout, throttle): keep the existing verdict
+        # instead of turning "Unknown" into a false "No".
+        return
     cracked = db_format.cracked_bool(cracked_label or "Yes")
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
@@ -743,7 +755,9 @@ def update_server_cracked(ip_port, cracked_label, message=""):
                     (ip_port, None, port, cracked, now, now),
                 )
             else:
-                con.execute("UPDATE servers SET cracked=?, needs_sync=1, last_seen=? WHERE ip_port=?",
+                con.execute("UPDATE servers SET cracked=?, needs_sync=1,"
+                            " last_source='cracked', last_seen=?"
+                            " WHERE ip_port=?",
                             (cracked, now, ip_port))
             con.commit()
         finally:
@@ -1214,12 +1228,16 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     version, protocol = o_ver, o_proto
                     src = o_src
                 remote_cracked = db_format.cracked_bool(raw.get("cracked"))
-                if o_cracked:
-                    cracked = 1
-                elif remote_newer and remote_cracked:
-                    cracked = 1
+                remote_authoritative = db_format.source_is_cracked_verdict(
+                    raw.get("last_source"))
+                if remote_authoritative and remote_newer:
+                    cracked = remote_cracked
                 else:
-                    cracked = 1 if (o_cracked or remote_cracked) else 0
+                    # Existing rows only change via an explicit check.
+                    cracked = 1 if o_cracked else 0
+                if (db_format.source_is_cracked_verdict(o_src)
+                        and not db_format.source_is_cracked_verdict(src)):
+                    src = o_src
                 if remote_newer and raw.get("whitelist"):
                     whitelist = str(raw.get("whitelist"))
                 else:
@@ -3338,8 +3356,9 @@ def login_probe(host, port=25565):
 
             if packet_id == 0x01:  # Encryption Request
                 saw_encryption_request = True
-                if sample_offline_hint is True:
-                    return True, "CRACKED by players.sample UUID (but got Encryption Request; mixed signals)"
+                # Encryption Request is definitive: the server requires
+                # Mojang auth.  Ignore players.sample here; online-mode
+                # proxies can still expose offline UUIDs in that list.
                 return False, "ONLINE-MODE (Mojang auth required)"
 
             if packet_id == 0x02:  # Login Success
@@ -3351,8 +3370,7 @@ def login_probe(host, port=25565):
                 return True, msg
 
             if packet_id == 0x04:  # Login Plugin Request
-                is_offline = (not saw_encryption_request) or (sample_offline_hint is True)
-                if is_offline:
+                if not saw_encryption_request:
                     return True, "CRACKED (offline-mode behind proxy/login plugin)"
                 return False, "ONLINE-MODE + login plugin (secure/proxied)"
 
@@ -3361,29 +3379,31 @@ def login_probe(host, port=25565):
                 reason = sanitize_motd(reason)[:500]
                 low = (reason or "").lower()
                 clean = low
-                if "whitelist" in clean or "white list" in clean:
-                    return True, f"CRACKED (whitelist message: {display_text(reason, 500)})"
                 if "outdated client" in low or "outdated server" in low:
                     return None, "VERSION MISMATCH (outdated client or server)"
                 if "rate" in low and "limit" in low:
                     return None, "RATE-LIMITED, slow down probes"
 
                 shown = display_text(reason, 200)
-                if sample_offline_hint is True:
-                    return True, f"CRACKED by players.sample UUID (disconnect: {shown})"
-                if sample_offline_hint is False and saw_encryption_request:
+                if saw_encryption_request:
+                    # Auth was already demanded; a later whitelist/plugin
+                    # kick does not make the server offline-mode.
                     return False, f"ONLINE-MODE (disconnect: {shown})"
+                if "whitelist" in clean or "white list" in clean:
+                    return True, f"CRACKED (whitelist message: {display_text(reason, 500)})"
+                if ("throttl" in low or "too fast" in low
+                        or "try again" in low):
+                    return None, f"THROTTLED, retry later: {shown}"
                 return None, f"UNKNOWN MODE (disconnect: {shown})"
 
             # Unknown login packets are ignored.
 
     except socket.timeout:
-        if sample_offline_hint is True:
-            return True, "CRACKED by players.sample UUID, but login probe timed out"
+        # A sample-UUID hint is not enough on its own.  Reporting Unknown
+        # leaves the existing DB verdict untouched instead of turning a
+        # timeout into a false cracked result.
         return None, "Timed out waiting for login response"
     except Exception as exc:
-        if sample_offline_hint is True:
-            return True, f"CRACKED by players.sample UUID, but login probe errored: {str(exc)[:60]}"
         return None, f"Error: {str(exc)[:80]}"
     finally:
         if sock:

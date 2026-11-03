@@ -65,7 +65,7 @@ When masscan reports insufficient privileges and `sudo` is available (Linux/macO
 
 #### Cracked column
 
-The result table has a CRACKED column. Every handshake already detects likely offline-mode servers (a sampled player's UUID matching the offline-mode UUID for its name), so rows show `Yes`/`No` immediately. Tick `Check cracked` before scanning to login-probe each found server for confirmation (`Yes`, `No`, `Unknown`; previously seen servers show `Yes (cached)` from `known_cracked_servers.json`). The `Check Cracked` button probes only the selected rows. The column is sortable.
+The result table has a CRACKED column. The status ping seeds a likely verdict for a newly seen server (a sampled player's UUID matching the offline-mode UUID for its name), but it never overwrites an existing verdict: an online-mode proxy can expose offline UUIDs while still requiring Mojang auth. Tick `Check cracked` before scanning to login-probe each found server for confirmation (`Yes`, `No`, `Unknown`; previously seen servers show `Yes (cached)` from `known_cracked_servers.json`). The `Check Cracked` button probes only the selected rows and is the only way a scan changes an existing value. The column is sortable.
 
 ### Whitelist verification
 
@@ -173,8 +173,9 @@ Each sync uploads the servers this client has seen since its last sync and
 downloads everything other clients added, merging first-seen (oldest wins)
 and last-seen/MOTD/players/version (newest wins) on both sides. Player lists
 merge too: currently-online follows the newer sighting, ever-seen is the
-union of both sides. A confirmed
-cracked verdict is never downgraded by a re-sight.
+union of both sides. A cracked verdict only changes when a client runs an
+explicit cracked or whitelist login probe; ordinary re-sights never
+overwrite it.
 
 Security: every `/api/*` endpoint requires auth — unauthenticated reads and
 writes get 401 and reveal nothing. Clients sign requests with HMAC-SHA256

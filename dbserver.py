@@ -513,13 +513,18 @@ def merge_row(con, row):
         src = o_src
         if protocol is None:
             protocol = row["protocol"]
-    # Never downgrade a confirmed cracked verdict via an older/plain sighting.
-    if o_cracked:
-        cracked = 1
-    elif incoming_newer and row["cracked"]:
-        cracked = 1
+    # Only an explicit cracked check or a whitelist probe may change an
+    # existing verdict.  A plain sighting never changes it, in either
+    # direction.  New rows still take the incoming value below.
+    authoritative = db_format.source_is_cracked_verdict(
+        row.get("last_source"))
+    if authoritative and incoming_newer:
+        cracked = row["cracked"]
     else:
-        cracked = 1 if (o_cracked or row["cracked"]) else 0
+        cracked = 1 if o_cracked else 0
+    if (db_format.source_is_cracked_verdict(o_src)
+            and not db_format.source_is_cracked_verdict(src)):
+        src = o_src
     if incoming_newer and row["whitelist"]:
         whitelist = row["whitelist"]
     else:
