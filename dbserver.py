@@ -630,10 +630,19 @@ def _prune_nonces():
 
 
 _ZSTD_CLI = shutil.which("zstd")
+_ZSTD_WORKERS = min(4, max(1, os.cpu_count() or 1))
 
 
 def _zstd_available():
     return _zstd is not None or bool(_ZSTD_CLI)
+
+
+def _zstd_options(size):
+    workers = _ZSTD_WORKERS if size >= (1 << 20) else 1
+    return {
+        _zstd.CompressionParameter.compression_level: 3,
+        _zstd.CompressionParameter.nb_workers: workers,
+    }
 
 
 def _zstd_cli_run(args, data=None):
@@ -647,17 +656,20 @@ def _zstd_cli_run(args, data=None):
 
 def _zstd_compress_bytes(data):
     if _zstd is not None:
-        return _zstd.compress(data, level=3)
-    return _zstd_cli_run(["-3", "-q", "-c"], data)
+        return _zstd.compress(data, options=_zstd_options(len(data)))
+    workers = _ZSTD_WORKERS if len(data) >= (1 << 20) else 1
+    return _zstd_cli_run(["-3", "-q", f"-T{workers}", "-c"], data)
 
 
 def _zstd_compress_file(src, dst):
+    size = os.path.getsize(src)
     if _zstd is not None:
         with open(src, "rb") as fin:
-            with _zstd.ZstdFile(dst, "w", level=3) as fout:
+            with _zstd.ZstdFile(dst, "w", options=_zstd_options(size)) as fout:
                 shutil.copyfileobj(fin, fout, length=1024 * 1024)
     else:
-        _zstd_cli_run(["-3", "-q", "-f", "-o", dst, src])
+        workers = _ZSTD_WORKERS if size >= (1 << 20) else 1
+        _zstd_cli_run(["-3", "-q", "-f", f"-T{workers}", "-o", dst, src])
 
 
 def _pick_encoding(accept_header):
