@@ -177,6 +177,14 @@ union of both sides. A cracked verdict only changes when a client runs an
 explicit cracked or whitelist login probe; ordinary re-sights never
 overwrite it.
 
+Full downloads use `GET /api/db`: the server makes a consistent compact
+snapshot with `VACUUM INTO` and streams the SQLite file itself, compressed
+with zstd when available (Python 3.14+ `compression.zstd` or a `zstd` CLI),
+otherwise gzip. That skips the row-by-row merge path entirely.
+`mcscan.py --download-db` uses it when available (and falls back to normal
+row sync on older servers); `--sync` uses it automatically when the local
+DB is missing or empty. JSON sync responses use the same zstd/gzip choice.
+
 Security: every `/api/*` endpoint requires auth — unauthenticated reads and
 writes get 401 and reveal nothing. Clients sign requests with HMAC-SHA256
 (the token itself never travels on the wire; plain `Bearer` is also accepted
@@ -219,7 +227,7 @@ hostnames). Run it from the same working directory as the GUI so it
 shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
 
     python mcscan.py --init-db URL TOKEN    # save shared-DB creds to netdb.json
-    python mcscan.py --sync                  # sync shared DB (netdb.json creds)
+    python mcscan.py --sync                  # sync shared DB (auto-full-download if local DB is missing)
     python mcscan.py --download-db           # replace local DB with the full shared DB
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
@@ -240,11 +248,14 @@ waiting for them, skips the end-of-scan sync, and a second Ctrl-C forces
 an immediate exit. The GUI behaves the same (closing the window also
 stops in-flight scans).
 
-`--download-db` pages through every row on the shared DB using its `seq`
-cursor, replaces the local `servers` table with exactly those rows, and
-updates `netdb.json`'s `last_seq` watermark. Use it to seed a new machine
-or recover a local DB that was deleted or got out of sync; a normal
-`--sync` afterwards is then an incremental no-op.
+`--download-db` asks the shared server for a direct SQLite snapshot
+(`GET /api/db`, compacted with `VACUUM INTO`) and installs it as the local
+`servers.db`, then updates `netdb.json`'s `last_seq` watermark. Older
+servers without that endpoint fall back to paging every row by `seq`. Use it
+to seed a new machine or recover a local DB that was deleted or got out of
+sync; a normal `--sync` afterwards is then an incremental no-op. `--sync`
+itself performs this full download automatically when the local DB is
+missing or empty, then continues with the normal incremental sync.
 
 #### Continuous mode
 

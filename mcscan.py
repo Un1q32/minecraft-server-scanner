@@ -92,22 +92,42 @@ def cmd_init_db(url, token):
     return 0
 
 def cmd_download_db():
-    """Download every shared-DB row and replace the local servers table."""
+    """Download the shared DB (direct file when available) and install it."""
     url, token = _sync_creds()
     if not url or not token:
         print("error: netdb.json has no URL/token yet -- run "
               "'mcscan.py --init-db URL TOKEN' first.")
         return 2
     print(f"downloading shared DB at {url} ...", flush=True)
+
+    def _size(value):
+        value = max(0, int(value or 0))
+        if value >= 1024 * 1024:
+            return f"{value / (1024 * 1024):.1f} MB"
+        if value >= 1024:
+            return f"{value / 1024:.0f} KB"
+        return f"{value} B"
+
+    def progress(done, total):
+        if total:
+            pct = min(100, done * 100 // total)
+            print(f"\r  {pct}% ({_size(done)}/{_size(total)})",
+                  end="", flush=True)
+        else:
+            print(f"\r  {_size(done)}", end="", flush=True)
+
     try:
-        rows, max_seq, now = scanner.netdb_download_all(url, token)
+        try:
+            count, max_seq, now = scanner.netdb_download_file(
+                url, token, progress=progress)
+            print()
+        except scanner.NetdbDirectDownloadUnsupported:
+            print("\nserver has no direct DB download; using row sync ...",
+                  flush=True)
+            rows, max_seq, now = scanner.netdb_download_all(url, token)
+            count = scanner.netdb_replace_all(rows)
     except Exception as exc:
-        print(f"error: download failed: {exc}", flush=True)
-        return 1
-    try:
-        count = scanner.netdb_replace_all(rows)
-    except Exception as exc:
-        print(f"error: could not replace local DB: {exc}", flush=True)
+        print(f"\nerror: download failed: {exc}", flush=True)
         return 1
     scanner.netdb_save_config(url, token, now, max_seq)
     print(f"download complete: {count} server(s), last_seq={max_seq}",
@@ -122,6 +142,12 @@ def cmd_sync():
         print("error: netdb.json has no URL/token yet -- run "
               "'mcscan.py --init-db URL TOKEN' first.")
         return 2
+    if not scanner.netdb_local_db_ready():
+        print("local DB missing or empty; downloading it first ...",
+              flush=True)
+        rc = cmd_download_db()
+        if rc:
+            return rc
     print(f"syncing shared DB at {url} ...")
     try:
         summary = scanner.netdb_sync_once(url, token)

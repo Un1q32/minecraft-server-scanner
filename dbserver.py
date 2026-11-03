@@ -45,7 +45,15 @@ Security model (deliberately simple for non-technical users):
 
 Protocol
 --------
+JSON replies are zstd- or gzip-compressed when the request advertises them
+(zstd uses Python 3.14+ `compression.zstd`, else the `zstd` CLI when present;
+gzip is the fallback).
+
 * ``GET  /api/health``               -> ``{"ok": true, "servers": N, "format": 2, "now": T}``
+* ``GET  /api/db``                   -> consistent compact SQLite snapshot
+  (the whole database file, optionally zstd/gzip-compressed); the client
+  derives row count/seq/format by opening it.  Used by
+  ``mcscan.py --download-db``.
 * ``GET  /api/servers?since=<ts>``   -> ``{"servers": [...], "now": T, "total": N}``
 * ``POST /api/continuous`` ``{"node": "<id>"}``
   registers a continuous scanner for automatic sharding and returns its
@@ -78,9 +86,10 @@ Row shape (mirrors the client's ``servers.db``)::
 
 Merge rule (both directions): ``first_seen`` = oldest non-zero,
 ``last_seen`` = newest, mutable display fields (motd/players/version/...)
-come from whichever side saw the server most recently, and a confirmed
-cracked verdict (``Yes`` / ``Yes (cached)``) is never downgraded by a plain
-status ping.  ``times_seen`` = max + 1 when the incoming sighting is newer.
+come from whichever side saw the server most recently, and a cracked
+verdict only changes when a client runs an explicit cracked check or
+whitelist probe; a plain status ping never changes an existing verdict.
+``times_seen`` = max + 1 when the incoming sighting is newer.
 ``players_now`` follows the newer sighting; ``players_ever`` is the union
 of both sides (capped at 500 names per server).
 
@@ -88,6 +97,11 @@ Stdlib only -- no pip dependencies.
 """
 
 import argparse
+import gzip
+try:
+    from compression import zstd as _zstd   # Python 3.14+
+except ImportError:
+    _zstd = None
 import hashlib
 import hmac
 import ipaddress
@@ -96,9 +110,12 @@ import math
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -612,6 +629,47 @@ def _prune_nonces():
                 _seen_nonces.pop(k, None)
 
 
+_ZSTD_CLI = shutil.which("zstd")
+
+
+def _zstd_available():
+    return _zstd is not None or bool(_ZSTD_CLI)
+
+
+def _zstd_cli_run(args, data=None):
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(
+        [_ZSTD_CLI] + args, input=data, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, check=True, timeout=60, **kwargs).stdout
+
+
+def _zstd_compress_bytes(data):
+    if _zstd is not None:
+        return _zstd.compress(data, level=3)
+    return _zstd_cli_run(["-3", "-q", "-c"], data)
+
+
+def _zstd_compress_file(src, dst):
+    if _zstd is not None:
+        with open(src, "rb") as fin:
+            with _zstd.ZstdFile(dst, "w", level=3) as fout:
+                shutil.copyfileobj(fin, fout, length=1024 * 1024)
+    else:
+        _zstd_cli_run(["-3", "-q", "-f", "-o", dst, src])
+
+
+def _pick_encoding(accept_header):
+    """Best response compression this Python/host and the client both support."""
+    accept = (accept_header or "").lower()
+    if _zstd_available() and "zstd" in accept:
+        return "zstd"
+    if "gzip" in accept:
+        return "gzip"
+    return None
+
+
 def check_auth(handler, body, token):
     """Validate Bearer or HMAC auth. Returns (ok, scheme)."""
     if not token:
@@ -674,9 +732,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, code, obj):
         raw = json.dumps(obj).encode("utf-8")
+        encoding = _pick_encoding(self.headers.get("Accept-Encoding"))
+        if len(raw) >= 1024 and encoding:
+            try:
+                if encoding == "zstd":
+                    raw = _zstd_compress_bytes(raw)
+                else:
+                    raw = gzip.compress(raw, 6)
+            except Exception:
+                if encoding == "zstd":
+                    try:
+                        raw = gzip.compress(raw, 6)
+                        encoding = "gzip"
+                    except Exception:
+                        encoding = None
+                else:
+                    encoding = None
+        else:
+            encoding = None
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.end_headers()
         try:
             self.wfile.write(raw)
@@ -735,6 +814,82 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(raw)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            return
+        if parsed.path == "/api/db":
+            if not self._require_auth(b""):
+                return
+            tmp = gz_tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(
+                    prefix=".mc-netdb-", suffix=".sqlite3",
+                    dir=os.path.dirname(self.server.db_path) or None)
+                os.close(fd)
+                os.unlink(tmp)
+                # VACUUM INTO gives a consistent, compact snapshot (it reads
+                # through the WAL) without the client doing row-by-row sync.
+                with _db_lock:
+                    src = db_connect(self.server.db_path)
+                    try:
+                        src.execute("VACUUM INTO ?", (tmp,))
+                    finally:
+                        src.close()
+                    try:
+                        os.chmod(tmp, 0o600)
+                    except OSError:
+                        pass
+                payload = tmp
+                encoding = _pick_encoding(self.headers.get("Accept-Encoding"))
+                if encoding:
+                    try:
+                        suffix = (".sqlite3.zst" if encoding == "zstd"
+                                  else ".sqlite3.gz")
+                        fd, gz_tmp = tempfile.mkstemp(
+                            prefix=".mc-netdb-", suffix=suffix,
+                            dir=os.path.dirname(self.server.db_path) or None)
+                        os.close(fd)
+                        if encoding == "zstd":
+                            _zstd_compress_file(tmp, gz_tmp)
+                        else:
+                            with open(tmp, "rb") as fin, open(gz_tmp, "wb") as fout:
+                                with gzip.GzipFile(fileobj=fout, mode="wb",
+                                                   compresslevel=6, mtime=0) as gz:
+                                    shutil.copyfileobj(fin, gz, length=1024 * 1024)
+                        payload = gz_tmp
+                    except Exception:
+                        if gz_tmp:
+                            try:
+                                os.unlink(gz_tmp)
+                            except OSError:
+                                pass
+                            gz_tmp = None
+                        payload = tmp
+                        encoding = None
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(os.path.getsize(payload)))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="netdb.sqlite3"')
+                self.send_header("Cache-Control", "no-store")
+                if encoding:
+                    self.send_header("Content-Encoding", encoding)
+                    self.send_header("Vary", "Accept-Encoding")
+                self.end_headers()
+                with open(payload, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                try:
+                    self._send_json(500, {"error": f"db snapshot failed: {exc}"})
+                except Exception:
+                    pass
+            finally:
+                for path in (gz_tmp, tmp):
+                    if path:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
             return
         if parsed.path in ("/api/health", "/api/servers"):
             if not self._require_auth(b""):

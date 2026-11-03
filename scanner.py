@@ -8,6 +8,11 @@ except ImportError:
     shodan = None
 import codecs
 import bisect
+import gzip
+try:
+    from compression import zstd as _zstd   # Python 3.14+
+except ImportError:
+    _zstd = None
 import socket
 import struct
 import json
@@ -958,6 +963,29 @@ NETDB_MAX_UPLOAD = 20000
 # at most this many rows, so big first-sync downloads page through it.
 NETDB_PAGE_SIZE = 50000
 NETDB_MAX_ROUNDS = 500
+NETDB_DOWNLOAD_TIMEOUT = 120
+_ZSTD_CLI = shutil.which("zstd")
+_HAS_ZSTD = _zstd is not None or bool(_ZSTD_CLI)
+NETDB_ACCEPT_ENCODING = "zstd, gzip" if _HAS_ZSTD else "gzip"
+
+
+def _zstd_decompress(data):
+    if _zstd is not None:
+        return _zstd.decompress(data)
+    if _ZSTD_CLI:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return subprocess.run(
+            [_ZSTD_CLI, "-d", "-q", "-c"], input=data,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+            timeout=60, **kwargs).stdout
+    raise ConnectionError(
+        "server sent zstd but neither compression.zstd nor the zstd CLI is available")
+
+
+class NetdbDirectDownloadUnsupported(ConnectionError):
+    """The server has no /api/db endpoint; fall back to row sync."""
 
 
 def netdb_load_config():
@@ -1013,16 +1041,23 @@ def _netdb_request(url, token, method="GET", payload=None, timeout=None):
     if parsed.query:
         path += "?" + parsed.query
     headers = {"User-Agent": "MC-Scanner",
-               "Content-Type": "application/json"}
+               "Content-Type": "application/json",
+               "Accept-Encoding": NETDB_ACCEPT_ENCODING}
     headers.update(_netdb_auth_headers(method, path, body, token))
     req = urllib.request.Request(url, data=body if method != "GET" else None,
                                  headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+            raw = resp.read()
+            encoding = (resp.headers.get("Content-Encoding") or "").lower()
+            if encoding == "zstd":
+                raw = _zstd_decompress(raw)
+            elif encoding == "gzip":
+                raw = gzip.decompress(raw)
             if resp.status == 429:
                 raise ConnectionError("server throttled us (too many bad logins?)")
-            return json.loads(raw) if raw else {}
+            text = raw.decode("utf-8")
+            return json.loads(text) if text else {}
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             raise ConnectionError("rejected: wrong token?")
@@ -1365,6 +1400,188 @@ def netdb_download_all(url, token, timeout=None):
     return list(rows.values()), max_seq, now
 
 
+def netdb_local_db_ready():
+    """True when the local DB exists and has at least one server row."""
+    import sqlite3
+    try:
+        if (not os.path.exists(SERVERS_DB_FILE)
+                or os.path.getsize(SERVERS_DB_FILE) == 0):
+            return False
+        con = sqlite3.connect(SERVERS_DB_FILE, timeout=2)
+        try:
+            if not con.execute(
+                    "SELECT 1 FROM sqlite_master"
+                    " WHERE type='table' AND name='servers'").fetchone():
+                return False
+            return con.execute("SELECT 1 FROM servers LIMIT 1").fetchone() is not None
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
+def _prepare_downloaded_db(path):
+    """Turn a server-schema DB into a local scanner DB. Returns (rows, max_seq)."""
+    import sqlite3
+    con = sqlite3.connect(path, timeout=10)
+    try:
+        con.row_factory = sqlite3.Row
+        db_format.ensure_format(con)
+        cols = {str(r[1]) for r in con.execute("PRAGMA table_info(servers)")}
+        if not cols:
+            raise ConnectionError("downloaded database has no servers table")
+        if "needs_sync" not in cols:
+            con.execute(
+                "ALTER TABLE servers ADD COLUMN needs_sync INTEGER DEFAULT 0")
+        con.execute("UPDATE servers SET needs_sync=0")
+        max_seq = 0
+        if "seq" in cols:
+            max_seq = int(con.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM servers").fetchone()[0] or 0)
+            try:
+                # The local schema does not need the server-only change cursor.
+                con.execute("DROP INDEX IF EXISTS idx_servers_seq")
+                con.execute("ALTER TABLE servers DROP COLUMN seq")
+            except Exception:
+                pass
+        con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen "
+                    "ON servers(last_seen DESC)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_servers_version "
+                    "ON servers(version)")
+        con.commit()
+        try:
+            con.execute("VACUUM")
+        except Exception:
+            pass
+        rows = int(con.execute(
+            "SELECT COUNT(*) FROM servers").fetchone()[0] or 0)
+        quick = con.execute("PRAGMA quick_check").fetchone()
+        if quick and str(quick[0]).lower() != "ok":
+            raise ConnectionError(
+                f"downloaded database failed quick_check: {quick[0]}")
+        return rows, max_seq
+    finally:
+        con.close()
+
+
+def netdb_download_file(url, token, progress=None, timeout=None):
+    """Download the server's SQLite DB directly, install it, return (rows, seq, now).
+
+    The server compacts a consistent snapshot with VACUUM INTO.  This avoids
+    the row-by-row merge path entirely for machines that need a full DB.
+    """
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        raise ConnectionError("enter the shared-DB URL and token first")
+    timeout = timeout or NETDB_DOWNLOAD_TIMEOUT
+    target = os.path.abspath(SERVERS_DB_FILE)
+    target_dir = os.path.dirname(target) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".servers-db-download-", dir=target_dir)
+    os.close(fd)
+    now = time.time()
+    try:
+        parsed = urllib.parse.urlparse(url + "/api/db")
+        path = parsed.path or "/api/db"
+        if parsed.query:
+            path += "?" + parsed.query
+        headers = {
+            "User-Agent": "MC-Scanner",
+            "Accept-Encoding": NETDB_ACCEPT_ENCODING,
+        }
+        headers.update(_netdb_auth_headers("GET", path, b"", token))
+        req = urllib.request.Request(url + "/api/db", headers=headers,
+                                     method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(resp.headers.get("Date") or "")
+                now = dt.timestamp()
+            except Exception:
+                pass
+            try:
+                total = int(resp.headers.get("Content-Length") or 0)
+            except Exception:
+                total = 0
+            encoding = (resp.headers.get("Content-Encoding") or "").lower()
+            if encoding == "zstd" and not _HAS_ZSTD:
+                raise ConnectionError(
+                    "server sent zstd but neither compression.zstd nor the zstd CLI is available")
+            compressed = encoding in ("gzip", "zstd")
+            done = 0
+            with open(tmp, "wb") as f:
+                if compressed:
+                    # Compressed payloads are much smaller; buffer the wire
+                    # bytes so the decoder can verify its checksum first.
+                    buf = bytearray()
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        done += len(chunk)
+                        if progress is not None:
+                            try:
+                                progress(done, total)
+                            except Exception:
+                                pass
+                    if encoding == "zstd":
+                        f.write(_zstd_decompress(buf))
+                    else:
+                        f.write(gzip.decompress(buf))
+                else:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if progress is not None:
+                            try:
+                                progress(done, total)
+                            except Exception:
+                                pass
+        if total and done != total:
+            raise ConnectionError("database download was truncated")
+        rows, max_seq = _prepare_downloaded_db(tmp)
+        with _SERVER_DB_LOCK:
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.unlink(target + suffix)
+                except FileNotFoundError:
+                    pass
+            os.replace(tmp, target)
+            tmp = None
+        try:
+            init_server_db()
+        except Exception:
+            pass
+        _notify_server_db_tab()
+        return rows, max_seq, now
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 405):
+            raise NetdbDirectDownloadUnsupported(
+                "server does not expose /api/db") from exc
+        if exc.code == 401:
+            raise ConnectionError("rejected: wrong token?") from exc
+        if exc.code == 429:
+            raise ConnectionError(
+                "throttled: too many failed logins, wait a minute") from exc
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            detail = ""
+        raise ConnectionError(
+            f"HTTP {exc.code}{(': ' + detail) if detail else ''}") from exc
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def netdb_replace_all(rows):
     """Replace the local servers table with exactly the supplied rows."""
     _ensure_server_db()
@@ -1450,6 +1667,18 @@ def netdb_sync_once(url, token, timeout=None):
     token = (token or "").strip()
     if not url or not token:
         raise ConnectionError("enter the shared-DB URL and token first")
+    if not netdb_local_db_ready():
+        # A missing/empty local DB can't be repaired incrementally: the
+        # last_seq cursor would only fetch later changes.  Seed it from the
+        # full DB first (direct file when the server supports it).
+        print("local DB missing or empty; downloading full DB first ...",
+              flush=True)
+        try:
+            _rows, _max_seq, _now = netdb_download_file(url, token)
+        except NetdbDirectDownloadUnsupported:
+            _rows, _max_seq, _now = netdb_download_all(url, token)
+            netdb_replace_all(_rows)
+        netdb_save_config(url, token, _now, _max_seq)
     cfg = netdb_load_config()
     since = cfg.get("last_sync", 0) or 0
     last_seq = cfg.get("last_seq", 0) or 0
