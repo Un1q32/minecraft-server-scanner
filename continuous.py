@@ -827,12 +827,14 @@ class ShardManager:
             return self._shard
 
     def drain_messages(self):
-        """End-of-round output: errors plus one line if the peer count changed.
+        """Round-start output: errors plus one line if the peer count changed.
 
         Heartbeats may see a peer expire and re-register within a long round.
         Only the final total is reported, and only when it differs from the
         last reported total, so transient membership flaps do not produce a
-        misleading 0-peer line after every round.
+        misleading 0-peer line after every round. Printing at the start of
+        the next round makes the first peer count visible immediately when a
+        node starts instead of after its first (possibly long) scan.
         """
         with self._lock:
             messages = list(self._messages)
@@ -964,6 +966,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
             body = bodies[rounds % len(bodies)]
             rounds += 1
             print(f"\n=== round {rounds} ({body}) {time.strftime('%H:%M:%S')} ===")
+            if shard_manager:
+                for message in shard_manager.drain_messages():
+                    print(f"  {message}", flush=True)
             before_rows = _known_rows()
             before = {}
             for row in before_rows:
@@ -1060,10 +1065,6 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                               * 3600.0 / (elapsed + 30.0))
                 print(f"  score for {name}: {score}")
                 picker.update(name, score)
-
-            if shard_manager:
-                for message in shard_manager.drain_messages():
-                    print(f"  {message}", flush=True)
 
             now = _now()
             if (sync_every and not stop_event.is_set()
