@@ -415,6 +415,7 @@ pub fn add_note(servers_path: &str, ip: &str, text: &str) -> Result<String, Stri
     let con = Connection::open(&path).map_err(|e| format!("cannot open notes DB: {e}"))?;
     con.busy_timeout(std::time::Duration::from_millis(3000))
         .map_err(|e| e.to_string())?;
+    let _ = con.execute_batch("PRAGMA secure_delete=ON;");
     ensure_notes_schema(&con)?;
     let note_id = new_note_id();
     let now = unix_now();
@@ -435,6 +436,7 @@ pub fn delete_note(servers_path: &str, note_id: &str) -> Result<bool, String> {
     let con = Connection::open(&path).map_err(|e| format!("cannot open notes DB: {e}"))?;
     con.busy_timeout(std::time::Duration::from_millis(3000))
         .map_err(|e| e.to_string())?;
+    let _ = con.execute_batch("PRAGMA secure_delete=ON;");
     ensure_notes_schema(&con)?;
     let changed = con
         .execute(
@@ -443,6 +445,9 @@ pub fn delete_note(servers_path: &str, note_id: &str) -> Result<bool, String> {
             rusqlite::params![unix_now(), note_id],
         )
         .map_err(|e| e.to_string())?;
+    if changed > 0 {
+        let _ = con.execute("VACUUM", []);
+    }
     drop(con);
     restrict_note_permissions(&path);
     Ok(changed > 0)

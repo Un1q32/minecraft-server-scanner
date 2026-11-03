@@ -341,8 +341,17 @@ def init_db(db_path):
         con.close()
 
 
-def init_notes_db(db_path):
+def notes_db_connect(db_path):
     con = db_connect(db_path)
+    try:
+        con.execute("PRAGMA secure_delete=ON")
+    except Exception:
+        pass
+    return con
+
+
+def init_notes_db(db_path):
+    con = notes_db_connect(db_path)
     try:
         con.execute(NOTES_SCHEMA)
         con.execute("CREATE INDEX IF NOT EXISTS idx_notes_seq "
@@ -350,6 +359,11 @@ def init_notes_db(db_path):
         con.execute("CREATE INDEX IF NOT EXISTS idx_notes_ip "
                     "ON notes(ip_port)")
         con.commit()
+        # Reclaim any text left behind by tombstones or old deletes.
+        try:
+            con.execute("VACUUM")
+        except Exception:
+            pass
     finally:
         con.close()
     try:
@@ -1141,9 +1155,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             since_seq = _clamp_seq(payload.get("since_seq", 0) or 0) or 0
             merged = 0
+            deleted = 0
             uploaded_ids = set()
             with _db_lock:
-                con = db_connect(self.server.notes_db_path)
+                con = notes_db_connect(self.server.notes_db_path)
                 try:
                     for raw_note in incoming:
                         note = sanitize_note(raw_note)
@@ -1153,9 +1168,18 @@ class Handler(BaseHTTPRequestHandler):
                         try:
                             if merge_note(con, note):
                                 merged += 1
+                                if note["text"] is None:
+                                    deleted += 1
                         except Exception:
                             continue
                     con.commit()
+                    if deleted:
+                        # Tombstones are small; VACUUM drops the old text
+                        # payload and shrinks the notes file immediately.
+                        try:
+                            con.execute("VACUUM")
+                        except Exception:
+                            pass
                     con.row_factory = sqlite3.Row
                     cur = con.execute(
                         "SELECT * FROM notes WHERE seq > ?"

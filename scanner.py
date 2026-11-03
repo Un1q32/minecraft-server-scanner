@@ -879,6 +879,10 @@ def _notes_db_connect():
     con = sqlite3.connect(NOTES_DB_FILE, timeout=10)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    try:
+        con.execute("PRAGMA secure_delete=ON")
+    except Exception:
+        pass
     return con
 
 
@@ -952,6 +956,11 @@ def delete_server_note(note_id):
                 " WHERE id=? AND text IS NOT NULL", (now, note_id))
             con.commit()
             changed = cur.rowcount > 0
+            if changed:
+                try:
+                    con.execute("VACUUM")
+                except Exception:
+                    pass
         finally:
             con.close()
     if changed:
@@ -2106,6 +2115,7 @@ def notes_merge_remote(notes):
     _ensure_notes_db()
     import sqlite3
     inserted = updated = 0
+    deleted = 0
     now = time.time()
     with _NOTES_DB_LOCK:
         con = _notes_db_connect()
@@ -2137,6 +2147,7 @@ def notes_merge_remote(notes):
                         (max(note["updated_at"], float(old_updated or 0)),
                          note["id"]))
                     updated += 1
+                    deleted += 1
                 elif note["text"] != old_text:
                     # The server's first-written copy is authoritative.
                     con.execute(
@@ -2146,6 +2157,11 @@ def notes_merge_remote(notes):
                          note["id"]))
                     updated += 1
             con.commit()
+            if deleted:
+                try:
+                    con.execute("VACUUM")
+                except Exception:
+                    pass
         finally:
             con.close()
     if inserted or updated:
@@ -2174,6 +2190,10 @@ def notes_replace_all(notes):
                      note["created_at"], note["updated_at"]))
                 inserted += 1
             con.commit()
+            try:
+                con.execute("VACUUM")
+            except Exception:
+                pass
         except Exception:
             try:
                 con.rollback()
