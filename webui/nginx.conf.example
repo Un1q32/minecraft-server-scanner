@@ -1,13 +1,18 @@
-# Example nginx site for the local web UI.
+# Static nginx site for the web DB viewer.
 #
-# Run the app on loopback only:
-#   python webui/webui.py --host 127.0.0.1 --port 8080 --no-browser
+# There is no Python process. Nginx serves:
+#   - webui/static/index.html, app.js, style.css, core.js, core.wasm
+#   - the live servers.db and servers.db-wal directly from disk
 #
-# Replace db.example.com and the certificate paths.
-# Install with:
+# Notes are not part of the web viewer and are not served here.
+#
+# Adjust the static root and the two aliases below, then install:
 #   sudo cp webui/nginx.conf.example /etc/nginx/sites-available/mc-webui
 #   sudo ln -s /etc/nginx/sites-available/mc-webui /etc/nginx/sites-enabled/
 #   sudo nginx -t && sudo systemctl reload nginx
+#
+# The nginx worker user must be able to read the static directory and both
+# database files, and traverse every parent directory.
 
 server {
     listen 80;
@@ -23,60 +28,47 @@ server {
     ssl_certificate     /etc/letsencrypt/live/db.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/db.example.com/privkey.pem;
 
-    # No application auth is implemented. Keep the Python server on
-    # 127.0.0.1; add nginx auth here if the hostname is not LAN-only.
+    # No application authentication: this serves the public servers DB only.
+    # Add Basic auth or allow/deny here if the hostname is not LAN-only.
 
-    # Simplest setup: let the Python server send both the page and the
-    # snapshot. Nginx provides TLS and timeouts.
+    root /home/uniq/devel/minecraft-server-scanner/webui/static;
+    index index.html;
+
+    # Keep these explicit so a minimal nginx without mime.types still serves
+    # the WASM module and scripts correctly.
+    types {
+        text/html html htm;
+        text/css css;
+        text/javascript js;
+        application/wasm wasm;
+        application/json json;
+        application/octet-stream db;
+    }
+
+    add_header X-Content-Type-Options nosniff always;
+
+    # The live SQLite database. Point the alias at the real path (or a
+    # symlink to netdb.sqlite3). Cache-Control prevents the browser reusing
+    # an old copy after a scan.
+    location = /servers.db {
+        alias /home/uniq/devel/minecraft-server-scanner/servers.db;
+        default_type application/octet-stream;
+        gzip off;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+    }
+
+    # SQLite's WAL sidecar. A 404 is normal when the WAL has been
+    # checkpointed or the database is idle; the viewer handles it.
+    location = /servers.db-wal {
+        alias /home/uniq/devel/minecraft-server-scanner/servers.db-wal;
+        default_type application/octet-stream;
+        gzip off;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+    }
+
     location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Stream the ~30 MB database snapshot instead of buffering it first.
-        proxy_buffering off;
+        try_files $uri $uri/ =404;
     }
 }
-
-# ---------------------------------------------------------------------------
-# Optional: let nginx serve the small static files directly. This avoids
-# copying 1 MB of JS/WASM through Python, but nginx needs read access to
-# webui/static (and execute permission on each parent directory).
-#
-# server {
-#     listen 443 ssl;
-#     http2 on;
-#     server_name db.example.com;
-#     ssl_certificate     /etc/letsencrypt/live/db.example.com/fullchain.pem;
-#     ssl_certificate_key /etc/letsencrypt/live/db.example.com/privkey.pem;
-#
-#     root /home/uniq/devel/minecraft-server-scanner/webui/static;
-#     index index.html;
-#     # Explicit types so a minimal nginx config without mime.types still
-#     # executes core.js/app.js and streams core.wasm correctly.
-#     types {
-#         text/html html;
-#         text/css css;
-#         text/javascript js;
-#         application/wasm wasm;
-#     }
-#
-#     location ~ ^/servers\.db(-wal)?$ {
-#         proxy_pass http://127.0.0.1:8080;
-#         proxy_set_header Host $host;
-#         proxy_buffering off;
-#         add_header Cache-Control "no-store" always;
-#     }
-#
-#     location /api/ {
-#         proxy_pass http://127.0.0.1:8080;
-#         proxy_set_header Host $host;
-#     }
-#
-#     location / {
-#         try_files $uri $uri/ =404;
-#     }
-# }

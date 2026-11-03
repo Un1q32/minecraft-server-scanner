@@ -197,7 +197,7 @@ stores a permanent `text=NULL` tombstone, and a stale client cannot edit or
 resurrect a stored note. A server can have any number of notes.
 `mcscan.py --sync` always syncs both databases; `--download-db` downloads
 both. Notes appear in the Rust viewer's detail pane and in the Python
-viewer's Notes column/button, but never in the unauthenticated web viewer.
+viewer's Notes column/button; the static web viewer does not serve notes.
 
 Security: every `/api/*` endpoint requires auth — unauthenticated reads and
 writes get 401 and reveal nothing. Clients sign requests with HMAC-SHA256
@@ -498,34 +498,25 @@ in `mc_accounts.json`, exactly like the GUI's Check Whitelist button.
 ## Web DB viewer (`webui`)
 
 A browser UI for the same `servers.db`, for when you want the table without
-launching Qt. It is read-only: there is no Open DB picker, no whitelist
-recheck, and no scan/sync action. **Refresh** just reloads `servers.db` from
-disk, so it picks up changes written by a scanner running elsewhere. The 11
-server columns, numeric version/IP sorting, stacked sort keys, search
-language, detail pane and Copy IP(s) all match the Rust viewer's table.
-Notes are intentionally not shown here: the web UI has no token
-authentication, so it only sees the public servers DB.
+launching Qt. It is a static site: nginx serves `webui/static/` plus the live
+`servers.db` and `servers.db-wal` directly. There is no Python process.
 
-    python webui/webui.py
-    python webui/webui.py --db /path/to/servers.db --port 8080
-    python webui/webui.py --no-browser
+It is read-only: there is no Open DB picker, no whitelist recheck, and no
+scan/sync action. **Refresh** reloads `servers.db` from disk, so it picks up
+changes written by a scanner running elsewhere. The 11 server columns,
+numeric version/IP sorting, stacked sort keys, search language, detail pane
+and Copy IP(s) all match the Rust viewer's table. Notes are intentionally not
+served here.
 
-It binds to `127.0.0.1` by default. HTTPS is enabled with
-`--tls-cert cert.pem --tls-key privkey.pem`, or by dropping those two files
-in the working directory; otherwise it serves plain HTTP. Use a
-trusted/real certificate because browsers will warn about self-signed ones.
-The Python server serves the existing `servers.db` directly (plus its
-`servers.db-wal` sidecar if present); the page loads that
-data into `webui/static/core.wasm`, a small Emscripten/SQLite build, so
-filtering, sorting and formatting run in the browser. A 120k-row database
-opens in roughly 100-170 ms and sorts in roughly 60-110 ms on a desktop.
-The table is virtualized: only the visible rows are drawn, so scrolling
-stays smooth. Drag the divider on the right edge of a header to resize a
-column; widths persist in the browser.
+The page loads the database into `webui/static/core.wasm`, a small
+Emscripten/SQLite build, so filtering, sorting and formatting run in the
+browser. A 120k-row database opens in roughly 100-170 ms and sorts in roughly
+60-110 ms on a desktop. The table is virtualized: only the visible rows are
+drawn, so scrolling stays smooth. Drag the divider on the right edge of a
+header to resize a column; widths persist in the browser.
 
-`--ports`, scanning and the continuous loop are not part of this UI.
-**Refresh** re-fetches the current database file and re-applies the
-active query and sort. It never starts a scan or a sync.
+**Refresh** re-fetches the current database file and re-applies the active
+query and sort. It never starts a scan or a sync.
 
 The generated WASM is committed. Rebuild it after changing `webui/core.cpp`
 with Emscripten installed:
@@ -538,25 +529,25 @@ works when Emscripten has a frozen cache.
 
 ### Hosting with nginx
 
-Run the app on loopback and let nginx terminate TLS and proxy requests:
-
-    python webui/webui.py --host 127.0.0.1 --port 8080 --no-browser
-
-`webui/nginx.conf.example` is a complete reverse-proxy site (HTTP redirect,
-TLS, and streaming for the database file). `webui/mc-webui.service.example`
-is the matching systemd unit. Basic outline:
+There is no application server to run. `webui/nginx.conf.example` is a
+static site that serves the files and database directly:
 
     sudo cp webui/nginx.conf.example /etc/nginx/sites-available/mc-webui
     sudo ln -s /etc/nginx/sites-available/mc-webui /etc/nginx/sites-enabled/
     sudo certbot --nginx -d db.example.com
     sudo nginx -t && sudo systemctl reload nginx
 
-Use a dedicated hostname (the page fetches `/core.js`, `/servers.db` and
-`/api/*` from the site root). The app has no authentication; keep the Python
-server bound to `127.0.0.1` and, if the hostname is reachable beyond a trusted
-LAN, add your own access control in nginx (Basic auth or `allow`/`deny`).
-The database is tens of MB, so `proxy_buffering off` keeps the first
-load responsive.
+Adjust the `root` and the two `alias` paths in the example to point at
+`webui/static`, `servers.db`, and `servers.db-wal`. The nginx worker user
+must be able to read those files and traverse every parent directory.
+
+Use a dedicated hostname; the page fetches `/core.js`, `/servers.db` and
+`/servers.db-wal` from the site root. There is no authentication, so if the
+hostname is reachable beyond a trusted LAN add nginx Basic auth or an
+`allow`/`deny` rule. WAL serving is best-effort: if the sidecar is absent or
+checkpointed between fetches, the viewer handles the 404, but a concurrent
+SQLite checkpoint can still make a main-file/WAL pair inconsistent.
+
 
 ## Database format
 

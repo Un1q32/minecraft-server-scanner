@@ -566,13 +566,6 @@ async function boot() {
       ip: core.cwrap("mc_ip", "string", ["number"]),
     };
 
-    const info = await fetch(assetUrl("api/info"), { cache: "no-store" })
-      .then((response) => (response.ok ? response.json() : null))
-      .catch(() => null);
-    if (info && info.db_name) {
-      document.title = `MC Server DB — ${info.db_name}`;
-    }
-
     await loadDatabase();
     loadWidths();
     buildHeader();
