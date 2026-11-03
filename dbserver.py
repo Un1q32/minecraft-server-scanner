@@ -1045,7 +1045,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth(b""):
                 return
             self._send_sqlite_snapshot(
-                self.server.db_path, "netdb.sqlite3")
+                self.server.db_path, "servers.db")
             return
         if parsed.path == "/api/notes/db":
             if not self._require_auth(b""):
@@ -1263,7 +1263,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Shared network DB for the MC scanner")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8777)
-    ap.add_argument("--db", default="netdb.sqlite3")
+    ap.add_argument("--db", default="servers.db")
     ap.add_argument("--notes-db", default="",
                     help="separate notes database (default: <db>-notes.sqlite3)")
     ap.add_argument("--token", default="",
