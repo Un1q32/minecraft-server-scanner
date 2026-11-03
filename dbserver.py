@@ -1051,7 +1051,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth(b""):
                 return
             self._send_sqlite_snapshot(
-                self.server.notes_db_path, "netdb-notes.sqlite3")
+                self.server.notes_db_path, "notes.db")
             return
         if parsed.path in ("/api/health", "/api/servers"):
             if not self._require_auth(b""):
