@@ -157,6 +157,9 @@ except Exception:
 
 SHODAN_KEY_PATH = os.path.join(os.getcwd(), "shodan_key.txt")
 SERVERS_DB_FILE = "servers.db"
+NOTES_DB_FILE = "notes.db"
+MAX_NOTE_CHARS = 4000
+MAX_NOTES_PER_SYNC = 2000
 TIMEOUT = 3
 PROTOCOL_VERSION = 772
 MAX_WORKERS = 100
@@ -210,6 +213,7 @@ MAX_VARINT_VALUE = 0x7FFFFFFF
 _CRACKED_CACHE_LOCK = threading.Lock()
 _WHITELIST_LOG_LOCK = threading.Lock()
 _SERVER_DB_LOCK = threading.Lock()
+_NOTES_DB_LOCK = threading.Lock()
 
 # Cooperative shutdown. Ctrl+C / SIGTERM / window close sets this so that
 # (a) probes bail between steps instead of finishing every queued target,
@@ -856,6 +860,136 @@ def delete_servers_from_db(ip_ports):
     _notify_server_db_tab()
 
 
+NOTES_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS notes ("
+    " id TEXT PRIMARY KEY,"
+    " ip_port TEXT NOT NULL,"
+    " text TEXT,"
+    " created_at REAL DEFAULT 0,"
+    " updated_at REAL DEFAULT 0,"
+    " needs_sync INTEGER DEFAULT 1"
+    ")"
+)
+
+_NOTES_DB_INITIALIZED = set()
+
+
+def _notes_db_connect():
+    import sqlite3
+    con = sqlite3.connect(NOTES_DB_FILE, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+
+def init_notes_db():
+    path = os.path.abspath(NOTES_DB_FILE)
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            con.execute(NOTES_SCHEMA)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_notes_ip "
+                        "ON notes(ip_port)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_notes_created "
+                        "ON notes(created_at ASC)")
+            con.commit()
+            _NOTES_DB_INITIALIZED.add(path)
+        finally:
+            con.close()
+    try:
+        os.chmod(NOTES_DB_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _ensure_notes_db():
+    path = os.path.abspath(NOTES_DB_FILE)
+    if path in _NOTES_DB_INITIALIZED and os.path.exists(path):
+        return
+    init_notes_db()
+
+
+def add_server_note(ip_port, text):
+    """Add an immutable note to a server. Returns its new UUID."""
+    _ensure_notes_db()
+    ip = strict_ip_port(ip_port)
+    if not ip:
+        raise ValueError("invalid server ip:port")
+    body = str(text or "").strip()
+    if not body:
+        raise ValueError("note is empty")
+    body = body[:MAX_NOTE_CHARS]
+    note_id = str(uuid.uuid4())
+    now = time.time()
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            con.execute(
+                "INSERT INTO notes (id, ip_port, text, created_at,"
+                " updated_at, needs_sync) VALUES (?, ?, ?, ?, ?, 1)",
+                (note_id, ip, body, now, now),
+            )
+            con.commit()
+        finally:
+            con.close()
+    _notify_server_db_tab()
+    return note_id
+
+
+def delete_server_note(note_id):
+    """Tombstone an existing note. Returns True if it changed anything."""
+    _ensure_notes_db()
+    try:
+        note_id = str(uuid.UUID(str(note_id)))
+    except Exception:
+        return False
+    now = time.time()
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            cur = con.execute(
+                "UPDATE notes SET text=NULL, updated_at=?, needs_sync=1"
+                " WHERE id=? AND text IS NOT NULL", (now, note_id))
+            con.commit()
+            changed = cur.rowcount > 0
+        finally:
+            con.close()
+    if changed:
+        _notify_server_db_tab()
+    return changed
+
+
+def query_server_notes(ip_port, include_deleted=False):
+    """Return notes for one server (active only by default), oldest first."""
+    _ensure_notes_db()
+    import sqlite3
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            sql = ("SELECT id, ip_port, text, created_at, updated_at"
+                   " FROM notes WHERE ip_port=?")
+            if not include_deleted:
+                sql += " AND text IS NOT NULL"
+            sql += " ORDER BY created_at ASC, id ASC"
+            return [dict(r) for r in con.execute(sql, (ip_port,))]
+        finally:
+            con.close()
+
+
+def query_notes_counts():
+    """Active note count per server, for the Servers table."""
+    _ensure_notes_db()
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            return {str(ip): int(n) for ip, n in con.execute(
+                "SELECT ip_port, COUNT(*) FROM notes"
+                " WHERE text IS NOT NULL GROUP BY ip_port")}
+        finally:
+            con.close()
+
+
 def register_server_db_tab(tab):
     global _SERVER_DB_TAB_INSTANCE
     _SERVER_DB_TAB_INSTANCE = tab
@@ -988,33 +1122,52 @@ class NetdbDirectDownloadUnsupported(ConnectionError):
     """The server has no /api/db endpoint; fall back to row sync."""
 
 
+class NetdbEndpointUnsupported(ConnectionError):
+    """The server does not implement this optional endpoint (old version)."""
+
+
 def netdb_load_config():
     try:
         with open(NETDB_CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"url": "", "token": "", "last_sync": 0.0, "last_seq": 0}
+            data = {}
     except Exception:
-        return {"url": "", "token": "", "last_sync": 0.0, "last_seq": 0}
+        data = {}
     try:
         last_seq = int(data.get("last_seq", 0) or 0)
     except Exception:
         last_seq = 0
+    try:
+        last_notes_seq = int(data.get("last_notes_seq", 0) or 0)
+    except Exception:
+        last_notes_seq = 0
     return {
         "url": str(data.get("url", "") or "").strip().rstrip("/"),
         "token": str(data.get("token", "") or "").strip(),
         "last_sync": float(data.get("last_sync", 0) or 0),
         "last_seq": max(0, last_seq),
+        "last_notes_seq": max(0, last_notes_seq),
     }
 
 
-def netdb_save_config(url, token, last_sync=0.0, last_seq=0):
+def netdb_save_config(url=None, token=None, last_sync=None, last_seq=None,
+                      last_notes_seq=None):
+    """Update netdb.json; omitted fields keep their current values."""
+    cfg = netdb_load_config()
+    if url is not None:
+        cfg["url"] = (url or "").strip().rstrip("/")
+    if token is not None:
+        cfg["token"] = (token or "").strip()
+    if last_sync is not None:
+        cfg["last_sync"] = float(last_sync or 0)
+    if last_seq is not None:
+        cfg["last_seq"] = int(last_seq or 0)
+    if last_notes_seq is not None:
+        cfg["last_notes_seq"] = int(last_notes_seq or 0)
     try:
         with open(NETDB_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"url": (url or "").strip().rstrip("/"),
-                       "token": (token or "").strip(),
-                       "last_sync": float(last_sync or 0),
-                       "last_seq": int(last_seq or 0)}, f, indent=2)
+            json.dump(cfg, f, indent=2)
     except Exception:
         pass
 
@@ -1059,6 +1212,9 @@ def _netdb_request(url, token, method="GET", payload=None, timeout=None):
             text = raw.decode("utf-8")
             return json.loads(text) if text else {}
     except urllib.error.HTTPError as exc:
+        if exc.code in (404, 405):
+            raise NetdbEndpointUnsupported(
+                f"server does not expose {path}") from exc
         if exc.code == 401:
             raise ConnectionError("rejected: wrong token?")
         if exc.code == 429:
@@ -1464,26 +1620,63 @@ def _prepare_downloaded_db(path):
         con.close()
 
 
-def netdb_download_file(url, token, progress=None, timeout=None):
-    """Download the server's SQLite DB directly, install it, return (rows, seq, now).
+def _prepare_notes_downloaded_db(path):
+    """Turn a server-schema notes DB into the local notes DB. Returns (rows, max_seq)."""
+    import sqlite3
+    con = sqlite3.connect(path, timeout=10)
+    try:
+        con.execute(NOTES_SCHEMA)
+        cols = {str(r[1]) for r in con.execute("PRAGMA table_info(notes)")}
+        if "needs_sync" not in cols:
+            con.execute(
+                "ALTER TABLE notes ADD COLUMN needs_sync INTEGER DEFAULT 0")
+        con.execute("UPDATE notes SET needs_sync=0")
+        max_seq = 0
+        if "seq" in cols:
+            max_seq = int(con.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM notes").fetchone()[0] or 0)
+            try:
+                con.execute("DROP INDEX IF EXISTS idx_notes_seq")
+                con.execute("ALTER TABLE notes DROP COLUMN seq")
+            except Exception:
+                pass
+        con.execute("CREATE INDEX IF NOT EXISTS idx_notes_ip "
+                    "ON notes(ip_port)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_notes_created "
+                    "ON notes(created_at ASC)")
+        con.commit()
+        try:
+            con.execute("VACUUM")
+        except Exception:
+            pass
+        rows = int(con.execute(
+            "SELECT COUNT(*) FROM notes").fetchone()[0] or 0)
+        quick = con.execute("PRAGMA quick_check").fetchone()
+        if quick and str(quick[0]).lower() != "ok":
+            raise ConnectionError(
+                f"downloaded notes DB failed quick_check: {quick[0]}")
+        return rows, max_seq
+    finally:
+        con.close()
 
-    The server compacts a consistent snapshot with VACUUM INTO.  This avoids
-    the row-by-row merge path entirely for machines that need a full DB.
-    """
+
+def _netdb_download_db(url, token, endpoint, target_file, prepare,
+                       after_install, lock, progress=None, timeout=None):
+    """Shared direct-SQLite download installer."""
     url = (url or "").strip().rstrip("/")
     token = (token or "").strip()
     if not url or not token:
         raise ConnectionError("enter the shared-DB URL and token first")
     timeout = timeout or NETDB_DOWNLOAD_TIMEOUT
-    target = os.path.abspath(SERVERS_DB_FILE)
+    target = os.path.abspath(target_file)
     target_dir = os.path.dirname(target) or "."
     os.makedirs(target_dir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".servers-db-download-", dir=target_dir)
+    fd, tmp = tempfile.mkstemp(prefix=".db-download-", dir=target_dir)
     os.close(fd)
     now = time.time()
     try:
-        parsed = urllib.parse.urlparse(url + "/api/db")
-        path = parsed.path or "/api/db"
+        parsed = urllib.parse.urlparse(url + endpoint)
+        path = parsed.path or endpoint
         if parsed.query:
             path += "?" + parsed.query
         headers = {
@@ -1491,8 +1684,10 @@ def netdb_download_file(url, token, progress=None, timeout=None):
             "Accept-Encoding": NETDB_ACCEPT_ENCODING,
         }
         headers.update(_netdb_auth_headers("GET", path, b"", token))
-        req = urllib.request.Request(url + "/api/db", headers=headers,
+        req = urllib.request.Request(url + endpoint, headers=headers,
                                      method="GET")
+        total = 0
+        done = 0
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             try:
                 from email.utils import parsedate_to_datetime
@@ -1509,11 +1704,10 @@ def netdb_download_file(url, token, progress=None, timeout=None):
                 raise ConnectionError(
                     "server sent zstd but neither compression.zstd nor the zstd CLI is available")
             compressed = encoding in ("gzip", "zstd")
-            done = 0
             with open(tmp, "wb") as f:
                 if compressed:
-                    # Compressed payloads are much smaller; buffer the wire
-                    # bytes so the decoder can verify its checksum first.
+                    # Buffer the wire bytes so the decoder can verify its
+                    # checksum before writing anything.
                     buf = bytearray()
                     while True:
                         chunk = resp.read(1024 * 1024)
@@ -1544,8 +1738,8 @@ def netdb_download_file(url, token, progress=None, timeout=None):
                                 pass
         if total and done != total:
             raise ConnectionError("database download was truncated")
-        rows, max_seq = _prepare_downloaded_db(tmp)
-        with _SERVER_DB_LOCK:
+        prepared = prepare(tmp)
+        with lock:
             for suffix in ("-wal", "-shm"):
                 try:
                     os.unlink(target + suffix)
@@ -1554,15 +1748,15 @@ def netdb_download_file(url, token, progress=None, timeout=None):
             os.replace(tmp, target)
             tmp = None
         try:
-            init_server_db()
+            after_install()
         except Exception:
             pass
         _notify_server_db_tab()
-        return rows, max_seq, now
+        return (*prepared, now)
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 405):
             raise NetdbDirectDownloadUnsupported(
-                "server does not expose /api/db") from exc
+                f"server does not expose {endpoint}") from exc
         if exc.code == 401:
             raise ConnectionError("rejected: wrong token?") from exc
         if exc.code == 429:
@@ -1580,6 +1774,21 @@ def netdb_download_file(url, token, progress=None, timeout=None):
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def netdb_download_file(url, token, progress=None, timeout=None):
+    """Download the server's SQLite DB directly, install it, return (rows, seq, now)."""
+    return _netdb_download_db(
+        url, token, "/api/db", SERVERS_DB_FILE, _prepare_downloaded_db,
+        init_server_db, _SERVER_DB_LOCK, progress=progress, timeout=timeout)
+
+
+def netdb_notes_download_file(url, token, progress=None, timeout=None):
+    """Download the separate notes SQLite DB directly and install it."""
+    return _netdb_download_db(
+        url, token, "/api/notes/db", NOTES_DB_FILE,
+        _prepare_notes_downloaded_db, init_notes_db, _NOTES_DB_LOCK,
+        progress=progress, timeout=timeout)
 
 
 def netdb_replace_all(rows):
@@ -1801,12 +2010,341 @@ def netdb_sync_once(url, token, timeout=None):
     # ...then merge what the others found.
     inserted, updated = netdb_merge_remote(remote_all, last_watermark)
     netdb_save_config(url, token, now, new_seq if use_seq else last_seq)
-    return {"uploaded": uploaded,
-            "merged_on_server": merged_on_server,
-            "downloaded": len(remote_all),
-            "inserted": inserted, "updated": updated,
-            "total_remote": total_remote,
-            "now": now}
+    summary = {"uploaded": uploaded,
+               "merged_on_server": merged_on_server,
+               "downloaded": len(remote_all),
+               "inserted": inserted, "updated": updated,
+               "total_remote": total_remote,
+               "now": now}
+    try:
+        summary.update(netdb_notes_sync_once(url, token, timeout=timeout))
+    except Exception as exc:
+        summary["notes_error"] = str(exc)
+    return summary
+
+def _canonical_note_id(value):
+    try:
+        return str(uuid.UUID(str(value or "").strip()))
+    except Exception:
+        return ""
+
+
+def _sanitize_note_row(raw, now=None):
+    """Validate a note row for local storage. Text None means a tombstone."""
+    if not isinstance(raw, dict):
+        return None
+    note_id = _canonical_note_id(raw.get("id"))
+    if not note_id:
+        return None
+    ip_port = strict_ip_port(raw.get("ip_port"))
+    if not ip_port:
+        return None
+    text = raw.get("text", None)
+    if text is not None:
+        text = str(text)[:MAX_NOTE_CHARS]
+        if not text.strip():
+            return None
+    now = now or time.time()
+
+    def ts(value, default):
+        try:
+            value = float(value or 0)
+        except Exception:
+            return default
+        if value <= 0 or value > now + 86400:
+            return default
+        return value
+
+    return {
+        "id": note_id,
+        "ip_port": ip_port,
+        "text": text,
+        "created_at": ts(raw.get("created_at"), now),
+        "updated_at": ts(raw.get("updated_at"), now),
+    }
+
+
+def notes_collect_dirty():
+    _ensure_notes_db()
+    import sqlite3
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            return [dict(r) for r in con.execute(
+                "SELECT id, ip_port, text, created_at, updated_at"
+                " FROM notes WHERE needs_sync=1"
+                " ORDER BY updated_at ASC LIMIT ?", (MAX_NOTES_PER_SYNC,))]
+        finally:
+            con.close()
+
+
+def notes_mark_synced(items):
+    """Mark uploaded notes clean, but only if they have not changed since."""
+    _ensure_notes_db()
+    pairs = []
+    for item in items or []:
+        try:
+            pairs.append((str(item["id"]), float(item["updated_at"])))
+        except Exception:
+            continue
+    if not pairs:
+        return
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            con.executemany(
+                "UPDATE notes SET needs_sync=0"
+                " WHERE id=? AND updated_at=?", pairs)
+            con.commit()
+        finally:
+            con.close()
+
+
+def notes_merge_remote(notes):
+    """Merge downloaded notes. Server text wins on UUID conflicts; tombstones win."""
+    _ensure_notes_db()
+    import sqlite3
+    inserted = updated = 0
+    now = time.time()
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            for raw in notes or []:
+                note = _sanitize_note_row(raw, now)
+                if not note:
+                    continue
+                old = con.execute(
+                    "SELECT text, updated_at FROM notes WHERE id=?",
+                    (note["id"],)).fetchone()
+                if old is None:
+                    con.execute(
+                        "INSERT INTO notes (id, ip_port, text, created_at,"
+                        " updated_at, needs_sync) VALUES (?, ?, ?, ?, ?, 0)",
+                        (note["id"], note["ip_port"], note["text"],
+                         note["created_at"], note["updated_at"]))
+                    inserted += 1
+                    continue
+                old_text, old_updated = old[0], old[1]
+                if old_text is None:
+                    # Deletion is final; never resurrect.
+                    continue
+                if note["text"] is None:
+                    con.execute(
+                        "UPDATE notes SET text=NULL, updated_at=?, needs_sync=0"
+                        " WHERE id=?",
+                        (max(note["updated_at"], float(old_updated or 0)),
+                         note["id"]))
+                    updated += 1
+                elif note["text"] != old_text:
+                    # The server's first-written copy is authoritative.
+                    con.execute(
+                        "UPDATE notes SET text=?, ip_port=?, updated_at=?,"
+                        " needs_sync=0 WHERE id=?",
+                        (note["text"], note["ip_port"], note["updated_at"],
+                         note["id"]))
+                    updated += 1
+            con.commit()
+        finally:
+            con.close()
+    if inserted or updated:
+        _notify_server_db_tab()
+    return inserted, updated
+
+
+def notes_replace_all(notes):
+    """Replace the local notes table with exactly the supplied rows."""
+    _ensure_notes_db()
+    now = time.time()
+    inserted = 0
+    with _NOTES_DB_LOCK:
+        con = _notes_db_connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM notes")
+            for raw in notes or []:
+                note = _sanitize_note_row(raw, now)
+                if not note:
+                    continue
+                con.execute(
+                    "INSERT INTO notes (id, ip_port, text, created_at,"
+                    " updated_at, needs_sync) VALUES (?, ?, ?, ?, ?, 0)",
+                    (note["id"], note["ip_port"], note["text"],
+                     note["created_at"], note["updated_at"]))
+                inserted += 1
+            con.commit()
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            con.close()
+    _notify_server_db_tab()
+    return inserted
+
+
+def notes_download_all(url, token, timeout=None):
+    """Download every note using the seq cursor. Raises NetdbEndpointUnsupported."""
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        raise ConnectionError("enter the shared-DB URL and token first")
+    cursor = 0
+    by_id = {}
+    max_seq = 0
+    now = time.time()
+    for _ in range(NETDB_MAX_ROUNDS):
+        resp = _netdb_request(
+            url + "/api/notes/sync", token, method="POST",
+            payload={"notes": [], "since_seq": cursor, "format": 1},
+            timeout=timeout)
+        if not isinstance(resp, dict) or not resp.get("has_seq"):
+            break
+        try:
+            now = float(resp.get("now", now) or now)
+        except Exception:
+            pass
+        batch = [raw for raw in (resp.get("notes") or [])
+                 if isinstance(raw, dict)]
+        if not batch:
+            break
+        top = cursor
+        for note in batch:
+            try:
+                seq = int(note.get("seq", 0) or 0)
+            except Exception:
+                seq = 0
+            if seq > top:
+                top = seq
+            if seq > max_seq:
+                max_seq = seq
+            note_id = _canonical_note_id(note.get("id"))
+            if note_id:
+                by_id[note_id] = note
+        if top <= cursor:
+            break
+        cursor = top
+        if len(batch) < NETDB_PAGE_SIZE:
+            break
+    return list(by_id.values()), max_seq, now
+
+
+def netdb_notes_sync_once(url, token, timeout=None):
+    """Sync the separate notes DB. Returns a summary dict.
+
+    An old server without /api/notes/* is treated as "no notes support":
+    the local notes DB still works, and nothing is uploaded/downloaded.
+    """
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        raise ConnectionError("enter the shared-DB URL and token first")
+    summary = {"notes_uploaded": 0, "notes_merged_on_server": 0,
+               "notes_downloaded": 0, "notes_inserted": 0,
+               "notes_updated": 0, "notes_unsupported": False}
+    notes_existed = (os.path.exists(NOTES_DB_FILE)
+                     and os.path.getsize(NOTES_DB_FILE) > 0)
+    downloaded_total = 0
+    try:
+        if not notes_existed:
+            try:
+                _rows, max_seq, _now = netdb_notes_download_file(url, token)
+                netdb_save_config(last_notes_seq=max_seq)
+                downloaded_total = _rows
+            except NetdbDirectDownloadUnsupported:
+                rows, max_seq, _now = notes_download_all(url, token)
+                notes_replace_all(rows)
+                netdb_save_config(last_notes_seq=max_seq)
+                downloaded_total = len(rows)
+        else:
+            _ensure_notes_db()
+    except NetdbEndpointUnsupported:
+        _ensure_notes_db()
+        summary["notes_unsupported"] = True
+        return summary
+
+    cfg = netdb_load_config()
+    last_seq = cfg.get("last_notes_seq", 0) or 0
+    by_id = {}
+
+    # Upload new notes / tombstones in batches.
+    for _ in range(NETDB_MAX_ROUNDS):
+        batch = notes_collect_dirty()
+        if not batch:
+            break
+        try:
+            resp = _netdb_request(
+                url + "/api/notes/sync", token, method="POST",
+                payload={"notes": batch, "since_seq": last_seq, "format": 1},
+                timeout=timeout)
+        except NetdbEndpointUnsupported:
+            summary["notes_unsupported"] = True
+            return summary
+        try:
+            summary["notes_merged_on_server"] += int(
+                resp.get("merged", 0) or 0)
+        except Exception:
+            pass
+        for note in (resp.get("notes") or []):
+            if not isinstance(note, dict):
+                continue
+            note_id = _canonical_note_id(note.get("id"))
+            if note_id:
+                by_id[note_id] = note
+        notes_mark_synced(batch)
+        summary["notes_uploaded"] += len(batch)
+        if len(batch) < MAX_NOTES_PER_SYNC:
+            break
+
+    # Download every note/tombstone newer than our cursor.
+    cursor = last_seq
+    now = time.time()
+    for _ in range(NETDB_MAX_ROUNDS):
+        try:
+            resp = _netdb_request(
+                url + "/api/notes/sync", token, method="POST",
+                payload={"notes": [], "since_seq": cursor, "format": 1},
+                timeout=timeout)
+        except NetdbEndpointUnsupported:
+            summary["notes_unsupported"] = True
+            return summary
+        if not isinstance(resp, dict) or not resp.get("has_seq"):
+            break
+        try:
+            now = float(resp.get("now", now) or now)
+        except Exception:
+            pass
+        batch = [raw for raw in (resp.get("notes") or [])
+                 if isinstance(raw, dict)]
+        if not batch:
+            break
+        top = cursor
+        for note in batch:
+            try:
+                seq = int(note.get("seq", 0) or 0)
+            except Exception:
+                seq = 0
+            if seq > top:
+                top = seq
+            note_id = _canonical_note_id(note.get("id"))
+            if note_id:
+                by_id[note_id] = note
+        if top <= cursor:
+            break
+        cursor = top
+        if len(batch) < NETDB_PAGE_SIZE:
+            break
+
+    inserted, updated = notes_merge_remote(list(by_id.values()))
+    summary["notes_downloaded"] = max(downloaded_total, len(by_id))
+    summary["notes_inserted"] = inserted
+    summary["notes_updated"] = updated
+    netdb_save_config(last_notes_seq=cursor)
+    return summary
+
 
 ICON_ENABLED = True           
 ICON_SIZE = 24
@@ -2820,6 +3358,19 @@ def display_text(value, limit=0):
     s = _DISPLAY_CONTROL_RE.sub("", s)
     s = _DISPLAY_BIDI_RE.sub("", s)
     s = re.sub(r"\s+", " ", s).strip()
+    if limit:
+        s = s[:limit]
+    return s
+
+
+def display_multiline(value, limit=0):
+    """Like display_text(), but keeps user-authored note line breaks."""
+    s = "" if value is None else str(value)
+    if len(s) > MAX_SANITIZE_INPUT:
+        s = s[:MAX_SANITIZE_INPUT]
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _DISPLAY_CONTROL_RE.sub("", s)
+    s = _DISPLAY_BIDI_RE.sub("", s)
     if limit:
         s = s[:limit]
     return s
@@ -9388,6 +9939,7 @@ import threading
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -9413,7 +9965,8 @@ class ServersTab(QWidget, QtBaseMixin):
     """
 
     COLS = ("ip", "motd", "players", "version", "cracked", "whitelist",
-            "online_names", "seen_names", "first_seen", "last_seen", "times_seen")
+            "online_names", "seen_names", "notes", "first_seen", "last_seen",
+            "times_seen")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -9473,8 +10026,8 @@ class ServersTab(QWidget, QtBaseMixin):
         netbar.addWidget(self.netdb_token_edit, 2)
         self.netdb_sync_btn = QPushButton("Sync DB")
         self.netdb_sync_btn.setToolTip(
-            "Upload this client's new sightings, download other clients' "
-            "servers, and refresh last-seen dates both ways.")
+            "Upload this client's new sightings and notes, download other "
+            "clients' servers/notes, and refresh last-seen dates both ways.")
         self.netdb_sync_btn.clicked.connect(self.sync_netdb)
         netbar.addWidget(self.netdb_sync_btn)
         try:
@@ -9486,8 +10039,8 @@ class ServersTab(QWidget, QtBaseMixin):
             if cfg.get("last_sync"):
                 self.netdb_sync_btn.setToolTip(
                     "Last sync: " + format_db_timestamp(cfg["last_sync"])
-                    + ". Upload new sightings, download other clients' "
-                    "servers, refresh last-seen dates both ways.")
+                    + ". Upload new sightings and notes, download other clients' "
+                    "servers/notes, refresh last-seen dates both ways.")
         except Exception:
             pass
 
@@ -9495,7 +10048,7 @@ class ServersTab(QWidget, QtBaseMixin):
         self.tree.setHorizontalHeaderLabels([c.upper() for c in self.COLS])
         widths = {"ip": 170, "motd": 260, "players": 90, "version": 120,
                   "cracked": 75, "whitelist": 180, "online_names": 200,
-                  "seen_names": 200,
+                  "seen_names": 200, "notes": 70,
                   "first_seen": 165, "last_seen": 165, "times_seen": 90}
         for i, c in enumerate(self.COLS):
             self.tree.setColumnWidth(i, widths.get(c, 150))
@@ -9510,6 +10063,7 @@ class ServersTab(QWidget, QtBaseMixin):
                 "whitelist": lambda v: str(v).lower(),
                 "online_names": lambda v: str(v).lower(),
                 "seen_names": lambda v: str(v).lower(),
+                "notes": lambda v: int(str(v)) if str(v).isdigit() else 0,
                 "first_seen": _timestamp_display_key,
                 "last_seen": _timestamp_display_key,
                 "times_seen": lambda v: int(str(v)) if str(v).isdigit() else -1,
@@ -9525,6 +10079,7 @@ class ServersTab(QWidget, QtBaseMixin):
             ("Add to Saved", self.save_selected),
             ("Add to Ignore", self.ignore_selected),
             ("Add to Monitor", self.monitor_selected),
+            ("Notes…", self.notes_selected),
             ("Delete", self.delete_selected),
             ("Export…", self.export_all),
         ):
@@ -9599,6 +10154,10 @@ class ServersTab(QWidget, QtBaseMixin):
 
     def _populate(self, entries):
         self._entries = entries
+        try:
+            note_counts = query_notes_counts()
+        except Exception:
+            note_counts = {}
         for iid in list(self.tree.get_children()):
             self.tree.delete(iid)
         for e in entries:
@@ -9634,6 +10193,7 @@ class ServersTab(QWidget, QtBaseMixin):
                 display_text(e.get("whitelist", ""), 200),
                 online_names,
                 seen_names,
+                str(note_counts.get(e.get("ip_port", ""), "") or ""),
                 format_db_timestamp(e.get("first_seen", 0)),
                 format_db_timestamp(e.get("last_seen", 0)),
                 display_text(e.get("times_seen", 1), 20),
@@ -9698,6 +10258,122 @@ class ServersTab(QWidget, QtBaseMixin):
             return
         added, invalid, duplicates = add_ips_to_monitor_list(sel)
         self.set_status(format_monitor_feedback(added, invalid, duplicates))
+
+    def notes_selected(self):
+        sel = self._selected_ips()
+        if len(sel) != 1:
+            q_info(self, "Notes", "Select exactly one server row.")
+            return
+        self.open_notes_dialog(sel[0])
+
+    def open_notes_dialog(self, ip_port):
+        """View/add/delete notes for one server. Notes are write-once."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Notes — {ip_port}")
+        dialog.resize(760, 520)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(0, 2, dialog)
+        table.setHorizontalHeaderLabels(["Added", "Note"])
+        table.setColumnWidth(0, 170)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(table, 3)
+        preview = QPlainTextEdit(dialog)
+        preview.setReadOnly(True)
+        preview.setMinimumHeight(110)
+        layout.addWidget(preview, 2)
+        input_box = QPlainTextEdit(dialog)
+        input_box.setPlaceholderText("Write a new note (notes cannot be edited once saved)…")
+        input_box.setMaximumHeight(100)
+        layout.addWidget(input_box)
+        buttons = QHBoxLayout()
+        layout.addLayout(buttons)
+        add_btn = QPushButton("Add Note")
+        delete_btn = QPushButton("Delete Selected")
+        close_btn = QPushButton("Close")
+        buttons.addWidget(add_btn)
+        buttons.addWidget(delete_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+
+        notes_by_id = {}
+
+        def refresh():
+            try:
+                notes = query_server_notes(ip_port)
+            except Exception as exc:
+                q_error(dialog, "Notes", f"Could not load notes:\n{exc}")
+                notes = []
+            notes_by_id.clear()
+            table.setRowCount(0)
+            for note in notes:
+                note_id = str(note.get("id", ""))
+                notes_by_id[note_id] = note
+                row = table.rowCount()
+                table.insertRow(row)
+                item = QTableWidgetItem(
+                    format_db_timestamp(note.get("created_at", 0)))
+                item.setData(Qt.UserRole, note_id)
+                table.setItem(row, 0, item)
+                table.setItem(row, 1, QTableWidgetItem(
+                    display_text(note.get("text", ""), 500)))
+            preview.clear()
+            delete_btn.setEnabled(bool(notes))
+
+        def on_select():
+            row = table.currentRow()
+            if row < 0:
+                preview.clear()
+                return
+            item = table.item(row, 0)
+            note = notes_by_id.get(str(item.data(Qt.UserRole))) if item else None
+            preview.setPlainText(
+                display_multiline(note.get("text", "")) if note else "")
+
+        def add_note():
+            body = input_box.toPlainText()
+            if not body.strip():
+                q_info(dialog, "Notes", "Write something first.")
+                return
+            try:
+                add_server_note(ip_port, body)
+            except Exception as exc:
+                q_error(dialog, "Notes", f"Could not add note:\n{exc}")
+                return
+            input_box.clear()
+            refresh()
+            self.request_refresh()
+
+        def delete_note():
+            row = table.currentRow()
+            if row < 0:
+                q_info(dialog, "Notes", "Select a note first.")
+                return
+            item = table.item(row, 0)
+            note_id = str(item.data(Qt.UserRole)) if item else ""
+            if not note_id:
+                return
+            answer = QMessageBox.question(
+                dialog, "Delete Note",
+                "Delete this note for everyone on the next sync?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+            try:
+                delete_server_note(note_id)
+            except Exception as exc:
+                q_error(dialog, "Notes", f"Could not delete note:\n{exc}")
+                return
+            refresh()
+            self.request_refresh()
+
+        add_btn.clicked.connect(add_note)
+        delete_btn.clicked.connect(delete_note)
+        close_btn.clicked.connect(dialog.accept)
+        table.itemSelectionChanged.connect(on_select)
+        refresh()
+        dialog.exec()
 
     def delete_selected(self):
         sel = self._selected_ips()
@@ -9847,8 +10523,8 @@ class ServersTab(QWidget, QtBaseMixin):
             if cfg.get("last_sync"):
                 self.netdb_sync_btn.setToolTip(
                     "Last sync: " + format_db_timestamp(cfg["last_sync"])
-                    + ". Upload new sightings, download other clients' "
-                    "servers, refresh last-seen dates both ways.")
+                    + ". Upload new sightings and notes, download other clients' "
+                    "servers/notes, refresh last-seen dates both ways.")
         except Exception:
             pass
         # Keep the summary visible: refreshing the table also sets a status,
@@ -9858,7 +10534,13 @@ class ServersTab(QWidget, QtBaseMixin):
             f"({summary.get('merged_on_server', 0)} new for server), "
             f"↓{summary.get('downloaded', 0)} downloaded "
             f"({summary.get('inserted', 0)} new, {summary.get('updated', 0)} "
-            f"refreshed), server holds {summary.get('total_remote', 0)}.")
+            f"refreshed), server holds {summary.get('total_remote', 0)}. "
+            f"Notes: ↑{summary.get('notes_uploaded', 0)} "
+            f"↓{summary.get('notes_downloaded', 0)}.")
+        if summary.get("notes_unsupported"):
+            self._sync_note += " Notes sync not supported by this server."
+        if summary.get("notes_error"):
+            self._sync_note += f" Notes warning: {summary['notes_error']}"
         self.refresh_from_db()
         self.set_status(self._sync_note)
 
@@ -12429,6 +13111,10 @@ def _install_signal_handlers(app=None):
 def main():  #gone but not forgotten
     try:
         init_server_db()
+    except Exception:
+        pass
+    try:
+        init_notes_db()
     except Exception:
         pass
     app = QApplication.instance() or QApplication(sys.argv)

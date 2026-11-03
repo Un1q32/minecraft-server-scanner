@@ -279,6 +279,29 @@ pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
     })
 }
 
+/// Notes live in a separate, token-protected `notes.db` next to `servers.db`.
+fn notes_for(servers_path: &str, ip: &str) -> Vec<(f64, String)> {
+    let path = std::path::Path::new(servers_path).with_file_name("notes.db");
+    let Some(path) = path.to_str() else {
+        return Vec::new();
+    };
+    let Ok(con) = open_read_only(path) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = con.prepare(
+        "SELECT created_at, text FROM notes \
+         WHERE ip_port=? AND text IS NOT NULL ORDER BY created_at ASC, id ASC",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([ip], |r| {
+        Ok((r.get::<_, f64>(0).unwrap_or(0.0), r.get::<_, String>(1)?))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
+}
+
 /// Full record text for one selected row (a single primary-key lookup).
 pub fn detail(path: &str, row: &Row) -> Result<String, String> {
     let con = open_read_only(path)?;
@@ -341,6 +364,23 @@ pub fn detail(path: &str, row: &Row) -> Result<String, String> {
     let _ = writeln!(out);
     let _ = writeln!(out, "Online now:  {}", names_of(&names_now));
     let _ = writeln!(out, "Ever seen:   {}", names_of(&names_ever));
+    let notes = notes_for(path, &row.ip);
+    let _ = writeln!(out);
+    if notes.is_empty() {
+        let _ = writeln!(out, "Notes:       (none)");
+    } else {
+        let _ = writeln!(out, "Notes:");
+        for (created, text) in notes {
+            let cleaned = clean_multiline(&text);
+            let mut lines = cleaned.lines();
+            if let Some(first) = lines.next() {
+                let _ = writeln!(out, "  [{}] {}", timestamp_text(created), first);
+            }
+            for line in lines {
+                let _ = writeln!(out, "              {}", line);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -379,5 +419,32 @@ mod tests {
     fn names_are_cleaned() {
         let names = names_of(r#"["alice", "b\u0000ob", "\u001b[31mcarol"]"#);
         assert_eq!(names, "alice, bob, [31mcarol");
+    }
+
+    #[test]
+    fn notes_are_read_from_sibling_db() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbviewer-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let notes_path = dir.join("notes.db");
+        let con = Connection::open(&notes_path).unwrap();
+        con.execute(
+            "CREATE TABLE notes (id TEXT PRIMARY KEY, ip_port TEXT, text TEXT, \
+             created_at REAL, updated_at REAL)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO notes VALUES ('a', '1.2.3.4:25565', 'hello', 123.0, 123.0)",
+            [],
+        )
+        .unwrap();
+        drop(con);
+        let servers_path = dir.join("servers.db");
+        let got = notes_for(servers_path.to_str().unwrap(), "1.2.3.4:25565");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

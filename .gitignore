@@ -3,6 +3,9 @@ shodan_key.txt
 servers.db
 servers.db-wal
 servers.db-shm
+notes.db
+notes.db-wal
+notes.db-shm
 ignore.txt
 saved.txt
 # shared network DB (dbserver.py) - server side and client settings
@@ -11,6 +14,12 @@ netdb.json
 netdb.sqlite3
 netdb.sqlite3-wal
 netdb.sqlite3-shm
+netdb-notes.sqlite3
+netdb-notes.sqlite3-wal
+netdb-notes.sqlite3-shm
+*-notes.sqlite3
+*-notes.sqlite3-wal
+*-notes.sqlite3-shm
 minecraft_servers.json
 user_log.json
 server_monitor_log.json

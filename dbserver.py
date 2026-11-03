@@ -49,7 +49,7 @@ JSON replies are zstd- or gzip-compressed when the request advertises them
 (zstd uses Python 3.14+ `compression.zstd`, else the `zstd` CLI when present;
 gzip is the fallback).
 
-* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "format": 2, "now": T}``
+* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "notes": M, "format": 2, "now": T}``
 * ``GET  /api/db``                   -> consistent compact SQLite snapshot
   (the whole database file, optionally zstd/gzip-compressed); the client
   derives row count/seq/format by opening it.  Used by
@@ -74,6 +74,17 @@ gzip is the fallback).
   ``GET``, ``?since_seq=N``): every insert/change bumps the row's ``seq``,
   so paging ``seq > since_seq`` can never miss rows that arrived with old
   ``last_seen`` timestamps. Replies carry ``"has_seq": true``.
+
+* ``GET  /api/notes/db``             -> consistent SQLite snapshot of the
+  separate notes database (same auth/compression as ``/api/db``).
+* ``POST /api/notes/sync`` ``{"notes": [...], "since_seq": N}``
+  uploads new notes/tombstones and returns notes with ``seq > since_seq``.
+  The reply also includes the current state of every uploaded note id, so
+  a client that attempted an edit or resurrection is corrected immediately.
+  Note rows are ``{"id": "<uuid>", "ip_port": "...", "text": "..."|null,
+  "created_at": T, "updated_at": T, "seq": N}``. Notes are write-once:
+  different text for an existing id is ignored, and ``text=null`` is a
+  permanent tombstone that cannot be resurrected by stale clients.
 
 Row shape (mirrors the client's ``servers.db``)::
 
@@ -118,6 +129,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -159,6 +171,20 @@ PLAYER_NAME_MAX_LEN = 32
 MAX_VARINT_VALUE = 0x7FFFFFFF
 CONTINUOUS_TTL = 30.0        # seconds without a heartbeat before a node expires
 CONTINUOUS_HEARTBEAT = 10.0  # suggested client heartbeat interval
+MAX_NOTES_PER_REQUEST = 20000
+MAX_NOTES_PER_RESPONSE = 50000
+MAX_NOTE_CHARS = 4000
+
+NOTES_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS notes ("
+    " id TEXT PRIMARY KEY,"
+    " ip_port TEXT NOT NULL,"
+    " text TEXT,"
+    " created_at REAL DEFAULT 0,"
+    " updated_at REAL DEFAULT 0,"
+    " seq INTEGER DEFAULT 0"
+    ")"
+)
 
 _db_lock = threading.Lock()
 _continuous_lock = threading.Lock()
@@ -313,6 +339,106 @@ def init_db(db_path):
         db_format.ensure_format(con)
     finally:
         con.close()
+
+
+def init_notes_db(db_path):
+    con = db_connect(db_path)
+    try:
+        con.execute(NOTES_SCHEMA)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_notes_seq "
+                    "ON notes(seq ASC)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_notes_ip "
+                    "ON notes(ip_port)")
+        con.commit()
+    finally:
+        con.close()
+    try:
+        os.chmod(db_path, 0o600)
+    except OSError:
+        pass
+
+
+def _canonical_uuid(value):
+    try:
+        return str(uuid.UUID(str(value or "").strip()))
+    except Exception:
+        return None
+
+
+def sanitize_note(raw):
+    """Validate one note. text=None is a deletion tombstone."""
+    if not isinstance(raw, dict):
+        return None
+    note_id = _canonical_uuid(raw.get("id"))
+    if not note_id:
+        return None
+    ip_port = str(raw.get("ip_port", "")).strip()
+    if not IP_PORT_RE.match(ip_port):
+        return None
+    try:
+        ipaddress.ip_address(ip_port.rsplit(":", 1)[0])
+        port = int(ip_port.rsplit(":", 1)[1])
+        if not 0 < port < 65536:
+            return None
+    except Exception:
+        return None
+    text = raw.get("text", None)
+    if text is not None:
+        text = str(text)[:MAX_NOTE_CHARS].strip()
+        if not text:
+            return None
+    now = _utcnow()
+
+    def ts(value, default):
+        try:
+            value = float(value or 0)
+        except Exception:
+            return default
+        if value <= 0 or value > now + 86400:
+            return default
+        return value
+
+    return {
+        "id": note_id,
+        "ip_port": ip_port,
+        "text": text,
+        "created_at": ts(raw.get("created_at"), now),
+        "updated_at": ts(raw.get("updated_at"), now),
+    }
+
+
+def merge_note(con, note):
+    """Upsert one note. Existing text is immutable; deletion is final."""
+    old = con.execute(
+        "SELECT ip_port, text, updated_at FROM notes WHERE id=?",
+        (note["id"],)).fetchone()
+    if old is None:
+        con.execute(
+            "INSERT INTO notes (id, ip_port, text, created_at, updated_at,"
+            " seq) VALUES (?, ?, ?, ?, ?,"
+            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM notes))",
+            (note["id"], note["ip_port"], note["text"],
+             note["created_at"], note["updated_at"]))
+        return True
+    old_ip, old_text, old_updated = old[0], old[1], old[2]
+    if old_ip != note["ip_port"]:
+        return False
+    if old_text is None:
+        # A deleted note can never be resurrected by an outdated client.
+        return False
+    if note["text"] is not None:
+        # Notes are write-once.  A different text is an edit attempt; the
+        # first stored copy wins.
+        return False
+    try:
+        updated = max(float(old_updated or 0), float(note["updated_at"] or 0))
+    except Exception:
+        updated = note["updated_at"]
+    con.execute(
+        "UPDATE notes SET text=NULL, updated_at=?,"
+        " seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM notes)"
+        " WHERE id=?", (updated, note["id"]))
+    return True
 
 
 def _clamp_seq(value):
@@ -814,6 +940,80 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _send_sqlite_snapshot(self, db_path, filename):
+        tmp = gz_tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(
+                prefix=".mc-netdb-", suffix=".sqlite3",
+                dir=os.path.dirname(db_path) or None)
+            os.close(fd)
+            os.unlink(tmp)
+            # VACUUM INTO gives a consistent, compact snapshot (it reads
+            # through the WAL) without the client doing row-by-row sync.
+            with _db_lock:
+                src = db_connect(db_path)
+                try:
+                    src.execute("VACUUM INTO ?", (tmp,))
+                finally:
+                    src.close()
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+            payload = tmp
+            encoding = _pick_encoding(self.headers.get("Accept-Encoding"))
+            if encoding:
+                try:
+                    suffix = (".sqlite3.zst" if encoding == "zstd"
+                              else ".sqlite3.gz")
+                    fd, gz_tmp = tempfile.mkstemp(
+                        prefix=".mc-netdb-", suffix=suffix,
+                        dir=os.path.dirname(db_path) or None)
+                    os.close(fd)
+                    if encoding == "zstd":
+                        _zstd_compress_file(tmp, gz_tmp)
+                    else:
+                        with open(tmp, "rb") as fin, open(gz_tmp, "wb") as fout:
+                            with gzip.GzipFile(fileobj=fout, mode="wb",
+                                               compresslevel=6, mtime=0) as gz:
+                                shutil.copyfileobj(fin, gz, length=1024 * 1024)
+                    payload = gz_tmp
+                except Exception:
+                    if gz_tmp:
+                        try:
+                            os.unlink(gz_tmp)
+                        except OSError:
+                            pass
+                        gz_tmp = None
+                    payload = tmp
+                    encoding = None
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(os.path.getsize(payload)))
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
+                self.send_header("Vary", "Accept-Encoding")
+            self.end_headers()
+            with open(payload, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            try:
+                self._send_json(500, {"error": f"db snapshot failed: {exc}"})
+            except Exception:
+                pass
+        finally:
+            for path in (gz_tmp, tmp):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -830,78 +1030,14 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/db":
             if not self._require_auth(b""):
                 return
-            tmp = gz_tmp = None
-            try:
-                fd, tmp = tempfile.mkstemp(
-                    prefix=".mc-netdb-", suffix=".sqlite3",
-                    dir=os.path.dirname(self.server.db_path) or None)
-                os.close(fd)
-                os.unlink(tmp)
-                # VACUUM INTO gives a consistent, compact snapshot (it reads
-                # through the WAL) without the client doing row-by-row sync.
-                with _db_lock:
-                    src = db_connect(self.server.db_path)
-                    try:
-                        src.execute("VACUUM INTO ?", (tmp,))
-                    finally:
-                        src.close()
-                    try:
-                        os.chmod(tmp, 0o600)
-                    except OSError:
-                        pass
-                payload = tmp
-                encoding = _pick_encoding(self.headers.get("Accept-Encoding"))
-                if encoding:
-                    try:
-                        suffix = (".sqlite3.zst" if encoding == "zstd"
-                                  else ".sqlite3.gz")
-                        fd, gz_tmp = tempfile.mkstemp(
-                            prefix=".mc-netdb-", suffix=suffix,
-                            dir=os.path.dirname(self.server.db_path) or None)
-                        os.close(fd)
-                        if encoding == "zstd":
-                            _zstd_compress_file(tmp, gz_tmp)
-                        else:
-                            with open(tmp, "rb") as fin, open(gz_tmp, "wb") as fout:
-                                with gzip.GzipFile(fileobj=fout, mode="wb",
-                                                   compresslevel=6, mtime=0) as gz:
-                                    shutil.copyfileobj(fin, gz, length=1024 * 1024)
-                        payload = gz_tmp
-                    except Exception:
-                        if gz_tmp:
-                            try:
-                                os.unlink(gz_tmp)
-                            except OSError:
-                                pass
-                            gz_tmp = None
-                        payload = tmp
-                        encoding = None
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(os.path.getsize(payload)))
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="netdb.sqlite3"')
-                self.send_header("Cache-Control", "no-store")
-                if encoding:
-                    self.send_header("Content-Encoding", encoding)
-                    self.send_header("Vary", "Accept-Encoding")
-                self.end_headers()
-                with open(payload, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except Exception as exc:
-                try:
-                    self._send_json(500, {"error": f"db snapshot failed: {exc}"})
-                except Exception:
-                    pass
-            finally:
-                for path in (gz_tmp, tmp):
-                    if path:
-                        try:
-                            os.unlink(path)
-                        except OSError:
-                            pass
+            self._send_sqlite_snapshot(
+                self.server.db_path, "netdb.sqlite3")
+            return
+        if parsed.path == "/api/notes/db":
+            if not self._require_auth(b""):
+                return
+            self._send_sqlite_snapshot(
+                self.server.notes_db_path, "netdb-notes.sqlite3")
             return
         if parsed.path in ("/api/health", "/api/servers"):
             if not self._require_auth(b""):
@@ -914,7 +1050,18 @@ class Handler(BaseHTTPRequestHandler):
                         db_format_value = db_format.detect_format(con)
                     finally:
                         con.close()
+                    try:
+                        ncon = db_connect(self.server.notes_db_path)
+                        try:
+                            notes_n = ncon.execute(
+                                "SELECT COUNT(*) FROM notes"
+                                " WHERE text IS NOT NULL").fetchone()[0]
+                        finally:
+                            ncon.close()
+                    except Exception:
+                        notes_n = 0
                 self._send_json(200, {"ok": True, "servers": n,
+                                      "notes": notes_n,
                                       "format": db_format_value,
                                       "now": _utcnow()})
                 return
@@ -950,7 +1097,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/sync", "/api/continuous"):
+        if parsed.path not in ("/api/sync", "/api/continuous", "/api/notes/sync"):
             self._send_json(404, {"error": "not found"})
             return
         body = self._read_body()
@@ -985,6 +1132,56 @@ class Handler(BaseHTTPRequestHandler):
                 "heartbeat": CONTINUOUS_HEARTBEAT,
                 "now": _utcnow(),
             })
+            return
+        if parsed.path == "/api/notes/sync":
+            incoming = payload.get("notes", [])
+            if (not isinstance(incoming, list)
+                    or len(incoming) > MAX_NOTES_PER_REQUEST):
+                self._send_json(400, {"error": "bad 'notes' list"})
+                return
+            since_seq = _clamp_seq(payload.get("since_seq", 0) or 0) or 0
+            merged = 0
+            uploaded_ids = set()
+            with _db_lock:
+                con = db_connect(self.server.notes_db_path)
+                try:
+                    for raw_note in incoming:
+                        note = sanitize_note(raw_note)
+                        if note is None:
+                            continue
+                        uploaded_ids.add(note["id"])
+                        try:
+                            if merge_note(con, note):
+                                merged += 1
+                        except Exception:
+                            continue
+                    con.commit()
+                    con.row_factory = sqlite3.Row
+                    cur = con.execute(
+                        "SELECT * FROM notes WHERE seq > ?"
+                        " ORDER BY seq ASC LIMIT ?",
+                        (since_seq, MAX_NOTES_PER_RESPONSE))
+                    by_id = {str(r["id"]): dict(r) for r in cur.fetchall()}
+                    # Also return the current state of everything the client
+                    # just tried to upload.  If an edit/delete was rejected
+                    # (immutability, tombstone), this corrects the client.
+                    ids = sorted(uploaded_ids)
+                    for start in range(0, len(ids), 500):
+                        chunk = ids[start:start + 500]
+                        marks = ",".join("?" * len(chunk))
+                        rows = con.execute(
+                            f"SELECT * FROM notes WHERE id IN ({marks})",
+                            chunk).fetchall()
+                        for r in rows:
+                            by_id[str(r["id"])] = dict(r)
+                    notes = list(by_id.values())
+                    total = con.execute(
+                        "SELECT COUNT(*) FROM notes").fetchone()[0]
+                finally:
+                    con.close()
+            self._send_json(200, {"notes": notes, "now": _utcnow(),
+                                  "merged": merged, "total": total,
+                                  "has_seq": True})
             return
         # A missing format means a legacy client (format 1); new clients
         # send 2. Rows are converted at this boundary either way.
@@ -1043,6 +1240,8 @@ def main(argv=None):
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--db", default="netdb.sqlite3")
+    ap.add_argument("--notes-db", default="",
+                    help="separate notes database (default: <db>-notes.sqlite3)")
     ap.add_argument("--token", default="",
                     help="Shared secret (else $DBSERVER_TOKEN, else token file).")
     ap.add_argument("--token-file", default=".dbserver_token",
@@ -1057,6 +1256,9 @@ def main(argv=None):
     except Exception:
         pass
     init_db(args.db)
+    notes_db = (args.notes_db.strip() or
+                os.path.splitext(os.path.abspath(args.db))[0] + "-notes.sqlite3")
+    init_notes_db(notes_db)
     token, token_source = load_or_create_token(args.token_file, args.token or None)
     if token_source.endswith("(generated)"):
         print(f"Generated new shared token (saved to {args.token_file}, mode 0600):")
@@ -1074,6 +1276,7 @@ def main(argv=None):
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.db_path = os.path.abspath(args.db)
+    server.notes_db_path = os.path.abspath(notes_db)
     server.shared_token = token
     server.daemon_threads = True
     scheme = "http"
@@ -1095,7 +1298,7 @@ def main(argv=None):
         scheme = "https"
         print(f"TLS enabled ({tls_cert}, {tls_key}) -- clients must use https:// URLs.")
     print(f"Serving netdb on {scheme}://{args.host}:{args.port} "
-          f"(db={server.db_path})")
+          f"(db={server.db_path}, notes={server.notes_db_path})")
     if scheme == "http":
         print("NOTE: plain HTTP -- clients auth with HMAC so the token itself "
               "is never sent in cleartext, but drop cert.pem + privkey.pem in "

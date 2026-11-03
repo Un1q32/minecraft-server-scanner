@@ -91,7 +91,7 @@ def cmd_init_db(url, token):
     print(f"saved shared-DB URL and token to {scanner.NETDB_CONFIG_FILE}")
     return 0
 
-def cmd_download_db():
+def cmd_download_db(include_notes=True):
     """Download the shared DB (direct file when available) and install it."""
     url, token = _sync_creds()
     if not url or not token:
@@ -130,8 +130,32 @@ def cmd_download_db():
         print(f"\nerror: download failed: {exc}", flush=True)
         return 1
     scanner.netdb_save_config(url, token, now, max_seq)
-    print(f"download complete: {count} server(s), last_seq={max_seq}",
-          flush=True)
+
+    notes_count = 0
+    notes_seq = None
+    if not include_notes:
+        print(f"download complete: {count} server(s), last_seq={max_seq}",
+              flush=True)
+        return 0
+    try:
+        print("downloading notes DB ...", flush=True)
+        try:
+            notes_count, notes_seq, _notes_now = scanner.netdb_notes_download_file(
+                url, token, progress=progress)
+            print()
+        except scanner.NetdbDirectDownloadUnsupported:
+            notes, notes_seq, _notes_now = scanner.notes_download_all(url, token)
+            notes_count = scanner.notes_replace_all(notes)
+    except scanner.NetdbEndpointUnsupported:
+        print("notes sync not supported by this server; skipped.")
+    except Exception as exc:
+        print(f"\nwarning: notes download failed: {exc}", flush=True)
+    if notes_seq is not None:
+        scanner.netdb_save_config(last_notes_seq=notes_seq)
+    shown_notes_seq = (notes_seq if notes_seq is not None
+                       else scanner.netdb_load_config().get("last_notes_seq", 0))
+    print(f"download complete: {count} server(s), {notes_count} note(s), "
+          f"last_seq={max_seq}, notes_seq={shown_notes_seq}", flush=True)
     return 0
 
 
@@ -145,7 +169,7 @@ def cmd_sync():
     if not scanner.netdb_local_db_ready():
         print("local DB missing or empty; downloading it first ...",
               flush=True)
-        rc = cmd_download_db()
+        rc = cmd_download_db(include_notes=False)
         if rc:
             return rc
     print(f"syncing shared DB at {url} ...")
@@ -160,7 +184,15 @@ def cmd_sync():
           f"downloaded={summary.get('downloaded', 0)} "
           f"inserted={summary.get('inserted', 0)} "
           f"updated={summary.get('updated', 0)} "
-          f"total_remote={summary.get('total_remote', 0)}")
+          f"total_remote={summary.get('total_remote', 0)} "
+          f"notes_uploaded={summary.get('notes_uploaded', 0)} "
+          f"notes_downloaded={summary.get('notes_downloaded', 0)} "
+          f"notes_inserted={summary.get('notes_inserted', 0)} "
+          f"notes_updated={summary.get('notes_updated', 0)}")
+    if summary.get("notes_unsupported"):
+        print("notes sync not supported by this server; skipped.")
+    if summary.get("notes_error"):
+        print(f"warning: notes sync failed: {summary['notes_error']}")
     return 0
 
 
@@ -729,8 +761,8 @@ def main(argv=None):
         help="sync the shared DB using creds in netdb.json")
     parser.add_argument(
         "--download-db", action="store_true",
-        help="replace the local servers.db with the full latest shared DB "
-             "and update netdb.json's seq watermark")
+        help="replace the local servers.db and notes.db with the full latest "
+             "shared DBs and update netdb.json's seq watermarks")
     parser.add_argument(
         "--scan", nargs="+", metavar="TARGET", dest="targets",
         help="scan targets (same syntax as the GUI box): IPs, CIDRs, "
@@ -820,6 +852,10 @@ def main(argv=None):
         scanner.init_server_db()
     except Exception as exc:
         print(f"warning: DB init failed: {exc}")
+    try:
+        scanner.init_notes_db()
+    except Exception as exc:
+        print(f"warning: notes DB init failed: {exc}")
     rc = 0
     try:
         if args.init_db is not None:

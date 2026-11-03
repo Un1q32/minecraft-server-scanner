@@ -169,6 +169,11 @@ Multiple scanner clients can pool their finds through one central server:
    then press **Sync DB**. That is the whole setup. The same token is used
    for automatic shard registration.
 
+Notes are stored separately from the public server list in
+`<db>-notes.sqlite3` (override with `--notes-db`). They are only available
+through authenticated `/api/notes/*` requests, so the web viewer does not
+see them.
+
 Each sync uploads the servers this client has seen since its last sync and
 downloads everything other clients added, merging first-seen (oldest wins)
 and last-seen/MOTD/players/version (newest wins) on both sides. Player lists
@@ -184,6 +189,15 @@ otherwise gzip. That skips the row-by-row merge path entirely.
 `mcscan.py --download-db` uses it when available (and falls back to normal
 row sync on older servers); `--sync` uses it automatically when the local
 DB is missing or empty. JSON sync responses use the same zstd/gzip choice.
+
+Server notes live in a separate, token-protected notes database
+(`notes.db` locally, `<db>-notes.sqlite3` on the server). Notes are
+write-once and identified by UUID: adding a note creates it, deleting it
+stores a permanent `text=NULL` tombstone, and a stale client cannot edit or
+resurrect a stored note. A server can have any number of notes.
+`mcscan.py --sync` always syncs both databases; `--download-db` downloads
+both. Notes appear in the Rust viewer's detail pane and in the Python
+viewer's Notes column/button, but never in the unauthenticated web viewer.
 
 Security: every `/api/*` endpoint requires auth — unauthenticated reads and
 writes get 401 and reveal nothing. Clients sign requests with HMAC-SHA256
@@ -228,7 +242,7 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
 
     python mcscan.py --init-db URL TOKEN    # save shared-DB creds to netdb.json
     python mcscan.py --sync                  # sync shared DB (auto-full-download if local DB is missing)
-    python mcscan.py --download-db           # replace local DB with the full shared DB
+    python mcscan.py --download-db           # replace local servers + notes DBs from the shared DB
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
@@ -248,14 +262,15 @@ waiting for them, skips the end-of-scan sync, and a second Ctrl-C forces
 an immediate exit. The GUI behaves the same (closing the window also
 stops in-flight scans).
 
-`--download-db` asks the shared server for a direct SQLite snapshot
-(`GET /api/db`, compacted with `VACUUM INTO`) and installs it as the local
-`servers.db`, then updates `netdb.json`'s `last_seq` watermark. Older
-servers without that endpoint fall back to paging every row by `seq`. Use it
-to seed a new machine or recover a local DB that was deleted or got out of
-sync; a normal `--sync` afterwards is then an incremental no-op. `--sync`
-itself performs this full download automatically when the local DB is
-missing or empty, then continues with the normal incremental sync.
+`--download-db` asks the shared server for direct SQLite snapshots
+(`GET /api/db` and `/api/notes/db`, compacted with `VACUUM INTO`) and
+installs them as the local `servers.db` and `notes.db`, then updates
+`netdb.json`'s `last_seq`/`last_notes_seq` watermarks. Older servers
+without those endpoints fall back to paging rows by `seq`. Use it to seed a
+new machine or recover a local DB that was deleted or got out of sync; a
+normal `--sync` afterwards is then an incremental no-op. `--sync` itself
+performs this full download automatically when the local DB is missing or
+empty, then continues with the normal incremental sync of both DBs.
 
 #### Continuous mode
 
@@ -402,7 +417,9 @@ vertical scrollbar has its own column beside the table and the horizontal one
 its own strip below it, so both are easy to grab (and clicking anywhere on a
 bar jumps that way). The columns match
 the Python Servers tab — IP, MOTD, PLAYERS, VERSION, CRACKED, WHITELIST,
-ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN and TIMES SEEN. Clicking a
+ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN and TIMES SEEN (the Python
+tab also has a NOTES count column). The detail pane also shows the server's
+notes from the sibling `notes.db`. Clicking a
 header sorts with the same keys and direction as the Python GUI: the first
 click ascending, the next descending, with versions compared numerically
 (`1.9 < 1.21.1 < 1.21.10`), IPs as octets, and timestamps by displayed
@@ -482,8 +499,10 @@ A browser UI for the same `servers.db`, for when you want the table without
 launching Qt. It is read-only: there is no Open DB picker, no whitelist
 recheck, and no scan/sync action. **Refresh** just reloads `servers.db` from
 disk, so it picks up changes written by a scanner running elsewhere. The 11
-columns, numeric version/IP sorting, stacked sort keys, search language,
-detail pane and Copy IP(s) all match the Rust viewer.
+server columns, numeric version/IP sorting, stacked sort keys, search
+language, detail pane and Copy IP(s) all match the Rust viewer's table.
+Notes are intentionally not shown here: the web UI has no token
+authentication, so it only sees the public servers DB.
 
     python webui/webui.py
     python webui/webui.py --db /path/to/servers.db --port 8080
