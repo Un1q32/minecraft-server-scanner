@@ -88,6 +88,21 @@ pub mod qobject {
         #[qinvokable]
         fn detail(self: &ViewerModel, row: i32) -> QString;
 
+        /// JSON array of active notes for one row.
+        #[qinvokable]
+        #[cxx_name = "notesFor"]
+        fn notes_for(self: &ViewerModel, row: i32) -> QString;
+
+        /// Add a note to one row; returns an error message (empty on success).
+        #[qinvokable]
+        #[cxx_name = "addNote"]
+        fn add_note(self: Pin<&mut ViewerModel>, row: i32, text: QString) -> QString;
+
+        /// Delete a note by UUID; returns an error message (empty on success).
+        #[qinvokable]
+        #[cxx_name = "deleteNote"]
+        fn delete_note(self: Pin<&mut ViewerModel>, row: i32, note_id: QString) -> QString;
+
         /// Set the status line (copy feedback, selection hints, ...).
         #[qinvokable]
         fn note(self: Pin<&mut ViewerModel>, message: QString);
@@ -346,6 +361,69 @@ impl qobject::ViewerModel {
 
     pub fn note(mut self: Pin<&mut Self>, message: QString) {
         self.as_mut().set_status(message);
+    }
+
+    pub fn notes_for(&self, row: i32) -> QString {
+        if row < 0 {
+            return qs("[]");
+        }
+        let rust = self.rust();
+        let Some(entry) = rust.rows.get(row as usize) else {
+            return qs("[]");
+        };
+        let path = rust.db_path.to_string();
+        qs(&crate::db::notes_json(&path, &entry.ip))
+    }
+
+    pub fn add_note(mut self: Pin<&mut Self>, row: i32, text: QString) -> QString {
+        let (path, ip) = {
+            let rust = self.rust();
+            let Some(entry) = rust.rows.get(row as usize) else {
+                return qs("select a server row first");
+            };
+            (rust.db_path.to_string(), entry.ip.clone())
+        };
+        if path.is_empty() {
+            return qs("open a database first");
+        }
+        match crate::db::add_note(&path, &ip, &text.to_string()) {
+            Ok(_) => {
+                self.as_mut().set_status(qs("Note added."));
+                QString::default()
+            }
+            Err(error) => {
+                self.as_mut().set_status(qs(&error));
+                qs(&error)
+            }
+        }
+    }
+
+    pub fn delete_note(
+        mut self: Pin<&mut Self>,
+        row: i32,
+        note_id: QString,
+    ) -> QString {
+        let path = self.rust().db_path.to_string();
+        if path.is_empty() {
+            return qs("open a database first");
+        }
+        if row < 0 {
+            return qs("select a server row first");
+        }
+        match crate::db::delete_note(&path, &note_id.to_string()) {
+            Ok(true) => {
+                self.as_mut().set_status(qs("Note deleted for the next sync."));
+                QString::default()
+            }
+            Ok(false) => {
+                self.as_mut().set_status(qs("Note was already deleted."));
+                QString::default()
+            }
+            Err(error) => {
+                self.as_mut().set_status(qs(&error));
+                qs(&error)
+            }
+        }
     }
 
     pub fn ip_at(&self, row: i32) -> QString {

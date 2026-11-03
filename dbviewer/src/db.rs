@@ -27,6 +27,12 @@ pub struct Row {
     pub times_seen: i64,
 }
 
+pub struct Note {
+    pub id: String,
+    pub created_at: f64,
+    pub text: String,
+}
+
 pub struct Loaded {
     pub rows: Vec<Row>,
     pub total: i64,
@@ -280,8 +286,12 @@ pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
 }
 
 /// Notes live in a separate, token-protected `notes.db` next to `servers.db`.
-fn notes_for(servers_path: &str, ip: &str) -> Vec<(f64, String)> {
-    let path = std::path::Path::new(servers_path).with_file_name("notes.db");
+fn notes_path(servers_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(servers_path).with_file_name("notes.db")
+}
+
+fn notes_for(servers_path: &str, ip: &str) -> Vec<Note> {
+    let path = notes_path(servers_path);
     let Some(path) = path.to_str() else {
         return Vec::new();
     };
@@ -289,17 +299,153 @@ fn notes_for(servers_path: &str, ip: &str) -> Vec<(f64, String)> {
         return Vec::new();
     };
     let Ok(mut stmt) = con.prepare(
-        "SELECT created_at, text FROM notes \
+        "SELECT id, created_at, text FROM notes \
          WHERE ip_port=? AND text IS NOT NULL ORDER BY created_at ASC, id ASC",
     ) else {
         return Vec::new();
     };
     let Ok(rows) = stmt.query_map([ip], |r| {
-        Ok((r.get::<_, f64>(0).unwrap_or(0.0), r.get::<_, String>(1)?))
+        Ok(Note {
+            id: r.get::<_, String>(0)?,
+            created_at: r.get::<_, f64>(1).unwrap_or(0.0),
+            text: r.get::<_, String>(2)?,
+        })
     }) else {
         return Vec::new();
     };
     rows.flatten().collect()
+}
+
+fn ensure_notes_schema(con: &Connection) -> Result<(), String> {
+    con.execute_batch(
+        "CREATE TABLE IF NOT EXISTS notes (\
+           id TEXT PRIMARY KEY, ip_port TEXT NOT NULL, text TEXT, \
+           created_at REAL DEFAULT 0, updated_at REAL DEFAULT 0, \
+           needs_sync INTEGER DEFAULT 1);\
+         CREATE INDEX IF NOT EXISTS idx_notes_ip ON notes(ip_port);\
+         CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at ASC);",
+    )
+    .map_err(|e| e.to_string())?;
+    let mut stmt = con
+        .prepare("PRAGMA table_info(notes)")
+        .map_err(|e| e.to_string())?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    if !cols.iter().any(|c| c == "needs_sync") {
+        con.execute(
+            "ALTER TABLE notes ADD COLUMN needs_sync INTEGER DEFAULT 1",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Format a UUID-shaped id from the clock + a process-local counter.
+fn new_note_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = nanos.to_le_bytes();
+    let extra = count.to_le_bytes();
+    for (i, byte) in extra.iter().enumerate() {
+        bytes[i] ^= byte;
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn restrict_note_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// JSON array of active notes for QML: [{id, created, text}, ...].
+pub fn notes_json(servers_path: &str, ip: &str) -> String {
+    let notes: Vec<serde_json::Value> = notes_for(servers_path, ip)
+        .into_iter()
+        .map(|note| {
+            serde_json::json!({
+                "id": note.id,
+                "created": timestamp_text(note.created_at),
+                "text": note.text,
+            })
+        })
+        .collect();
+    serde_json::to_string(&notes).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Add a write-once note and queue it for the next sync.
+pub fn add_note(servers_path: &str, ip: &str, text: &str) -> Result<String, String> {
+    let body: String = text.trim().chars().take(4000).collect();
+    if body.is_empty() {
+        return Err("note is empty".to_string());
+    }
+    let path = notes_path(servers_path);
+    let con = Connection::open(&path).map_err(|e| format!("cannot open notes DB: {e}"))?;
+    con.busy_timeout(std::time::Duration::from_millis(3000))
+        .map_err(|e| e.to_string())?;
+    ensure_notes_schema(&con)?;
+    let note_id = new_note_id();
+    let now = unix_now();
+    con.execute(
+        "INSERT INTO notes (id, ip_port, text, created_at, updated_at, needs_sync) \
+         VALUES (?, ?, ?, ?, ?, 1)",
+        rusqlite::params![note_id, ip, body, now, now],
+    )
+    .map_err(|e| e.to_string())?;
+    drop(con);
+    restrict_note_permissions(&path);
+    Ok(note_id)
+}
+
+/// Delete (tombstone) a note and queue the tombstone for the next sync.
+pub fn delete_note(servers_path: &str, note_id: &str) -> Result<bool, String> {
+    let path = notes_path(servers_path);
+    let con = Connection::open(&path).map_err(|e| format!("cannot open notes DB: {e}"))?;
+    con.busy_timeout(std::time::Duration::from_millis(3000))
+        .map_err(|e| e.to_string())?;
+    ensure_notes_schema(&con)?;
+    let changed = con
+        .execute(
+            "UPDATE notes SET text=NULL, updated_at=?, needs_sync=1 \
+             WHERE id=? AND text IS NOT NULL",
+            rusqlite::params![unix_now(), note_id],
+        )
+        .map_err(|e| e.to_string())?;
+    drop(con);
+    restrict_note_permissions(&path);
+    Ok(changed > 0)
 }
 
 /// Full record text for one selected row (a single primary-key lookup).
@@ -370,11 +516,16 @@ pub fn detail(path: &str, row: &Row) -> Result<String, String> {
         let _ = writeln!(out, "Notes:       (none)");
     } else {
         let _ = writeln!(out, "Notes:");
-        for (created, text) in notes {
-            let cleaned = clean_multiline(&text);
+        for note in notes {
+            let cleaned = clean_multiline(&note.text);
             let mut lines = cleaned.lines();
             if let Some(first) = lines.next() {
-                let _ = writeln!(out, "  [{}] {}", timestamp_text(created), first);
+                let _ = writeln!(
+                    out,
+                    "  [{}] {}",
+                    timestamp_text(note.created_at),
+                    first
+                );
             }
             for line in lines {
                 let _ = writeln!(out, "              {}", line);
@@ -444,7 +595,50 @@ mod tests {
         let servers_path = dir.join("servers.db");
         let got = notes_for(servers_path.to_str().unwrap(), "1.2.3.4:25565");
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].1, "hello");
+        assert_eq!(got[0].text, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_can_be_added_and_deleted() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbviewer-notes-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let servers_path = dir.join("servers.db");
+        let path = servers_path.to_str().unwrap();
+
+        let note_id = add_note(path, "1.2.3.4:25565", "  hello rust  ").unwrap();
+        assert_eq!(note_id.len(), 36);
+        assert!(note_id.contains('-'));
+        let json = notes_json(path, "1.2.3.4:25565");
+        assert!(json.contains("hello rust"));
+
+        let con = Connection::open(dir.join("notes.db")).unwrap();
+        let (text, needs): (String, i64) = con
+            .query_row(
+                "SELECT text, needs_sync FROM notes WHERE id=?",
+                [&note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "hello rust");
+        assert_eq!(needs, 1);
+        drop(con);
+
+        assert!(delete_note(path, &note_id).unwrap());
+        assert!(!delete_note(path, &note_id).unwrap());
+        assert!(notes_for(path, "1.2.3.4:25565").is_empty());
+        let con = Connection::open(dir.join("notes.db")).unwrap();
+        let (text, needs): (Option<String>, i64) = con
+            .query_row(
+                "SELECT text, needs_sync FROM notes WHERE id=?",
+                [&note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(text.is_none());
+        assert_eq!(needs, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

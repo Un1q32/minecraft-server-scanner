@@ -814,6 +814,23 @@ ApplicationWindow {
                         }
 
                         SquareButton {
+                            text: "Notes"
+                            flat: true
+                            enabled: viewer.db_path.length > 0
+                                     && table.currentRow >= 0
+                            onClicked: {
+                                var row = table.currentRow
+                                if (row < 0) {
+                                    viewer.note("Select a server row first.")
+                                    return
+                                }
+                                notesDialog.row = row
+                                notesDialog.refresh()
+                                notesDialog.open()
+                            }
+                        }
+
+                        SquareButton {
                             text: "Log"
                             flat: true
                             enabled: viewer.job_log.length > 0
@@ -952,6 +969,163 @@ ApplicationWindow {
                 // the end so new mcscan.py output stays visible at the
                 // bottom (whitelist rechecks can append thousands of lines).
                 onTextChanged: cursorPosition = length
+            }
+        }
+    }
+
+    ListModel {
+        id: notesModel
+    }
+
+    Dialog {
+        id: notesDialog
+        property int row: -1
+        property string notesJson: "[]"
+        title: "Notes — " + (row >= 0 ? viewer.ipAt(row) : "")
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        background: Rectangle { color: pal.window; radius: 0; border.color: pal.mid }
+        width: Math.min(window.width - 48, 720)
+        height: Math.min(window.height - 48, 560)
+        padding: 10
+
+        function refresh() {
+            notesJson = viewer.notesFor(row)
+            notesModel.clear()
+            var data = []
+            try { data = JSON.parse(notesJson) } catch (e) { data = [] }
+            for (var i = 0; i < data.length; ++i) {
+                notesModel.append({
+                    noteId: data[i].id,
+                    createdText: data[i].created,
+                    noteText: data[i].text
+                })
+            }
+        }
+
+        function addNote() {
+            var error = viewer.addNote(row, noteInput.text)
+            if (error.length > 0) {
+                viewer.note(error)
+                return
+            }
+            noteInput.text = ""
+            refresh()
+            detailView.text = viewer.detail(row)
+            viewer.note("Note added.")
+        }
+
+        function removeNote(noteId) {
+            var error = viewer.deleteNote(row, noteId)
+            if (error.length > 0) {
+                viewer.note(error)
+                return
+            }
+            refresh()
+            detailView.text = viewer.detail(row)
+            viewer.note("Note deleted for the next sync.")
+        }
+
+        onOpened: refresh()
+
+        contentItem: ColumnLayout {
+            spacing: 8
+
+            Text {
+                visible: notesModel.count === 0
+                text: "No notes yet."
+                color: pal.text
+                opacity: 0.6
+            }
+
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: notesModel
+                spacing: 2
+
+                delegate: Rectangle {
+                    width: ListView.view.width
+                    implicitHeight: noteRow.implicitHeight + 8
+                    color: index % 2 === 0 ? "transparent" : Qt.rgba(
+                               pal.text.r, pal.text.g, pal.text.b, 0.04)
+
+                    RowLayout {
+                        id: noteRow
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.leftMargin: 4
+                        anchors.rightMargin: 4
+                        spacing: 8
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 2
+
+                            Text {
+                                text: createdText
+                                color: pal.text
+                                opacity: 0.55
+                                font.pixelSize: 11
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: noteText
+                                color: pal.text
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                            }
+                        }
+
+                        SquareButton {
+                            text: "Delete"
+                            flat: true
+                            onClicked: notesDialog.removeNote(noteId)
+                        }
+                    }
+                }
+            }
+
+            TextArea {
+                id: noteInput
+                Layout.fillWidth: true
+                Layout.preferredHeight: 64
+                color: pal.text
+                placeholderText: "Write a note (notes cannot be edited once saved)…"
+                placeholderTextColor: "#aaaaaa"
+                selectByMouse: true
+                wrapMode: TextEdit.Wrap
+                background: Rectangle {
+                    color: pal.base
+                    border.color: pal.mid
+                    border.width: 1
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+
+                SquareButton {
+                    text: "Add Note"
+                    enabled: noteInput.text.trim().length > 0
+                    onClicked: notesDialog.addNote()
+                }
+
+                Item { Layout.fillWidth: true }
+            }
+        }
+
+        footer: Item {
+            implicitHeight: 40
+            SquareButton {
+                anchors.right: parent.right; anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Close"
+                onClicked: notesDialog.close()
             }
         }
     }

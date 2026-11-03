@@ -419,7 +419,9 @@ bar jumps that way). The columns match
 the Python Servers tab — IP, MOTD, PLAYERS, VERSION, CRACKED, WHITELIST,
 ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN and TIMES SEEN (the Python
 tab also has a NOTES count column). The detail pane also shows the server's
-notes from the sibling `notes.db`. Clicking a
+notes from the sibling `notes.db`, and the **Notes** button opens a dialog
+to add or delete them. Added/deleted notes are written to `notes.db` with
+`needs_sync=1`, so the next **Sync DB** uploads them. Clicking a
 header sorts with the same keys and direction as the Python GUI: the first
 click ascending, the next descending, with versions compared numerically
 (`1.9 < 1.21.1 < 1.21.10`), IPs as octets, and timestamps by displayed
