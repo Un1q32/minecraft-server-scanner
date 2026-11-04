@@ -16,6 +16,11 @@ use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
 use std::time::Instant;
 
 fn main() {
+    // The UI imports QtQuick.Controls.Basic, but QtQuick.Dialogs resolves its
+    // own style from the platform.  On KDE/Breeze the FileDialog sidebar
+    // triggers binding loops and ButtonBackground type errors, so pin the
+    // whole process to the Basic style.
+    std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Basic");
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
