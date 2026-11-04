@@ -576,6 +576,52 @@ def _server_db_connect():
     return con
 
 
+def _init_history_schema(con, backfill=False):
+    """Create the per-sighting tables used by the viewer graphs."""
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS server_history ("
+        " ip_port TEXT NOT NULL,"
+        " seen_at REAL NOT NULL,"
+        " players_online INTEGER,"
+        " max_players INTEGER,"
+        " PRIMARY KEY (ip_port, seen_at)"
+        ")"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS player_history ("
+        " ip_port TEXT NOT NULL,"
+        " player_name TEXT NOT NULL,"
+        " seen_at REAL NOT NULL,"
+        " PRIMARY KEY (ip_port, player_name, seen_at)"
+        ")"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_player_history_ip_time"
+        " ON player_history(ip_port, seen_at ASC)"
+    )
+    if backfill:
+        try:
+            count = con.execute(
+                "SELECT COUNT(*) FROM server_history").fetchone()[0]
+            if not count:
+                # Existing DBs only have first/last seen; seed those two
+                # points.  Player counts are unknown (NULL) for the seed rows.
+                con.execute(
+                    "INSERT OR IGNORE INTO server_history"
+                    " (ip_port, seen_at, players_online, max_players)"
+                    " SELECT ip_port, first_seen, NULL, NULL FROM servers"
+                    " WHERE first_seen > 0"
+                )
+                con.execute(
+                    "INSERT OR IGNORE INTO server_history"
+                    " (ip_port, seen_at, players_online, max_players)"
+                    " SELECT ip_port, last_seen, NULL, NULL FROM servers"
+                    " WHERE last_seen > 0"
+                )
+        except Exception:
+            pass
+
+
 def init_server_db():
     import sqlite3
     with _SERVER_DB_LOCK:
@@ -607,6 +653,7 @@ def init_server_db():
             _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
             _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
             _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
+            _init_history_schema(con, backfill=True)
             con.commit()
             db_format.ensure_format(con)
             # One-time cleanup: bogons (loopback/LAN test servers) are no
@@ -721,6 +768,19 @@ def record_server_result(result, source="scan"):
                     (None, port, motd, online, maximum, version, protocol,
                      keep_cracked, now, times_seen, source, now_json, ever_json, ip_port),
                 )
+            try:
+                con.execute(
+                    "INSERT OR IGNORE INTO server_history"
+                    " (ip_port, seen_at, players_online, max_players)"
+                    " VALUES (?, ?, ?, ?)",
+                    (ip_port, now, online, maximum))
+                if sample_names:
+                    con.executemany(
+                        "INSERT OR IGNORE INTO player_history"
+                        " (ip_port, player_name, seen_at) VALUES (?, ?, ?)",
+                        [(ip_port, name, now) for name in sample_names])
+            except Exception:
+                pass
             con.commit()
         finally:
             con.close()
@@ -1122,6 +1182,7 @@ def _ensure_server_db():
                 _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
                 _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
                 _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
+                _init_history_schema(con)
                 con.commit()
                 db_format.ensure_format(con)
             finally:
@@ -1627,6 +1688,47 @@ def netdb_local_db_ready():
         return False
 
 
+def _merge_previous_history(con):
+    """Carry local sighting history across a direct DB-file replacement.
+
+    The shared DB has no history tables (history is local-only), so after a
+    direct download the new file would otherwise start empty.  Copy the old
+    file's rows for servers that still exist in the downloaded DB.
+    """
+    try:
+        local = os.path.abspath(SERVERS_DB_FILE)
+        current_row = con.execute("PRAGMA database_list").fetchone()
+        current = os.path.abspath(current_row[2] or "") if current_row else ""
+    except Exception:
+        return
+    if not local or current == local or not os.path.isfile(local):
+        return
+    try:
+        con.execute("ATTACH DATABASE ? AS previous", (local,))
+    except Exception:
+        return
+    try:
+        tables = (
+            ("server_history", "ip_port, seen_at, players_online, max_players"),
+            ("player_history", "ip_port, player_name, seen_at"),
+        )
+        for table, columns in tables:
+            found = con.execute(
+                "SELECT 1 FROM previous.sqlite_master"
+                " WHERE type='table' AND name=?", (table,)).fetchone()
+            if not found:
+                continue
+            con.execute(
+                f"INSERT OR IGNORE INTO {table} ({columns})"
+                f" SELECT {columns} FROM previous.{table}"
+                " WHERE ip_port IN (SELECT ip_port FROM main.servers)")
+    finally:
+        try:
+            con.execute("DETACH DATABASE previous")
+        except Exception:
+            pass
+
+
 def _prepare_downloaded_db(path):
     """Turn a server-schema DB into a local scanner DB. Returns (rows, max_seq)."""
     import sqlite3
@@ -1655,6 +1757,8 @@ def _prepare_downloaded_db(path):
                     "ON servers(last_seen DESC)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_servers_version "
                     "ON servers(version)")
+        _init_history_schema(con)
+        _merge_previous_history(con)
         con.commit()
         try:
             con.execute("VACUUM")

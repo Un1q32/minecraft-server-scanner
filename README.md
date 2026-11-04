@@ -117,6 +117,13 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
 - Each server also keeps two player-name lists from status-ping samples:
   players online now (latest sample) and everyone ever seen (union of all
   samples, kept after logout, capped at 500 names per server).
+- Every sighting is stored separately in `server_history` (timestamp,
+  players online, max players), and every sampled player name is stored in
+  `player_history` (timestamp, name). This is what the viewers graph.
+  Existing databases are seeded with their `first_seen`/`last_seen` points
+  once; player counts are unknown (`NULL`) for those older points. History
+  is local-only: normal sync and `--download-db` keep the local history for
+  servers that still exist, but history is not uploaded to the shared DB.
 - The Servers tab browses that history (search, rescan, copy, export, add to
   Saved/Ignore/Monitor, delete). Search also matches player names, so you
   can find every server a player has been seen on.
@@ -418,7 +425,11 @@ its own strip below it, so both are easy to grab (and clicking anywhere on a
 bar jumps that way). The columns match
 the Python Servers tab — IP, MOTD, PLAYERS, VERSION, CRACKED, WHITELIST,
 ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN and TIMES SEEN (the Python
-tab also has a NOTES count column). The detail pane also shows the server's
+tab also has a NOTES count column). Selecting a row draws its sighting
+history above the detail text: a player-count line with a tick for every
+time the server was seen, then one row per player showing when that player
+was sampled online. Points are local 12-hour time; storage stays UTC epoch.
+The detail pane also shows the server's
 notes from the sibling `notes.db`, and the **Notes** button opens a dialog
 to add or delete them. Added/deleted notes are written to `notes.db` with
 `needs_sync=1`, so the next **Sync DB** uploads them. Clicking a
@@ -505,8 +516,9 @@ It is read-only: there is no Open DB picker, no whitelist recheck, and no
 scan/sync action. **Refresh** reloads `servers.db` from disk, so it picks up
 changes written by a scanner running elsewhere. The 11 server columns,
 numeric version/IP sorting, stacked sort keys, search language, detail pane
-and Copy IP(s) all match the Rust viewer's table. Notes are intentionally not
-served here.
+and Copy IP(s) all match the Rust viewer's table. Selecting a row also draws
+the same sighting and player-activity charts as the Rust viewer (hover a
+point for its local time). Notes are intentionally not served here.
 
 The page loads the database into `webui/static/core.wasm`, a small
 Emscripten/SQLite build, so filtering, sorting and formatting run in the
@@ -567,6 +579,12 @@ Changes from format 1:
 Existing local and server databases are converted once on startup, then
 `VACUUM`ed. On the current data this reduced the DB from about 46 MB to
 36 MB.
+
+The local database also has two history tables: `server_history` (one row
+per sighting) and `player_history` (one row per sampled player per
+sighting). They are not part of the shared format; the viewer JSON is capped
+at 5000 sighting points and 20000 player events while storage keeps every
+row.
 
 Sync clients send `"format": 2` in `/api/sync`; a missing field means a
 format-1 client. The server converts rows at the sync boundary, so old

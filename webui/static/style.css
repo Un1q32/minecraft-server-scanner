@@ -18,6 +18,10 @@
   border-radius: 0;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -214,6 +218,48 @@ body.resizing * {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: inherit;
+}
+
+/* ------------------------------------------------------- history charts */
+.history {
+  position: relative;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chartTitle {
+  margin: 0 0 4px;
+  font-size: 10px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  opacity: 0.65;
+}
+
+.chartTitle + .historyChart {
+  margin-bottom: 8px;
+}
+
+.historyChart {
+  display: block;
+  width: 100%;
+  background: var(--field);
+  border: 1px solid var(--border);
+}
+
+.historyEmpty {
+  padding: 4px 0;
+  opacity: 0.65;
+}
+
+.historyTip {
+  position: absolute;
+  z-index: 5;
+  padding: 2px 5px;
+  background: var(--btn);
+  color: var(--btn-text);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 /* ---------------------------------------------------------- narrow screens */

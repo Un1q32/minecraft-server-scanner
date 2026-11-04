@@ -49,6 +49,19 @@ const headerRow = document.getElementById("headerRow");
 const bodyEl = document.getElementById("body");
 const rowsEl = document.getElementById("rows");
 const detailEl = document.getElementById("detail");
+const detailPane = document.querySelector(".detailPane");
+const historyEl = document.getElementById("history");
+const serverTitle = document.getElementById("serverTitle");
+const playerTitle = document.getElementById("playerTitle");
+const serverChart = document.getElementById("serverChart");
+const playerChart = document.getElementById("playerChart");
+const historyEmpty = document.getElementById("historyEmpty");
+const historyTip = document.getElementById("historyTip");
+
+const CHART_COLORS = [
+  "#6fa8dc", "#93c47d", "#e6b85c", "#e07b8f", "#b4a7d6",
+  "#76a5af", "#f0a35e", "#c3d36c", "#d98cc4", "#8fb8e8",
+];
 
 let core = null;
 let mc = null;
@@ -60,6 +73,10 @@ let anchorRow = -1;
 let searchTimer = null;
 let renderPending = false;
 let refreshing = false;
+let historyData = null;
+let serverGeom = null;
+let playerGeom = null;
+let lastHistoryWidth = 0;
 
 // ------------------------------------------------------------------ helpers
 
@@ -153,14 +170,449 @@ function relayout() {
 function showDetail(row) {
   if (row < 0 || row >= rowCount) {
     detailEl.textContent = HELP;
+    hideHistory();
     return;
   }
   detailEl.textContent = mc.detail(row);
+  showHistory(row);
 }
 
 function showHelp() {
   detailEl.textContent = HELP;
+  hideHistory();
 }
+
+// ------------------------------------------------------------ history charts
+
+function hideHistory() {
+  historyEl.hidden = true;
+  historyTip.hidden = true;
+  serverGeom = null;
+  playerGeom = null;
+  historyData = null;
+}
+
+function chartTime(epoch) {
+  if (!epoch || epoch <= 0) {
+    return "-";
+  }
+  const d = new Date(epoch * 1000);
+  let hours = d.getHours();
+  const suffix = hours >= 12 ? "PM" : "AM";
+  hours %= 12;
+  if (hours === 0) {
+    hours = 12;
+  }
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  return `${d.getMonth() + 1}/${d.getDate()} ${hours}:${minutes} ${suffix}`;
+}
+
+function historyRange(points, players) {
+  let lo = 0;
+  let hi = 0;
+  for (const point of points) {
+    const t = Number(point.t) || 0;
+    if (t <= 0) {
+      continue;
+    }
+    if (!lo || t < lo) {
+      lo = t;
+    }
+    if (t > hi) {
+      hi = t;
+    }
+  }
+  if (!lo) {
+    for (const player of players) {
+      for (const raw of player.times || []) {
+        const t = Number(raw) || 0;
+        if (t <= 0) {
+          continue;
+        }
+        if (!lo || t < lo) {
+          lo = t;
+        }
+        if (t > hi) {
+          hi = t;
+        }
+      }
+    }
+  }
+  if (!lo) {
+    return [0, 0];
+  }
+  if (hi <= lo) {
+    hi = lo + 3600;
+  }
+  return [lo, hi];
+}
+
+function chartSetup(canvas, height) {
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(80, canvas.clientWidth || 320);
+  canvas.style.height = `${height}px`;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const style = getComputedStyle(canvas);
+  return {
+    ctx,
+    w: width,
+    h: height,
+    text: style.color || "#cccccc",
+  };
+}
+
+function peakPlayers(points) {
+  let peak = 1;
+  let counted = false;
+  for (const point of points) {
+    if (point.p !== null && point.p !== undefined) {
+      peak = Math.max(peak, Number(point.p) || 0);
+      counted = true;
+    }
+  }
+  if (!counted) {
+    // Backfilled rows have no observed count; use capacity for scale.
+    for (const point of points) {
+      if (point.m !== null && point.m !== undefined) {
+        peak = Math.max(peak, Number(point.m) || 0);
+      }
+    }
+  }
+  return Math.max(1, peak);
+}
+
+function drawServerChart(points) {
+  const { ctx, w, h, text } = chartSetup(serverChart, 150);
+  if (!points.length) {
+    serverGeom = null;
+    return;
+  }
+  const left = 40;
+  const right = 8;
+  const top = 10;
+  const bottom = 22;
+  const pw = Math.max(1, w - left - right);
+  const ph = Math.max(1, h - top - bottom);
+  const [t0, t1] = historyRange(points, []);
+  const span = Math.max(1, t1 - t0);
+  const peak = peakPlayers(points);
+  const counted = points.filter((p) => p.p !== null && p.p !== undefined).length;
+  const mid = "rgba(128,128,128,0.4)";
+
+  ctx.font = "11px ui-monospace, monospace";
+  ctx.textBaseline = "middle";
+  for (let g = 0; g <= 2; g += 1) {
+    const value = Math.round((peak * g) / 2);
+    const y = top + ph - (ph * g) / 2;
+    ctx.strokeStyle = mid;
+    ctx.globalAlpha = g === 0 ? 0.8 : 0.45;
+    ctx.beginPath();
+    ctx.moveTo(left, y + 0.5);
+    ctx.lineTo(left + pw, y + 0.5);
+    ctx.stroke();
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = text;
+    ctx.textAlign = "right";
+    ctx.fillText(String(value), left - 5, y);
+  }
+  ctx.globalAlpha = 1;
+
+  let drawing = false;
+  ctx.strokeStyle = CHART_COLORS[0];
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (const point of points) {
+    if (point.p === null || point.p === undefined) {
+      if (drawing) {
+        ctx.stroke();
+        drawing = false;
+        ctx.beginPath();
+      }
+      continue;
+    }
+    const x = left + (((Number(point.t) || t0) - t0) / span) * pw;
+    const y = top + ph - Math.min(1, (Number(point.p) || 0) / peak) * ph;
+    if (!drawing) {
+      ctx.moveTo(x, y);
+      drawing = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  if (drawing) {
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = CHART_COLORS[0];
+  const step = Math.max(1, Math.floor(points.length / 600));
+  for (let i = 0; i < points.length; i += step) {
+    const point = points[i];
+    if (point.p === null || point.p === undefined) {
+      continue;
+    }
+    const x = left + (((Number(point.t) || t0) - t0) / span) * pw;
+    const y = top + ph - Math.min(1, (Number(point.p) || 0) / peak) * ph;
+    ctx.beginPath();
+    ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Every sighting is marked below the player-count graph.
+  ctx.strokeStyle = "#7aa6cc";
+  ctx.globalAlpha = 0.8;
+  ctx.lineWidth = 1;
+  const tickStep = Math.max(1, Math.floor(points.length / 800));
+  for (let i = 0; i < points.length; i += tickStep) {
+    const x = left + (((Number(points[i].t) || t0) - t0) / span) * pw;
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, top + ph + 2);
+    ctx.lineTo(x + 0.5, top + ph + 6);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = text;
+  ctx.globalAlpha = 0.7;
+  ctx.textAlign = "left";
+  ctx.fillText(chartTime(t0), left, h - 9);
+  ctx.textAlign = "right";
+  ctx.fillText(chartTime(t1), left + pw, h - 9);
+  ctx.globalAlpha = 1;
+  if (!counted) {
+    ctx.fillStyle = text;
+    ctx.globalAlpha = 0.6;
+    ctx.textAlign = "center";
+    ctx.fillText("No player counts recorded for these sightings",
+                 left + pw / 2, top + ph / 2);
+    ctx.globalAlpha = 1;
+  }
+
+  serverGeom = { left, top, pw, ph, t0, span, points };
+}
+
+function drawPlayerChart(players) {
+  const sorted = players.slice().sort((a, b) => {
+    const at = (a.times || []).length;
+    const bt = (b.times || []).length;
+    return bt - at || String(a.name).localeCompare(String(b.name));
+  });
+  const maxRows = 10;
+  const shown = Math.min(sorted.length, maxRows);
+  const overflow = sorted.length - shown;
+  const height = 24 + shown * 13 + (overflow ? 13 : 0);
+  const { ctx, w, h, text } = chartSetup(playerChart, height);
+  const left = 92;
+  const right = 8;
+  const top = 6;
+  const rowHeight = 13;
+  const pw = Math.max(1, w - left - right);
+  const [t0, t1] = historyRange((historyData && historyData.points) || [], players);
+  const span = Math.max(1, t1 - t0);
+  const mid = "rgba(128,128,128,0.35)";
+  const rows = [];
+
+  ctx.font = "11px ui-monospace, monospace";
+  ctx.textBaseline = "middle";
+  for (let r = 0; r < shown; r += 1) {
+    const player = sorted[r];
+    const centerY = top + rowHeight * r + rowHeight / 2;
+    const color = CHART_COLORS[r % CHART_COLORS.length];
+
+    ctx.strokeStyle = mid;
+    ctx.beginPath();
+    ctx.moveTo(left, centerY + 0.5);
+    ctx.lineTo(left + pw, centerY + 0.5);
+    ctx.stroke();
+
+    let name = String(player.name || "");
+    if (name.length > 13) {
+      name = `${name.substring(0, 12)}…`;
+    }
+    ctx.fillStyle = text;
+    ctx.globalAlpha = 0.9;
+    ctx.textAlign = "left";
+    ctx.fillText(name, 4, centerY);
+    ctx.globalAlpha = 1;
+
+    const times = (player.times || []).map(Number);
+    ctx.fillStyle = color;
+    const eventStep = Math.max(1, Math.floor(times.length / 400));
+    for (let k = 0; k < times.length; k += eventStep) {
+      const x = left + ((times[k] - t0) / span) * pw;
+      ctx.beginPath();
+      ctx.arc(x, centerY, 1.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    rows.push({ player, centerY, times });
+  }
+
+  if (overflow > 0) {
+    ctx.fillStyle = text;
+    ctx.globalAlpha = 0.6;
+    ctx.textAlign = "left";
+    ctx.fillText(`+${overflow} more player(s)`, 4, top + rowHeight * shown + rowHeight / 2);
+    ctx.globalAlpha = 1;
+  }
+
+  playerGeom = { left, pw, t0, span, rowHeight, rows };
+}
+
+function renderHistory() {
+  if (!historyData) {
+    return;
+  }
+  const points = historyData.points || [];
+  const players = historyData.players || [];
+  if (!points.length && !players.length) {
+    historyEl.hidden = false;
+    serverTitle.hidden = true;
+    serverChart.hidden = true;
+    playerTitle.hidden = true;
+    playerChart.hidden = true;
+    historyEmpty.hidden = false;
+    historyEmpty.textContent = "No sighting history recorded for this server.";
+    hideTip();
+    return;
+  }
+
+  historyEl.hidden = false;
+  historyEmpty.hidden = true;
+
+  if (points.length) {
+    serverTitle.hidden = false;
+    serverChart.hidden = false;
+    const peak = peakPlayers(points);
+    serverTitle.textContent = `SIGHTINGS ${points.length} • PEAK ${peak}`;
+    drawServerChart(points);
+  } else {
+    serverTitle.hidden = true;
+    serverChart.hidden = true;
+    serverGeom = null;
+  }
+
+  if (players.length) {
+    playerTitle.hidden = false;
+    playerChart.hidden = false;
+    playerTitle.textContent = `PLAYER ACTIVITY • ${players.length} SEEN`;
+    drawPlayerChart(players);
+  } else {
+    playerTitle.hidden = true;
+    playerChart.hidden = true;
+    playerGeom = null;
+  }
+  hideTip();
+}
+
+function showHistory(row) {
+  if (!mc || row < 0 || row >= rowCount) {
+    hideHistory();
+    return;
+  }
+  try {
+    historyData = JSON.parse(mc.history(mc.ip(row)));
+  } catch (error) {
+    historyData = { points: [], players: [] };
+  }
+  if (!historyData || !Array.isArray(historyData.points)) {
+    historyData = { points: [], players: [] };
+  }
+  if (!Array.isArray(historyData.players)) {
+    historyData.players = [];
+  }
+  renderHistory();
+}
+
+function hideTip() {
+  historyTip.hidden = true;
+}
+
+function showTip(text, clientX, clientY) {
+  historyTip.textContent = text;
+  historyTip.hidden = false;
+  const rect = historyEl.getBoundingClientRect();
+  const x = Math.max(4, Math.min(rect.width - 12, clientX - rect.left + 10));
+  historyTip.style.left = `${x}px`;
+  historyTip.style.top = `${Math.max(4, clientY - rect.top - 22)}px`;
+}
+
+serverChart.addEventListener("mousemove", (event) => {
+  if (!serverGeom || !serverGeom.points.length) {
+    hideTip();
+    return;
+  }
+  const rect = serverChart.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const geom = serverGeom;
+  if (x < geom.left || x > geom.left + geom.pw) {
+    hideTip();
+    return;
+  }
+  const target = geom.t0 + ((x - geom.left) / geom.pw) * geom.span;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const point of geom.points) {
+    const distance = Math.abs((Number(point.t) || 0) - target);
+    if (distance < bestDistance) {
+      best = point;
+      bestDistance = distance;
+    }
+  }
+  if (!best) {
+    hideTip();
+    return;
+  }
+  const players = best.p === null || best.p === undefined
+    ? "players unknown"
+    : `${best.p} player${Number(best.p) === 1 ? "" : "s"}`;
+  showTip(`${chartTime(best.t)} — ${players}`, event.clientX, event.clientY);
+});
+
+playerChart.addEventListener("mousemove", (event) => {
+  if (!playerGeom || !playerGeom.rows.length) {
+    hideTip();
+    return;
+  }
+  const rect = playerChart.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  if (x < playerGeom.left || x > playerGeom.left + playerGeom.pw) {
+    hideTip();
+    return;
+  }
+  const row = playerGeom.rows.find(
+    (entry) => Math.abs(y - entry.centerY) <= playerGeom.rowHeight / 2,
+  );
+  if (!row || !row.times.length) {
+    hideTip();
+    return;
+  }
+  const target = playerGeom.t0 + ((x - playerGeom.left) / playerGeom.pw) * playerGeom.span;
+  let best = row.times[0];
+  for (const time of row.times) {
+    if (Math.abs(time - target) < Math.abs(best - target)) {
+      best = time;
+    }
+  }
+  showTip(`${row.player.name} — ${chartTime(best)}`, event.clientX, event.clientY);
+});
+
+serverChart.addEventListener("mouseleave", hideTip);
+playerChart.addEventListener("mouseleave", hideTip);
+
+new ResizeObserver((entries) => {
+  const width = Math.round(entries[0].contentRect.width);
+  if (width === lastHistoryWidth) {
+    return;
+  }
+  lastHistoryWidth = width;
+  if (historyData && !historyEl.hidden) {
+    renderHistory();
+  }
+}).observe(detailPane);
 
 // ------------------------------------------------------------------- table
 
@@ -531,12 +983,12 @@ async function boot() {
     setStatus("Starting WebAssembly…");
     if (typeof createCore !== "function") {
       // The script tag failed or was blocked; try once more explicitly.
-      await loadScript("core.js?v=3-retry");
+      await loadScript("core.js?v=4-retry");
     }
     if (typeof createCore !== "function") {
       let detail = "";
       try {
-        const probe = await fetch(assetUrl("core.js?v=3-probe"), { cache: "no-store" });
+        const probe = await fetch(assetUrl("core.js?v=4-probe"), { cache: "no-store" });
         const body = await probe.text();
         detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
       } catch (probeError) {
@@ -563,6 +1015,7 @@ async function boot() {
       error: core.cwrap("mc_error", "string", []),
       cell: core.cwrap("mc_cell", "string", ["number", "number"]),
       detail: core.cwrap("mc_detail", "string", ["number"]),
+      history: core.cwrap("mc_history", "string", ["string"]),
       ip: core.cwrap("mc_ip", "string", ["number"]),
     };
 

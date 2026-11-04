@@ -19,6 +19,7 @@
 #include <strings.h>
 
 #include <chrono>
+#include <map>
 #include <string>
 #include <utility>
 #include <variant>
@@ -925,6 +926,134 @@ std::string timestamp_text(double epoch) {
     return buf;
 }
 
+std::string json_escape(const std::string &value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    for (unsigned char c : value) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[7];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+bool table_exists(const char *name) {
+    if (!g_db) {
+        return false;
+    }
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+std::string number_json(double value) {
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%.6f", value);
+    return buf;
+}
+
+// JSON sighting/player history for one server.  Missing tables (older or
+// shared databases) simply produce empty arrays.
+std::string history_text(const std::string &ip) {
+    const long long point_limit = 5000;
+    const long long event_limit = 20000;
+    std::string out = "{\"points\":[";
+    bool first = true;
+    if (g_db && table_exists("server_history")) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql =
+            "SELECT seen_at, players_online, max_players FROM ("
+            "  SELECT seen_at, players_online, max_players FROM server_history"
+            "  WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?"
+            ") ORDER BY seen_at ASC";
+        if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ip.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, point_limit);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                if (!first) {
+                    out += ',';
+                }
+                first = false;
+                out += "{\"t\":";
+                out += number_json(sqlite3_column_double(stmt, 0));
+                out += ",\"p\":";
+                if (sqlite3_column_type(stmt, 1) == SQLITE_NULL) {
+                    out += "null";
+                } else {
+                    out += std::to_string(sqlite3_column_int64(stmt, 1));
+                }
+                out += ",\"m\":";
+                if (sqlite3_column_type(stmt, 2) == SQLITE_NULL) {
+                    out += "null";
+                } else {
+                    out += std::to_string(sqlite3_column_int64(stmt, 2));
+                }
+                out += '}';
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    out += "],\"players\":[";
+    std::map<std::string, std::vector<double>> players;
+    if (g_db && table_exists("player_history")) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql =
+            "SELECT player_name, seen_at FROM ("
+            "  SELECT player_name, seen_at FROM player_history"
+            "  WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?"
+            ") ORDER BY player_name ASC, seen_at ASC";
+        if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ip.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, event_limit);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                players[text_col(stmt, 0)].push_back(
+                    sqlite3_column_double(stmt, 1));
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    bool first_player = true;
+    for (const auto &entry : players) {
+        if (!first_player) {
+            out += ',';
+        }
+        first_player = false;
+        out += "{\"name\":\"" + json_escape(entry.first) + "\",\"times\":[";
+        for (size_t i = 0; i < entry.second.size(); ++i) {
+            if (i) {
+                out += ',';
+            }
+            out += number_json(entry.second[i]);
+        }
+        out += "]}";
+    }
+    out += "]}";
+    return out;
+}
+
 std::string detail_text(const Row &row) {
     std::string out;
     out.reserve(512);
@@ -1152,6 +1281,12 @@ const char *mc_detail(int index) {
         return g_scratch.c_str();
     }
     g_scratch = detail_text(g_rows[static_cast<size_t>(index)]);
+    return g_scratch.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *mc_history(const char *ip) {
+    g_scratch = history_text(ip ? ip : "");
     return g_scratch.c_str();
 }
 

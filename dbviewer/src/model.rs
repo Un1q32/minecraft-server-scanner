@@ -88,6 +88,11 @@ pub mod qobject {
         #[qinvokable]
         fn detail(self: &ViewerModel, row: i32) -> QString;
 
+        /// JSON sighting/player history for one row:
+        /// `{"points":[{"t","p","m"}],"players":[{"name","times"}]}`.
+        #[qinvokable]
+        fn history(self: &ViewerModel, row: i32) -> QString;
+
         /// JSON array of active notes for one row.
         #[qinvokable]
         #[cxx_name = "notesFor"]
@@ -357,6 +362,19 @@ impl qobject::ViewerModel {
             Ok(text) => qs(&text),
             Err(error) => qs(&format!("could not load row: {error}")),
         }
+    }
+
+    pub fn history(&self, row: i32) -> QString {
+        let empty = qs("{\"points\":[],\"players\":[]}");
+        if row < 0 {
+            return empty;
+        }
+        let rust = self.rust();
+        let Some(entry) = rust.rows.get(row as usize) else {
+            return empty;
+        };
+        let path = rust.db_path.to_string();
+        qs(&crate::db::history_json(&path, &entry.ip))
     }
 
     pub fn note(mut self: Pin<&mut Self>, message: QString) {

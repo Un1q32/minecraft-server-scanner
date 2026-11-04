@@ -37,6 +37,15 @@ ApplicationWindow {
     readonly property int rowHeight: 24
     property real columnsWidth: 0
 
+    // Sighting / player history for the selected row.  Rust sends JSON; the
+    // canvases below parse it once per selection and repaint on resize.
+    property bool historyLoaded: false
+    property var historyData: ({ points: [], players: [] })
+    readonly property var chartColors: [
+        "#6fa8dc", "#93c47d", "#e6b85c", "#e07b8f", "#b4a7d6",
+        "#76a5af", "#f0a35e", "#c3d36c", "#d98cc4", "#8fb8e8"
+    ]
+
     // Same widths as the Python Servers tab.
     readonly property var defaultWidths: [
         170, 260, 90, 120, 75, 180, 200, 200, 165, 165, 90
@@ -130,6 +139,340 @@ ApplicationWindow {
         if (table.selectionModel)
             table.selectionModel.clear()
         detailView.text = helpText
+        clearHistory()
+    }
+
+    /// Load and repaint the history graphs for a row (-1 clears them).
+    function loadHistory(row) {
+        if (row < 0) {
+            clearHistory()
+            return
+        }
+        var data = { points: [], players: [] }
+        try {
+            var parsed = JSON.parse(viewer.history(row))
+            if (parsed && parsed.points)
+                data = parsed
+        } catch (error) {
+            data = { points: [], players: [] }
+        }
+        if (!data.players)
+            data.players = []
+        historyData = data
+        historyLoaded = true
+        serverChart.requestPaint()
+        playerChart.requestPaint()
+    }
+
+    function clearHistory() {
+        historyLoaded = false
+        historyData = ({ points: [], players: [] })
+        serverChart.requestPaint()
+        playerChart.requestPaint()
+    }
+
+    /// Canvas wants a CSS colour string, not a QML color variant.
+    function cssColor(c) {
+        var alpha = c.a === undefined ? 1 : c.a
+        return "rgba(" + Math.round(c.r * 255) + "," +
+               Math.round(c.g * 255) + "," + Math.round(c.b * 255) + "," +
+               alpha + ")"
+    }
+
+    /// Local 12-hour timestamp used by the charts and their axis labels.
+    function chartTime(epoch) {
+        if (!epoch || epoch <= 0)
+            return "-"
+        var d = new Date(epoch * 1000)
+        var hours = d.getHours()
+        var suffix = hours >= 12 ? "PM" : "AM"
+        hours = hours % 12
+        if (hours === 0)
+            hours = 12
+        var minutes = d.getMinutes()
+        return (d.getMonth() + 1) + "/" + d.getDate() + " " +
+               hours + ":" + (minutes < 10 ? "0" : "") + minutes + " " + suffix
+    }
+
+    function historyRange(points, players) {
+        var lo = 0
+        var hi = 0
+        for (var i = 0; i < points.length; ++i) {
+            var t = Number(points[i].t) || 0
+            if (t <= 0)
+                continue
+            if (!lo || t < lo)
+                lo = t
+            if (t > hi)
+                hi = t
+        }
+        if (!lo) {
+            for (var p = 0; p < players.length; ++p) {
+                var times = players[p].times || []
+                for (var k = 0; k < times.length; ++k) {
+                    var pt = Number(times[k]) || 0
+                    if (pt <= 0)
+                        continue
+                    if (!lo || pt < lo)
+                        lo = pt
+                    if (pt > hi)
+                        hi = pt
+                }
+            }
+        }
+        if (!lo)
+            return [0, 0]
+        if (hi <= lo)
+            hi = lo + 3600
+        return [lo, hi]
+    }
+
+    function paintServerChart() {
+        var ctx = serverChart.getContext("2d")
+        var w = serverChart.width
+        var h = serverChart.height
+        ctx.clearRect(0, 0, w, h)
+        ctx.fillStyle = cssColor(pal.base)
+        ctx.fillRect(0, 0, w, h)
+        ctx.strokeStyle = cssColor(pal.mid)
+        ctx.lineWidth = 1
+        ctx.strokeRect(0.5, 0.5, w - 1, h - 1)
+
+        var points = historyLoaded ? (historyData.points || []) : []
+        if (!points.length) {
+            ctx.fillStyle = cssColor(pal.text)
+            ctx.globalAlpha = 0.65
+            ctx.font = "12px " + window.mono
+            ctx.textAlign = "left"
+            ctx.textBaseline = "middle"
+            ctx.fillText(historyLoaded
+                         ? "No sighting history recorded for this server."
+                         : "Select a server to see its sighting history.", 10, h / 2)
+            ctx.globalAlpha = 1
+            return
+        }
+
+        var left = 40
+        var right = 8
+        var top = 20
+        var bottom = 22
+        var pw = Math.max(1, w - left - right)
+        var ph = Math.max(1, h - top - bottom)
+        var range = historyRange(points, [])
+        var t0 = range[0]
+        var t1 = range[1]
+        var span = Math.max(1, t1 - t0)
+        var peak = 1
+        var counted = 0
+        for (var i = 0; i < points.length; ++i) {
+            var value = points[i].p
+            if (value !== null && value !== undefined) {
+                peak = Math.max(peak, Number(value) || 0)
+                counted += 1
+            }
+        }
+        if (!counted) {
+            // Backfilled rows have no observed count; use capacity for scale.
+            for (var c = 0; c < points.length; ++c) {
+                var maximum = points[c].m
+                if (maximum !== null && maximum !== undefined)
+                    peak = Math.max(peak, Number(maximum) || 0)
+            }
+        }
+
+        ctx.font = "11px " + window.mono
+        ctx.textBaseline = "middle"
+
+        // Horizontal grid and the player-count scale.
+        for (var g = 0; g <= 2; ++g) {
+            var valueAt = Math.round(peak * g / 2)
+            var y = top + ph - ph * g / 2
+            ctx.strokeStyle = cssColor(pal.mid)
+            ctx.globalAlpha = g === 0 ? 0.55 : 0.25
+            ctx.beginPath()
+            ctx.moveTo(left, y + 0.5)
+            ctx.lineTo(left + pw, y + 0.5)
+            ctx.stroke()
+            ctx.globalAlpha = 0.7
+            ctx.fillStyle = cssColor(pal.text)
+            ctx.textAlign = "right"
+            ctx.fillText(String(valueAt), left - 5, y)
+        }
+        ctx.globalAlpha = 1
+
+        // Player count over time; older/backfilled rows have no count.
+        var drawing = false
+        ctx.strokeStyle = chartColors[0]
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        for (var p = 0; p < points.length; ++p) {
+            var v = points[p].p
+            if (v === null || v === undefined) {
+                if (drawing) {
+                    ctx.stroke()
+                    drawing = false
+                    ctx.beginPath()
+                }
+                continue
+            }
+            var x = left + ((Number(points[p].t) || t0) - t0) / span * pw
+            var py = top + ph - Math.min(1, (Number(v) || 0) / peak) * ph
+            if (!drawing) {
+                ctx.moveTo(x, py)
+                drawing = true
+            } else {
+                ctx.lineTo(x, py)
+            }
+        }
+        if (drawing)
+            ctx.stroke()
+
+        // Dots keep isolated sightings visible after decimation-free lines.
+        ctx.fillStyle = chartColors[0]
+        var step = Math.max(1, Math.floor(points.length / 600))
+        for (var d = 0; d < points.length; d += step) {
+            var dv = points[d].p
+            if (dv === null || dv === undefined)
+                continue
+            var dx = left + ((Number(points[d].t) || t0) - t0) / span * pw
+            var dy = top + ph - Math.min(1, (Number(dv) || 0) / peak) * ph
+            ctx.beginPath()
+            ctx.arc(dx, dy, 1.6, 0, Math.PI * 2)
+            ctx.fill()
+        }
+
+        // Sighting ticks: every point is an observation of the server.
+        ctx.strokeStyle = cssColor(pal.highlight)
+        ctx.globalAlpha = 0.8
+        ctx.lineWidth = 1
+        var tickStep = Math.max(1, Math.floor(points.length / 800))
+        for (var s = 0; s < points.length; s += tickStep) {
+            var tx = left + ((Number(points[s].t) || t0) - t0) / span * pw
+            ctx.beginPath()
+            ctx.moveTo(tx + 0.5, top + ph + 2)
+            ctx.lineTo(tx + 0.5, top + ph + 6)
+            ctx.stroke()
+        }
+        ctx.globalAlpha = 1
+
+        // Labels.
+        ctx.fillStyle = cssColor(pal.text)
+        ctx.globalAlpha = 0.85
+        ctx.textAlign = "left"
+        ctx.fillText("SIGHTINGS " + points.length + "  •  PEAK " + peak, left, 10)
+        ctx.globalAlpha = 0.65
+        ctx.textAlign = "left"
+        ctx.fillText(chartTime(t0), left, h - 9)
+        ctx.textAlign = "right"
+        ctx.fillText(chartTime(t1), left + pw, h - 9)
+        ctx.globalAlpha = 1
+        if (!counted) {
+            ctx.fillStyle = cssColor(pal.text)
+            ctx.globalAlpha = 0.6
+            ctx.textAlign = "center"
+            ctx.fillText("No player counts recorded for these sightings",
+                         left + pw / 2, top + ph / 2)
+            ctx.globalAlpha = 1
+        }
+    }
+
+    function paintPlayerChart() {
+        var ctx = playerChart.getContext("2d")
+        var w = playerChart.width
+        var h = playerChart.height
+        ctx.clearRect(0, 0, w, h)
+        ctx.fillStyle = cssColor(pal.base)
+        ctx.fillRect(0, 0, w, h)
+        ctx.strokeStyle = cssColor(pal.mid)
+        ctx.lineWidth = 1
+        ctx.strokeRect(0.5, 0.5, w - 1, h - 1)
+
+        var players = historyLoaded ? (historyData.players || []) : []
+        if (!players.length) {
+            ctx.fillStyle = cssColor(pal.text)
+            ctx.globalAlpha = 0.65
+            ctx.font = "12px " + window.mono
+            ctx.textAlign = "left"
+            ctx.textBaseline = "middle"
+            ctx.fillText("No player samples recorded for this server.", 10, h / 2)
+            ctx.globalAlpha = 1
+            return
+        }
+
+        // Show the most frequently sampled players; the rest are summarised.
+        var sorted = players.slice().sort(function (a, b) {
+            var at = (a.times || []).length
+            var bt = (b.times || []).length
+            return bt - at || String(a.name).localeCompare(String(b.name))
+        })
+        var left = 92
+        var right = 8
+        var top = 18
+        var bottom = 8
+        var maxRows = Math.max(1, Math.floor((h - top - bottom) / 12))
+        var shown = Math.min(sorted.length, maxRows)
+        var overflow = sorted.length - shown
+        if (overflow > 0)
+            shown = Math.max(1, shown - 1)
+        var rowHeight = (h - top - bottom) / Math.max(1, shown + (overflow > 0 ? 1 : 0))
+        var pw = Math.max(1, w - left - right)
+        var range = historyRange(historyData.points || [], players)
+        var t0 = range[0]
+        var t1 = range[1]
+        var span = Math.max(1, t1 - t0)
+
+        ctx.font = "11px " + window.mono
+        ctx.textBaseline = "middle"
+
+        for (var r = 0; r < shown; ++r) {
+            var player = sorted[r]
+            var rowY = top + rowHeight * r
+            var centerY = rowY + rowHeight / 2
+            var color = chartColors[r % chartColors.length]
+
+            ctx.strokeStyle = cssColor(pal.mid)
+            ctx.globalAlpha = 0.22
+            ctx.beginPath()
+            ctx.moveTo(left, centerY + 0.5)
+            ctx.lineTo(left + pw, centerY + 0.5)
+            ctx.stroke()
+            ctx.globalAlpha = 1
+
+            var name = String(player.name || "")
+            if (name.length > 13)
+                name = name.substring(0, 12) + "…"
+            ctx.fillStyle = cssColor(pal.text)
+            ctx.globalAlpha = 0.9
+            ctx.textAlign = "left"
+            ctx.fillText(name, 6, centerY)
+            ctx.globalAlpha = 1
+
+            ctx.fillStyle = color
+            var times = player.times || []
+            var eventStep = Math.max(1, Math.floor(times.length / 400))
+            for (var k = 0; k < times.length; k += eventStep) {
+                var x = left + ((Number(times[k]) || t0) - t0) / span * pw
+                ctx.beginPath()
+                ctx.arc(x, centerY, 1.7, 0, Math.PI * 2)
+                ctx.fill()
+            }
+        }
+
+        if (overflow > 0) {
+            ctx.fillStyle = cssColor(pal.text)
+            ctx.globalAlpha = 0.6
+            ctx.textAlign = "left"
+            ctx.fillText("+" + overflow + " more player(s)", 6,
+                         top + rowHeight * shown + rowHeight / 2)
+            ctx.globalAlpha = 1
+        }
+
+        ctx.fillStyle = cssColor(pal.text)
+        ctx.globalAlpha = 0.85
+        ctx.textAlign = "left"
+        ctx.fillText("PLAYER ACTIVITY  •  " + players.length + " SEEN  •  " +
+                     chartTime(t0) + " – " + chartTime(t1), 6, 9)
+        ctx.globalAlpha = 1
     }
 
     /// Click / Ctrl-click / Shift-click row selection, like a native table.
@@ -163,6 +506,7 @@ ApplicationWindow {
 
         table.selectionModel.setCurrentIndex(index, ItemSelectionModel.NoUpdate)
         detailView.text = viewer.detail(row)
+        window.loadHistory(row)
         window.selectedCount = window.selectedIps().length
     }
 
@@ -606,8 +950,12 @@ ApplicationWindow {
                         onLayoutChanged: window.recalculateColumnsWidth()
 
                         onCurrentRowChanged: {
-                            if (currentRow >= 0)
+                            if (currentRow >= 0) {
                                 detailView.text = viewer.detail(currentRow)
+                                window.loadHistory(currentRow)
+                            } else {
+                                window.clearHistory()
+                            }
                         }
                     }
 
@@ -841,6 +1189,27 @@ ApplicationWindow {
                                 jobDialog.open()
                             }
                         }
+                    }
+
+                    Canvas {
+                        id: serverChart
+                        visible: window.historyLoaded
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: visible ? 150 : 0
+                        onPaint: window.paintServerChart()
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
+                    }
+
+                    Canvas {
+                        id: playerChart
+                        visible: window.historyLoaded
+                                 && (window.historyData.players || []).length > 0
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: visible ? 165 : 0
+                        onPaint: window.paintPlayerChart()
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
                     }
 
                     ScrollView {

@@ -28,11 +28,19 @@
     </section>
 
     <aside class="detailPane">
+      <div id="history" class="history" hidden>
+        <div id="serverTitle" class="chartTitle">SIGHTINGS</div>
+        <canvas id="serverChart" class="historyChart"></canvas>
+        <div id="playerTitle" class="chartTitle" hidden>PLAYER ACTIVITY</div>
+        <canvas id="playerChart" class="historyChart" hidden></canvas>
+        <div id="historyEmpty" class="historyEmpty" hidden></div>
+        <div id="historyTip" class="historyTip" hidden></div>
+      </div>
       <pre id="detail"></pre>
     </aside>
   </main>
 
-  <script src="core.js?v=3"></script>
-  <script src="app.js?v=3"></script>
+  <script src="core.js?v=4"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>

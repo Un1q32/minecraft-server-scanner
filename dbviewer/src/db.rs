@@ -453,6 +453,61 @@ pub fn delete_note(servers_path: &str, note_id: &str) -> Result<bool, String> {
     Ok(changed > 0)
 }
 
+/// Max points/events sent to the charts; storage keeps every sighting.
+const HISTORY_POINT_LIMIT: i64 = 5000;
+const PLAYER_EVENT_LIMIT: i64 = 20000;
+
+pub fn history_json(servers_path: &str, ip: &str) -> String {
+    let mut points: Vec<serde_json::Value> = Vec::new();
+    let mut players: Vec<serde_json::Value> = Vec::new();
+    if let Ok(con) = open_read_only(servers_path) {
+        if let Ok(mut stmt) = con.prepare(
+            "SELECT seen_at, players_online, max_players FROM (\
+               SELECT seen_at, players_online, max_players FROM server_history \
+               WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?\
+             ) ORDER BY seen_at ASC",
+        ) {
+            if let Ok(rows) = stmt.query_map(
+                rusqlite::params![ip, HISTORY_POINT_LIMIT],
+                |r| {
+                    Ok(serde_json::json!({
+                        "t": r.get::<_, f64>(0).unwrap_or(0.0),
+                        "p": r.get::<_, Option<i64>>(1).unwrap_or(None),
+                        "m": r.get::<_, Option<i64>>(2).unwrap_or(None),
+                    }))
+                },
+            ) {
+                points = rows.flatten().collect();
+            }
+        }
+        if let Ok(mut stmt) = con.prepare(
+            "SELECT player_name, seen_at FROM (\
+               SELECT player_name, seen_at FROM player_history \
+               WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?\
+             ) ORDER BY player_name ASC, seen_at ASC",
+        ) {
+            if let Ok(rows) = stmt.query_map(
+                rusqlite::params![ip, PLAYER_EVENT_LIMIT],
+                |r| Ok((r.get::<_, String>(0).unwrap_or_default(),
+                        r.get::<_, f64>(1).unwrap_or(0.0))),
+            ) {
+                let mut grouped: std::collections::BTreeMap<String, Vec<f64>> =
+                    std::collections::BTreeMap::new();
+                for (name, seen_at) in rows.flatten() {
+                    grouped.entry(name).or_default().push(seen_at);
+                }
+                players = grouped
+                    .into_iter()
+                    .map(|(name, times)| {
+                        serde_json::json!({"name": name, "times": times})
+                    })
+                    .collect();
+            }
+        }
+    }
+    serde_json::json!({"points": points, "players": players}).to_string()
+}
+
 /// Full record text for one selected row (a single primary-key lookup).
 pub fn detail(path: &str, row: &Row) -> Result<String, String> {
     let con = open_read_only(path)?;
@@ -575,6 +630,76 @@ mod tests {
     fn names_are_cleaned() {
         let names = names_of(r#"["alice", "b\u0000ob", "\u001b[31mcarol"]"#);
         assert_eq!(names, "alice, bob, [31mcarol");
+    }
+
+    #[test]
+    fn history_is_grouped_by_player() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbviewer-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.db");
+        let con = Connection::open(&path).unwrap();
+        con.execute(
+            "CREATE TABLE server_history (ip_port TEXT, seen_at REAL, \
+             players_online INTEGER, max_players INTEGER)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "CREATE TABLE player_history (ip_port TEXT, player_name TEXT, \
+             seen_at REAL)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO server_history VALUES ('1.2.3.4:25565', 100.0, 2, 20)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO server_history VALUES ('1.2.3.4:25565', 200.0, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO player_history VALUES ('1.2.3.4:25565', 'alice', 100.0)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO player_history VALUES ('1.2.3.4:25565', 'alice', 200.0)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO player_history VALUES ('1.2.3.4:25565', 'bob', 200.0)",
+            [],
+        )
+        .unwrap();
+        drop(con);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&history_json(path.to_str().unwrap(), "1.2.3.4:25565"))
+                .unwrap();
+        assert_eq!(json["points"].as_array().unwrap().len(), 2);
+        assert_eq!(json["points"][1]["p"], serde_json::Value::Null);
+        assert_eq!(json["players"].as_array().unwrap().len(), 2);
+        assert_eq!(json["players"][0]["name"], "alice");
+        assert_eq!(json["players"][0]["times"].as_array().unwrap().len(), 2);
+        assert_eq!(json["players"][1]["name"], "bob");
+
+        // Databases without the history tables still return valid JSON.
+        let empty = dir.join("empty.db");
+        Connection::open(&empty)
+            .unwrap()
+            .execute("CREATE TABLE servers (ip_port TEXT)", [])
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&history_json(empty.to_str().unwrap(), "1.2.3.4:25565"))
+                .unwrap();
+        assert_eq!(json["points"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

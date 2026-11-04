@@ -86,7 +86,7 @@ em++ core.cpp "$SQLITE_DIR/sqlite3.o" \
     -sALLOW_MEMORY_GROWTH=1 \
     -sINITIAL_MEMORY=64MB \
     -sFORCE_FILESYSTEM=1 \
-    -sEXPORTED_FUNCTIONS='["_mc_open","_mc_close","_mc_apply","_mc_sort","_mc_count","_mc_total","_mc_load_ms","_mc_error","_mc_cell","_mc_detail","_mc_ip","_mc_sqlite_version","_malloc","_free"]' \
+    -sEXPORTED_FUNCTIONS='["_mc_open","_mc_close","_mc_apply","_mc_sort","_mc_count","_mc_total","_mc_load_ms","_mc_error","_mc_cell","_mc_detail","_mc_history","_mc_ip","_mc_sqlite_version","_malloc","_free"]' \
     -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","FS","UTF8ToString"]' \
     -o static/core.js
 
