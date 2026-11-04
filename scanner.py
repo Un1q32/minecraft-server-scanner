@@ -4172,8 +4172,12 @@ def login_probe(host, port=25565):
         packets = 0
         while True:
             packets += 1
-            if packets > LOGIN_PACKET_BUDGET or time.monotonic() > deadline:
-                raise ValueError("Login probe packet budget exceeded")
+            if packets > LOGIN_PACKET_BUDGET:
+                raise ValueError(
+                    f"Login packet budget exceeded ({LOGIN_PACKET_BUDGET} packets)")
+            if time.monotonic() > deadline:
+                raise ValueError(
+                    f"Login probe timed out after {LOGIN_PROBE_DEADLINE:g}s")
             packet_length = recv_varint(sock)
             if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
                 raise ValueError("Packet too large")
@@ -4418,8 +4422,12 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                 packets = 0
                 while True:
                     packets += 1
-                    if packets > LOGIN_PACKET_BUDGET or time.monotonic() > deadline:
-                        raise ValueError("Login packet budget exceeded")
+                    if packets > LOGIN_PACKET_BUDGET:
+                        raise ValueError(
+                            f"Login packet budget exceeded ({LOGIN_PACKET_BUDGET} packets)")
+                    if time.monotonic() > deadline:
+                        raise ValueError(
+                            f"Login probe timed out after {WHITELIST_PROBE_DEADLINE:g}s")
                     packet_length = recv_varint(sock)
                     if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
                         raise ValueError("Packet too large")
