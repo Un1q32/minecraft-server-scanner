@@ -90,7 +90,7 @@ Row shape (mirrors the client's ``servers.db``)::
 
     {"ip_port": "1.2.3.4:25565", "host": "1.2.3.4", "port": 25565,
      "motd": "...", "players_online": 3, "max_players": 20,
-     "version": "1.21", "protocol": 767, "cracked": "Yes/No",
+     "version": "1.21", "protocol": 767, "cracked": 1,
      "whitelist": "...", "first_seen": 123.0, "last_seen": 456.0,
      "times_seen": 2, "last_source": "scan",
      "players_now": ["Alice"], "players_ever": ["Alice", "Bob"]}
@@ -100,7 +100,8 @@ Merge rule (both directions): ``first_seen`` = oldest non-zero,
 come from whichever side saw the server most recently, and a cracked
 verdict only changes when a client runs an explicit cracked check or
 whitelist probe; a plain status ping never changes an existing verdict.
-``times_seen`` = max + 1 when the incoming sighting is newer.
+``cracked`` is 1 / 0 / NULL (unset or unknown). ``times_seen`` = max + 1
+when the incoming sighting is newer.
 ``players_now`` follows the newer sighting; ``players_ever`` is the union
 of both sides (capped at 500 names per server).
 
@@ -154,7 +155,7 @@ SCHEMA = (
     " max_players INTEGER DEFAULT 0,"
     " version TEXT DEFAULT '',"
     " protocol INTEGER,"
-    " cracked INTEGER DEFAULT 0,"
+    " cracked INTEGER DEFAULT NULL,"
     " whitelist TEXT DEFAULT '',"
     " first_seen REAL DEFAULT 0,"
     " last_seen REAL DEFAULT 0,"
@@ -603,7 +604,7 @@ def sanitize_row(raw):
         "max_players": min(maximum, 1000000),
         "version": _clamp_str(raw.get("version", ""), 100),
         "protocol": protocol,
-        "cracked": db_format.cracked_bool(raw.get("cracked")),
+        "cracked": db_format.cracked_state(raw.get("cracked")),
         "whitelist": _clamp_str(raw.get("whitelist", ""), 200),
         "first_seen": first_seen,
         "last_seen": last_seen,
@@ -678,7 +679,8 @@ def merge_row(con, row):
     if authoritative and incoming_newer:
         cracked = row["cracked"]
     else:
-        cracked = 1 if o_cracked else 0
+        # Keep 0, 1, and the unset/NULL state.
+        cracked = o_cracked
     if (db_format.source_is_cracked_verdict(o_src)
             and not db_format.source_is_cracked_verdict(src)):
         src = o_src

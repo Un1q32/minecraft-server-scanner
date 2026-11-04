@@ -591,7 +591,7 @@ def init_server_db():
                 " max_players INTEGER DEFAULT 0,"
                 " version TEXT DEFAULT '',"
                 " protocol INTEGER,"
-                " cracked INTEGER DEFAULT 0,"
+                " cracked INTEGER DEFAULT NULL,"
                 " whitelist TEXT DEFAULT '',"
                 " first_seen REAL DEFAULT 0,"
                 " last_seen REAL DEFAULT 0,"
@@ -669,7 +669,7 @@ def record_server_result(result, source="scan"):
     except Exception:
         source = "scan"
     protocol = sanitize_protocol(result.get("protocol"))
-    cracked = 1 if result.get("cracked") else 0
+    cracked = 1 if result.get("cracked") else None
     # Player-name lists: the live sample is the current roster; the union of
     # every sample ever seen stays after logout. Minescan hits carry no
     # sample (webscan doesn't report one), so they must not blank the list
@@ -702,11 +702,10 @@ def record_server_result(result, source="scan"):
                 except Exception:
                     times_seen = 1
                 # A plain status ping never changes an existing cracked
-                # verdict.  Only the explicit cracked checker (or a login
-                # probe during a whitelist check) may do that, via
-                # update_server_cracked().  This is the pre-format behavior;
-                # the heuristic is only used when a row is first inserted.
-                keep_cracked = 1 if old_cracked else 0
+                # verdict (including the unset/NULL state).  Only the explicit
+                # cracked checker, a whitelist probe, or a transient reconnect
+                # kick (which unsets it) may do that.
+                keep_cracked = old_cracked
                 if (db_format.source_is_cracked_verdict(old_source)
                         and not db_format.source_is_cracked_verdict(source)):
                     source = old_source
@@ -774,6 +773,47 @@ def update_server_cracked(ip_port, cracked_label, message=""):
     _notify_server_db_tab()
 
 
+def unset_server_cracked(ip_port, message=""):
+    """Set cracked to the unset/NULL state (e.g. a reconnect/startup kick)."""
+    _ensure_server_db()
+    if not ip_port:
+        return
+    ip_port = strict_ip_port(ip_port)
+    if not ip_port:
+        return
+    try:
+        if _is_bogon_ip(ip_port):
+            return
+    except Exception:
+        return
+    now = time.time()
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            cur = con.execute("SELECT first_seen FROM servers WHERE ip_port=?",
+                              (ip_port,))
+            if cur.fetchone() is None:
+                try:
+                    host, port = split_host_port(ip_port)
+                except Exception:
+                    host, port = ip_port, 25565
+                con.execute(
+                    "INSERT INTO servers (ip_port, host, port, cracked,"
+                    " first_seen, last_seen, times_seen, last_source)"
+                    " VALUES (?, ?, ?, NULL, ?, ?, 1, 'cracked')",
+                    (ip_port, None, port, now, now),
+                )
+            else:
+                con.execute(
+                    "UPDATE servers SET cracked=NULL, needs_sync=1,"
+                    " last_source='cracked', last_seen=? WHERE ip_port=?",
+                    (now, ip_port))
+            con.commit()
+        finally:
+            con.close()
+    _notify_server_db_tab()
+
+
 def update_server_whitelist(ip_port, whitelist_label):
     _ensure_server_db()
     if not ip_port:
@@ -798,8 +838,9 @@ def update_server_whitelist(ip_port, whitelist_label):
                 except Exception:
                     host, port = ip_port, 25565
                 con.execute(
-                    "INSERT INTO servers (ip_port, host, port, whitelist, first_seen,"
-                    " last_seen, times_seen, last_source) VALUES (?, ?, ?, ?, ?, ?, 1, 'whitelist')",
+                    "INSERT INTO servers (ip_port, host, port, cracked, whitelist,"
+                    " first_seen, last_seen, times_seen, last_source)"
+                    " VALUES (?, ?, ?, NULL, ?, ?, ?, 1, 'whitelist')",
                     (ip_port, None, port, label, now, now),
                 )
             else:
@@ -1025,7 +1066,7 @@ def format_db_timestamp(ts):
 
 
 def cracked_display(value):
-    """Format-2 bool or legacy label -> Yes/No for the table display."""
+    """Format-2 state or legacy label -> Yes/No/blank for table display."""
     if isinstance(value, (bool, int)):
         return "Yes" if value else "No"
     text = str(value or "").strip()
@@ -1067,7 +1108,7 @@ def _ensure_server_db():
                     " max_players INTEGER DEFAULT 0,"
                     " version TEXT DEFAULT '',"
                     " protocol INTEGER,"
-                    " cracked INTEGER DEFAULT 0,"
+                    " cracked INTEGER DEFAULT NULL,"
                     " whitelist TEXT DEFAULT '',"
                     " first_seen REAL DEFAULT 0,"
                     " last_seen REAL DEFAULT 0,"
@@ -1383,7 +1424,7 @@ def netdb_merge_remote(servers, upload_watermark=None):
                          int(raw.get("players_online", 0) or 0),
                          int(raw.get("max_players", 0) or 0),
                          sanitize_motd(raw.get("version", "") or ""),
-                         raw.get("protocol"), db_format.cracked_bool(raw.get("cracked")),
+                         raw.get("protocol"), db_format.cracked_state(raw.get("cracked")),
                          str(raw.get("whitelist", "") or ""),
                          r_first or r_last, r_last or r_first, max(1, r_times),
                          str(raw.get("last_source", "") or "netdb"),
@@ -1427,14 +1468,15 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     motd, online, maximum = o_motd, o_on, o_max
                     version, protocol = o_ver, o_proto
                     src = o_src
-                remote_cracked = db_format.cracked_bool(raw.get("cracked"))
+                remote_cracked = db_format.cracked_state(raw.get("cracked"))
                 remote_authoritative = db_format.source_is_cracked_verdict(
                     raw.get("last_source"))
                 if remote_authoritative and remote_newer:
                     cracked = remote_cracked
                 else:
-                    # Existing rows only change via an explicit check.
-                    cracked = 1 if o_cracked else 0
+                    # Existing rows only change via an explicit check;
+                    # preserve 0, 1, and the unset/NULL state.
+                    cracked = o_cracked
                 if (db_format.source_is_cracked_verdict(o_src)
                         and not db_format.source_is_cracked_verdict(src)):
                     src = o_src
@@ -1852,7 +1894,7 @@ def netdb_replace_all(rows):
                      online, maximum,
                      sanitize_motd(raw.get("version", "") or "")[:MAX_VERSION_CHARS],
                      sanitize_protocol(raw.get("protocol")),
-                     db_format.cracked_bool(raw.get("cracked")),
+                     db_format.cracked_state(raw.get("cracked")),
                      sanitize_motd(raw.get("whitelist", ""))[:200],
                      first_seen or last_seen, last_seen or first_seen,
                      times_seen,
@@ -3722,7 +3764,7 @@ def ping_server(entry, proxy=None):
                 d[8] = (d[8] & 0x3f) | 0x80
                 return str(uuid.UUID(bytes=bytes(d)))
 
-            cracked = False
+            cracked = None
             for pid, pname in players_sample:
                 if not pname:
                     continue
@@ -4449,7 +4491,8 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                         low = reason.lower()
                         if "whitelist" in low or "white list" in low or "not whitelisted" in low:
                             msg = f"WHITELISTED ({shown_reason})"
-                            if not mojang_used and not saw_encryption:
+                            if (not mojang_used and not saw_encryption
+                                    and not whitelist_login_transient(reason)):
                                 msg += " [offline-mode]"
                             return True, append_mod_warning(msg, mod_warning), "done"
                         if "throttl" in low:
@@ -4471,7 +4514,8 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                                 extra_warning = append_mod_warning("", mod_warning_text("NeoForge" if marker == "neoforge" else "Forge", reason)) or extra_warning
                                 break
                         msg = f"Not Whitelisted ({shown_reason})"
-                        if not mojang_used and not saw_encryption:
+                        if (not mojang_used and not saw_encryption
+                                and not whitelist_login_transient(reason)):
                             msg += " [offline-mode]"
                         return False, append_mod_warning(msg, extra_warning), "done"
 
@@ -4537,12 +4581,23 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
             continue
         return result, message
 
+def whitelist_login_transient(message):
+    """True for startup/maintenance/reconnect kicks, which prove nothing."""
+    low = (message or "").lower()
+    return any(marker in low for marker in (
+        "starting", "reconnect", "restart", "maintenance",
+        "try again", "not ready", "loading"))
+
+
 def whitelist_login_showed_offline(message):
     """True when a whitelist probe message proves the server accepted an
     offline-mode (no Mojang auth) login: Login Success without encryption,
     a decision kick without encryption, or a progressed login-plugin /
     configuration stage without encryption. Auth rejections, throttles,
-    timeouts and version mismatches never carry the marker."""
+    timeouts, version mismatches, and startup/reconnect kicks never carry
+    the marker."""
+    if whitelist_login_transient(message):
+        return False
     low = (message or "").lower()
     return ("[offline-mode" in low
             or "offline login accepted" in low)
@@ -4559,6 +4614,19 @@ def _probe_whitelist_entry(entry, account, proxy=None):
     protocol = sanitize_protocol(entry.get("protocol"))
     version_hint = entry.get("version", "") or ""
     result, message = whitelist_login_probe(host, port, account=account, protocol=protocol, proxy=proxy, version_hint=version_hint)
+    if whitelist_login_transient(message):
+        # A startup/reconnect/maintenance kick is inconclusive; clear any
+        # previous cracked label instead of guessing in either direction.
+        try:
+            unset_server_cracked(ip)
+        except Exception:
+            pass
+        try:
+            if isinstance(entry, dict):
+                entry["cracked_unset"] = True
+        except Exception:
+            pass
+        return result, message
     if whitelist_login_showed_offline(message):
         # The server let an offline login through: by definition cracked,
         # even when the status-ping heuristic said otherwise. Record it in
@@ -7237,7 +7305,7 @@ def update_server_monitor_entry(state, ip, result, timestamp):
     entry["max_players"] = result.get("max_players", 0)
     entry["last_status"] = "online"
     entry["last_ping"] = timestamp
-    entry["cracked"] = bool(result.get("cracked"))
+    entry["cracked"] = result.get("cracked")
     entry["cracked_message"] = result.get("cracked_message", "")
     entry["cracked_last_check"] = result.get("cracked_last_check", timestamp if "cracked_message" in result else entry.get("cracked_last_check", 0))
     sample = result.get("players_sample") or []
@@ -7363,7 +7431,7 @@ def verify_monitor_cracked_result(result):
         result["cracked_last_check"] = checked_at
         return result
 
-    result["cracked"] = False
+    result["cracked"] = None
     result["cracked_message"] = message or "UNKNOWN MODE"
     result["cracked_last_check"] = checked_at
     return result
@@ -9018,7 +9086,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         else:
                             cracked_text = "Queued"
                     else:
-                        cracked_text = "Yes" if r.get("cracked") else "No"
+                        cracked_text = cracked_display(r.get("cracked"))
                     row = (
                         r["ip"],
                         display_text(r["motd"], MAX_MOTD_CHARS),
@@ -10079,7 +10147,7 @@ class ServersTab(QWidget, QtBaseMixin):
                 "motd": lambda v: str(v).lower(),
                 "players": _players_key,
                 "version": _version_key,
-                "cracked": lambda v: str(v).lower(),
+                "cracked": lambda v: cracked_display(v).lower(),
                 "whitelist": lambda v: str(v).lower(),
                 "online_names": lambda v: str(v).lower(),
                 "seen_names": lambda v: str(v).lower(),
@@ -10979,7 +11047,7 @@ class ServerMonitorTab(QtBaseMixin, QWidget):
             status = entry.get("last_status", "unknown")
             last_ping = format_timestamp(entry.get("last_ping"))
             version = entry.get("version", "N/A")
-            cracked = "Yes" if entry.get("cracked") else "No"
+            cracked = cracked_display(entry.get("cracked"))
             motd = display_text(entry.get("motd", ""), MAX_MOTD_CHARS)
             offline = status.strip().lower() != "online" and status.strip()
             row = self._add_table_row(
@@ -11672,7 +11740,7 @@ class ShodanTab(QWidget, QtBaseMixin):
                             display_text(r["motd"], MAX_MOTD_CHARS),
                             f"{r['players']}/{r['max_players']}",
                             display_text(r["version"], MAX_VERSION_CHARS),
-                            "Yes" if r.get("cracked") else "No",
+                            cracked_display(r.get("cracked")),
                             "Queued" if check_whitelist else "-",
                             format_player_list(r.get("players_sample")),
                         )
@@ -11687,7 +11755,7 @@ class ShodanTab(QWidget, QtBaseMixin):
                     ):
                         return
 
-                    cracked_text = "Yes" if r.get("cracked") else "No"
+                    cracked_text = cracked_display(r.get("cracked"))
                     whitelist_text = "Queued" if check_whitelist else "-"
                     queue_candidate = None
                     if only_cracked:
@@ -12352,7 +12420,7 @@ class JSONTab(QWidget, QtBaseMixin):
                         display_text(r['motd'], MAX_MOTD_CHARS),
                         f"{r['players']}/{r['max_players']}",
                         display_text(r['version'], MAX_VERSION_CHARS),
-                        "Yes" if r.get('cracked') else "No",
+                        cracked_display(r.get('cracked')),
                         "Queued" if check_whitelist else "-",
                         format_player_list(r.get('players_sample'))
                     ))
@@ -12364,7 +12432,7 @@ class JSONTab(QWidget, QtBaseMixin):
                     if not version_filter_allows(r.get("version", ""), self._version_filter_text()):
                         return
 
-                    cracked_text = "Yes" if r.get('cracked') else "No"
+                    cracked_text = cracked_display(r.get('cracked'))
                     whitelist_text = "Queued" if check_whitelist else "-"
                     queue_candidate = None
                     if only_cracked:

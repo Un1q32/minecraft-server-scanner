@@ -65,7 +65,7 @@ When masscan reports insufficient privileges and `sudo` is available (Linux/macO
 
 #### Cracked column
 
-The result table has a CRACKED column. The status ping seeds a likely verdict for a newly seen server (a sampled player's UUID matching the offline-mode UUID for its name), but it never overwrites an existing verdict: an online-mode proxy can expose offline UUIDs while still requiring Mojang auth. Tick `Check cracked` before scanning to login-probe each found server for confirmation (`Yes`, `No`, `Unknown`; previously seen servers show `Yes (cached)` from `known_cracked_servers.json`). The `Check Cracked` button probes only the selected rows and is the only way a scan changes an existing value. The column is sortable.
+The result table has a CRACKED column. The status ping seeds a likely verdict for a newly seen server (a sampled player's UUID matching the offline-mode UUID for its name), but it never overwrites an existing verdict: an online-mode proxy can expose offline UUIDs while still requiring Mojang auth. A click on `Check Cracked` login-probes selected rows for confirmation (`Yes`, `No`, `Unknown`; previously seen servers show `Yes (cached)` from `known_cracked_servers.json`). A blank cell means unset/unknown; a transient whitelist kick such as "server starting, please reconnect" unsets it instead of guessing. The `Check Cracked` button is the only way a scan changes an existing value. The column is sortable.
 
 ### Whitelist verification
 
@@ -556,8 +556,10 @@ SQLite checkpoint can still make a main-file/WAL pair inconsistent.
 
 Changes from format 1:
 
-- `cracked` is an integer bool (`0` = No, `1` = Yes) instead of a display
-  string. Legacy `Yes (cached)` and `Yes (heuristic)` become `1`.
+- `cracked` is an integer state instead of a display string:
+  `0` = No, `1` = Yes, `NULL` = unset/unknown. Legacy
+  `Yes (cached)` and `Yes (heuristic)` become `1`; an empty legacy value
+  becomes `NULL`.
 - `host` is `NULL`; it is redundant with `ip_port` and is derived when
   needed.
 - Empty `players_now` and `players_ever` lists are `NULL` instead of `"[]"`.

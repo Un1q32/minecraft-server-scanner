@@ -1,10 +1,11 @@
 """Shared on-disk format helpers for the scanner and shared DB server.
 
 Format 1 stored ``cracked`` as a display string ("Yes", "No",
-"Yes (cached)", ...).  Format 2 stores it as a SQLite integer bool and
-also drops redundant/empty payloads (host duplicated by ip_port, empty
-player lists as NULL).  SQLite's ``PRAGMA user_version`` marks the format;
-older databases have 0 and are migrated in place.
+"Yes (cached)", ...).  Format 2 stores it as a SQLite integer state
+(1 = yes, 0 = no, NULL = unset/unknown) and also drops redundant/empty
+payloads (host duplicated by ip_port, empty player lists as NULL).
+SQLite's ``PRAGMA user_version`` marks the format; older databases have 0
+and are migrated in place.
 """
 
 from __future__ import annotations
@@ -37,25 +38,37 @@ def detect_format(con: sqlite3.Connection) -> int:
     return 1
 
 
-def cracked_bool(value) -> int:
-    """Any format-1 label or format-2 value -> 0/1."""
+def cracked_state(value):
+    """Any format-1 label or format-2 value -> 0, 1, or None (unset)."""
     if value is None:
-        return 0
+        return None
     if isinstance(value, bool):
         return 1 if value else 0
     if isinstance(value, (int, float)):
         return 1 if value else 0
     text = str(value).strip().lower()
+    if not text or text in ("unknown", "unset", "?", "null", "none"):
+        return None
     if text in ("1", "true", "yes", "yes (cached)", "yes (heuristic)"):
         return 1
     if text.startswith("yes"):
         return 1
-    return 0
+    if text in ("0", "false", "no"):
+        return 0
+    return None
+
+
+def cracked_bool(value) -> int:
+    """Any format-1 label or format-2 value -> 0/1 (None -> 0)."""
+    return cracked_state(value) or 0
 
 
 def cracked_text(value) -> str:
-    """Format-2 bool / format-1 label -> the legacy display label."""
-    return "Yes" if cracked_bool(value) else "No"
+    """Format-2 state / format-1 label -> the legacy display label."""
+    state = cracked_state(value)
+    if state is None:
+        return ""
+    return "Yes" if state else "No"
 
 
 def source_is_cracked_verdict(source) -> bool:
@@ -75,7 +88,7 @@ def _host_for(ip_port: str) -> str:
 def row_for_format(row: dict, target: int) -> dict:
     """Convert one row between formats without mutating the input."""
     out = dict(row)
-    out["cracked"] = cracked_bool(row.get("cracked"))
+    out["cracked"] = cracked_state(row.get("cracked"))
     if target >= 2:
         out["host"] = None
         for name in ("players_now", "players_ever"):
@@ -96,7 +109,7 @@ def _column_defs(columns) -> list[str]:
     for _cid, name, ctype, notnull, default, pk in columns:
         name = str(name)
         if name == "cracked":
-            defs.append("cracked INTEGER DEFAULT 0")
+            defs.append("cracked INTEGER DEFAULT NULL")
         elif name in ("players_now", "players_ever"):
             defs.append(f"{name} TEXT")
         else:
@@ -114,9 +127,15 @@ def _column_defs(columns) -> list[str]:
 def _select_expr(name: str) -> str:
     if name == "cracked":
         return (
-            "CASE WHEN cracked IS NULL OR trim(CAST(cracked AS TEXT))='' THEN 0 "
-            "WHEN lower(CAST(cracked AS TEXT)) LIKE 'yes%' THEN 1 "
-            "WHEN CAST(cracked AS INTEGER)<>0 THEN 1 ELSE 0 END"
+            "CASE "
+            "WHEN cracked IS NULL OR trim(CAST(cracked AS TEXT))='' THEN NULL "
+            "WHEN lower(trim(CAST(cracked AS TEXT))) LIKE 'yes%' THEN 1 "
+            "WHEN lower(trim(CAST(cracked AS TEXT))) IN ('no','false') THEN 0 "
+            "WHEN trim(CAST(cracked AS TEXT)) IN ('0','1') "
+            "  THEN CAST(trim(CAST(cracked AS TEXT)) AS INTEGER) "
+            "WHEN typeof(cracked) IN ('integer','real') "
+            "  THEN (CASE WHEN cracked <> 0 THEN 1 ELSE 0 END) "
+            "ELSE NULL END"
         )
     if name in ("players_now", "players_ever"):
         return f"NULLIF(NULLIF({name},'[]'),'')"
