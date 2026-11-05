@@ -325,10 +325,13 @@ that answers again counts 0.1×. Scores persist in `strategies.json`
 random one, and untried strategies go first so the empty case bootstraps
 with `slash0`.
 
-Rescan rounds revisit servers by age: last pinged 2h-1d, 1-7d, 7-30d,
-30-365d, or over a year ago, plus one fast tier (every 10 minutes) for
-servers that currently have players online. Older-with-25565 hosts are
-diluted into their `/20` so a rescan doesn't burst at known addresses.
+Rescan rounds revisit the exact stored `ip:port` by age: a fast tier
+(every 10 minutes) for servers that currently have players online, then
+last pinged 2h-1d, 1-7d, 7-30d, 30-365d, or over a year ago. Rescans do
+not expand hosts into `/20`s; masscan's global `--rate` already paces the
+probes, and padding turned a 155k-server rescan into hundreds of millions
+of useless probes. Neighborhood discovery stays in the normal
+`slash16*`/`slash24*` strategies.
 
 Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
 sweeps a random slice of the internet rather than all four billion
@@ -338,8 +341,9 @@ strategies; `slash24b`/`slash24c` keep their fixed nearby-port sets and
 the `slash32*` strategies still sweep every port on known IPs. Rescans
 always use each server's stored port. While a round runs, a status line at the bottom of the terminal
 counts servers found so far in that round — `new`, `updated` and total
-hits — and is rewritten in place as results arrive (when output is piped
-it prints a plain summary line every 15 seconds instead). The shared DB is
+hits — and is rewritten in place as results arrive, with the elapsed clock
+refreshed at least once a second even between hits (when output is piped it
+prints a plain summary line every 15 seconds instead). The shared DB is
 synced every `--sync-every` seconds (default 300) and once more on exit, so
 peers see new finds promptly. Continuous nodes publish their sighting and
 player history but do not download the shared activity history; run a normal
@@ -401,7 +405,7 @@ Do not mix manual and automatic machines in the same pool: manual nodes are
 not registered, so they can overlap the automatic slices.
 
 `exclude.conf` applies to every round, to both halves: strategy ranges and
-rescan targets (including padded /20s) are carved before any backend runs,
+rescan targets are carved before any backend runs,
 and masscan additionally receives them as an `--excludefile`. The round
 header reports how many specs that removed, and edits to the file apply to
 the next round without a restart.

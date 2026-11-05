@@ -82,20 +82,28 @@ STRATEGY_NAMES = (
 # Rescan tiers: only servers whose last_seen falls in
 # (now - max_age, now - every) are due. require_players is matscan's
 # "rescan2" idea: servers with people on them are rechecked often.
+# Rescans ping the exact ip:port that was stored, never a padded /20.
+# Padding a 155k-server rescan into /20s turned it into >500M probes, so a
+# 300s round only reached a few hundred servers and reported almost no
+# hits.  masscan already paces SYNs globally (--rate), so exact endpoints
+# are not a "tight burst".  Neighborhood discovery stays in the normal
+# slash16/slash24 strategies, where it belongs.
+#
+# rescan-players goes first: those servers are online right now and are
+# the most valuable to refresh.
 RESCAN_TIERS = (
-    {"name": "rescan-1d", "every": 2 * 3600, "max_age": 86400,
-     "limit": 250_000, "sort": "oldest", "padded": True},
-    {"name": "rescan-7d", "every": 86400, "max_age": 7 * 86400,
-     "limit": 250_000, "sort": "oldest", "padded": True},
-    {"name": "rescan-30d", "every": 7 * 86400, "max_age": 30 * 86400,
-     "limit": 250_000, "sort": "random", "padded": True},
-    {"name": "rescan-365d", "every": 30 * 86400, "max_age": 365 * 86400,
-     "limit": 500_000, "sort": "random", "padded": True},
-    {"name": "rescan-old", "every": 365 * 86400, "max_age": 3650 * 86400,
-     "limit": 500_000, "sort": "random", "padded": True},
     {"name": "rescan-players", "every": 600, "max_age": 2 * 3600,
-     "limit": 10_000, "sort": "oldest", "padded": False,
-     "require_players": True},
+     "limit": 10_000, "sort": "oldest", "require_players": True},
+    {"name": "rescan-1d", "every": 2 * 3600, "max_age": 86400,
+     "limit": 250_000, "sort": "oldest"},
+    {"name": "rescan-7d", "every": 86400, "max_age": 7 * 86400,
+     "limit": 250_000, "sort": "oldest"},
+    {"name": "rescan-30d", "every": 7 * 86400, "max_age": 30 * 86400,
+     "limit": 250_000, "sort": "random"},
+    {"name": "rescan-365d", "every": 30 * 86400, "max_age": 365 * 86400,
+     "limit": 500_000, "sort": "random"},
+    {"name": "rescan-old", "every": 365 * 86400, "max_age": 3650 * 86400,
+     "limit": 500_000, "sort": "random"},
 )
 
 
@@ -261,11 +269,10 @@ STRATEGIES = {
 
 # --- rescan tiers ---------------------------------------------------------
 def rescan_targets(rows, tier):
-    """Due servers for one tier -> [(spec, port), ...].
+    """Due servers for one tier -> [(ip, port), ...].
 
-    Servers keep their own port (grouped by port before sweeping), and
-    padded tiers expand port-25565 hosts to their /20 -- matscan's trick
-    to avoid a tight burst at known addresses.
+    Servers keep their own exact address and port.  The caller groups them
+    by port before sweeping, so one masscan run checks each due endpoint.
     """
     now = _now()
     every = tier["every"]
@@ -300,16 +307,8 @@ def rescan_targets(rows, tier):
     for row in picked:
         ip_port = str(row.get("ip_port", ""))
         ip = _host_of(ip_port)
-        port = _port_of(ip_port)
-        if tier.get("padded") and port == 25565:
-            try:
-                a, b, c, _ = (int(x) for x in ip.split("."))
-            except Exception:
-                targets.append((ip, port))
-                continue
-            targets.append((f"{a}.{b}.{c & 0xF0}.0/20", port))
-        else:
-            targets.append((ip, port))
+        if ip:
+            targets.append((ip, _port_of(ip_port)))
     return targets
 
 
@@ -372,15 +371,21 @@ class LiveStatus:
             self._last_log = time.time()
             if self.tty:
                 self._draw_locked()
-        if not self.tty:
-            self._thread = threading.Thread(target=self._ticker, daemon=True)
-            self._thread.start()
+        # On a terminal the ticker keeps the elapsed clock moving even when
+        # hits are sparse (hit() still redraws immediately).  When output is
+        # piped it degrades to a periodic summary line.
+        self._thread = threading.Thread(target=self._ticker, daemon=True)
+        self._thread.start()
 
     def _ticker(self):
-        while not self._stop.wait(STATUS_INTERVAL):
+        interval = 1.0 if self.tty else STATUS_INTERVAL
+        while not self._stop.wait(interval):
             with self._lock:
                 if not self.active:
                     return
+                if self.tty:
+                    self._draw_locked()
+                    continue
                 now = time.time()
                 if now - self._last_log >= STATUS_LOG_INTERVAL:
                     self._last_log = now
@@ -1053,16 +1058,25 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     return 1
             else:
                 targets = []
+                seen_targets = set()
                 for tier in RESCAN_TIERS:
                     try:
                         picked = rescan_targets(before_rows, tier)
                     except Exception as exc:
                         print(f"  {tier['name']} failed: {exc}")
                         continue
-                    if picked:
-                        print(f"  {tier['name']}: {len(picked)} due")
-                    targets.extend(picked)
+                    added = 0
+                    for spec, port in picked:
+                        key = (spec, port)
+                        if key in seen_targets:
+                            continue
+                        seen_targets.add(key)
+                        targets.append(key)
+                        added += 1
+                    if added:
+                        print(f"  {tier['name']}: {added} due")
                 if targets:
+                    print(f"  {len(targets)} unique due endpoint(s)")
                     # Keep per-target ports: group by port for the sweep.
                     by_port = {}
                     for spec, port in targets:
