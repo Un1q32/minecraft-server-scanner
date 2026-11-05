@@ -334,6 +334,13 @@ def init_db(db_path):
             pass
         con.execute(f"CREATE INDEX IF NOT EXISTS idx_server_state_seq"
                     f" ON {base}(seq ASC)")
+        # The server is the sync source; its history must not be marked as
+        # pending upload when a client downloads the DB file.
+        for table in ("server_history", "player_history"):
+            try:
+                con.execute(f"UPDATE {table} SET synced=1 WHERE synced=0")
+            except Exception:
+                pass
         db_format.ensure_view(con, recreate=added)
         con.commit()
     finally:

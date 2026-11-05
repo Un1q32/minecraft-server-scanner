@@ -606,7 +606,7 @@ def init_server_db():
             # longer persisted, so drop any rows from before this rule
             # (the sync-import filter keeps them from coming back).
             try:
-                cur = con.execute("SELECT ip_port FROM servers")
+                cur = con.execute("SELECT ip_port FROM server_state")
                 drop = []
                 for (ip_port,) in cur.fetchall():
                     try:
@@ -1887,12 +1887,17 @@ def _merge_previous_history(con):
                     f"PRAGMA previous.table_info({table})")}
             except Exception:
                 prev_cols = set()
-            source = columns + (", synced" if "synced" in prev_cols
-                                else ", 0")
+            has_synced = "synced" in prev_cols
+            source = columns + (", synced" if has_synced else ", 0")
+            # Rows already uploaded are in the shared snapshot too; only
+            # carry over local history that has not reached the server yet.
+            where = (" WHERE ip_port IN"
+                     " (SELECT ip_port FROM main.server_state)")
+            if has_synced:
+                where += " AND synced=0"
             con.execute(
                 f"INSERT OR IGNORE INTO main.{table} ({columns}, synced)"
-                f" SELECT {source} FROM previous.{table}"
-                " WHERE ip_port IN (SELECT ip_port FROM main.servers)")
+                f" SELECT {source} FROM previous.{table}{where}")
     finally:
         try:
             con.execute("DETACH DATABASE previous")
@@ -1906,10 +1911,21 @@ def _prepare_downloaded_db(path):
     con = sqlite3.connect(path, timeout=10)
     try:
         con.row_factory = sqlite3.Row
+        # The download is a temporary file that will be atomically replaced.
+        # Disable journaling/fsync and use a larger cache for the bulk merge.
+        for pragma in ("PRAGMA journal_mode=OFF",
+                       "PRAGMA synchronous=OFF",
+                       "PRAGMA temp_store=MEMORY",
+                       "PRAGMA cache_size=-65536"):
+            try:
+                con.execute(pragma)
+            except Exception:
+                pass
         db_format.ensure_format(con)
         # Everything in a downloaded DB already came from the shared server.
-        con.execute("UPDATE server_history SET synced=1")
-        con.execute("UPDATE player_history SET synced=1")
+        # Most rows should already be synced; only fix the leftovers.
+        con.execute("UPDATE server_history SET synced=1 WHERE synced=0")
+        con.execute("UPDATE player_history SET synced=1 WHERE synced=0")
         base = db_format.base_table(con)
         cols = {str(r[1]) for r in con.execute(f"PRAGMA table_info({base})")}
         if not cols:
@@ -1919,7 +1935,7 @@ def _prepare_downloaded_db(path):
             con.execute(
                 f"ALTER TABLE {base} ADD COLUMN needs_sync INTEGER DEFAULT 0")
             added_columns = True
-        con.execute(f"UPDATE {base} SET needs_sync=0")
+        con.execute(f"UPDATE {base} SET needs_sync=0 WHERE needs_sync<>0")
         max_seq = 0
         if "seq" in cols:
             max_seq = int(con.execute(
@@ -1930,12 +1946,10 @@ def _prepare_downloaded_db(path):
         _merge_previous_history(con)
         db_format.ensure_view(con, recreate=added_columns)
         con.commit()
-        try:
-            con.execute("VACUUM")
-        except Exception:
-            pass
+        # The shared server already sends a compact VACUUM INTO snapshot;
+        # a second VACUUM here was by far the slowest part on slow disks.
         rows = int(con.execute(
-            "SELECT COUNT(*) FROM servers").fetchone()[0] or 0)
+            f"SELECT COUNT(*) FROM {base}").fetchone()[0] or 0)
         quick = con.execute("PRAGMA quick_check").fetchone()
         if quick and str(quick[0]).lower() != "ok":
             raise ConnectionError(
