@@ -227,6 +227,60 @@ ApplicationWindow {
         return [lo, hi]
     }
 
+    function historyTimes(points) {
+        var out = []
+        for (var i = 0; i < points.length; ++i)
+            out.push(Number(points[i].t) || 0)
+        return out
+    }
+
+    function uniqueHistoryTimes(points, players) {
+        var seen = ({})
+        var out = []
+        function add(value) {
+            var t = Number(value) || 0
+            if (t <= 0 || seen[String(t)])
+                return
+            seen[String(t)] = true
+            out.push(t)
+        }
+        for (var i = 0; i < points.length; ++i)
+            add(points[i].t)
+        for (var p = 0; p < players.length; ++p) {
+            var times = players[p].times || []
+            for (var k = 0; k < times.length; ++k)
+                add(times[k])
+        }
+        out.sort(function (a, b) { return a - b })
+        return out
+    }
+
+    /// Time-proportional x positions, but with a small minimum gap so
+    /// frequent rescans do not collapse into one pixel.
+    function chartPositions(times, left, pw, t0, t1) {
+        var out = []
+        var n = times.length
+        if (!n)
+            return out
+        var span = Math.max(1, t1 - t0)
+        var minGap = Math.min(4, pw / Math.max(1, n - 1))
+        var prev = -1e12
+        for (var i = 0; i < n; ++i) {
+            var x = left + ((Number(times[i]) || t0) - t0) / span * pw
+            if (x < prev + minGap)
+                x = prev + minGap
+            out.push(x)
+            prev = x
+        }
+        var last = out[n - 1]
+        if (last > left + pw) {
+            var scale = pw / Math.max(1, last - left)
+            for (var j = 0; j < n; ++j)
+                out[j] = left + (out[j] - left) * scale
+        }
+        return out
+    }
+
     function paintServerChart() {
         var ctx = serverChart.getContext("2d")
         var w = serverChart.width
@@ -261,7 +315,7 @@ ApplicationWindow {
         var range = historyRange(points, [])
         var t0 = range[0]
         var t1 = range[1]
-        var span = Math.max(1, t1 - t0)
+        var xs = chartPositions(historyTimes(points), left, pw, t0, t1)
         var peak = 1
         var counted = 0
         for (var i = 0; i < points.length; ++i) {
@@ -315,7 +369,7 @@ ApplicationWindow {
                 }
                 continue
             }
-            var x = left + ((Number(points[p].t) || t0) - t0) / span * pw
+            var x = xs[p]
             var py = top + ph - Math.min(1, (Number(v) || 0) / peak) * ph
             if (!drawing) {
                 ctx.moveTo(x, py)
@@ -334,7 +388,7 @@ ApplicationWindow {
             var dv = points[d].p
             if (dv === null || dv === undefined)
                 continue
-            var dx = left + ((Number(points[d].t) || t0) - t0) / span * pw
+            var dx = xs[d]
             var dy = top + ph - Math.min(1, (Number(dv) || 0) / peak) * ph
             ctx.beginPath()
             ctx.arc(dx, dy, 1.6, 0, Math.PI * 2)
@@ -347,7 +401,7 @@ ApplicationWindow {
         ctx.lineWidth = 1
         var tickStep = Math.max(1, Math.floor(points.length / 800))
         for (var s = 0; s < points.length; s += tickStep) {
-            var tx = left + ((Number(points[s].t) || t0) - t0) / span * pw
+            var tx = xs[s]
             ctx.beginPath()
             ctx.moveTo(tx + 0.5, top + ph + 2)
             ctx.lineTo(tx + 0.5, top + ph + 6)
@@ -416,10 +470,16 @@ ApplicationWindow {
             shown = Math.max(1, shown - 1)
         var rowHeight = (h - top - bottom) / Math.max(1, shown + (overflow > 0 ? 1 : 0))
         var pw = Math.max(1, w - left - right)
-        var range = historyRange(historyData.points || [], players)
+        var points = historyData.points || []
+        var range = historyRange(points, players)
         var t0 = range[0]
         var t1 = range[1]
         var span = Math.max(1, t1 - t0)
+        var uniqueTimes = uniqueHistoryTimes(points, players)
+        var xs = chartPositions(uniqueTimes, left, pw, t0, t1)
+        var xByTime = ({})
+        for (var u = 0; u < uniqueTimes.length; ++u)
+            xByTime[String(uniqueTimes[u])] = xs[u]
 
         ctx.font = "11px " + window.mono
         ctx.textBaseline = "middle"
@@ -451,7 +511,10 @@ ApplicationWindow {
             var times = player.times || []
             var eventStep = Math.max(1, Math.floor(times.length / 400))
             for (var k = 0; k < times.length; k += eventStep) {
-                var x = left + ((Number(times[k]) || t0) - t0) / span * pw
+                var eventTime = Number(times[k]) || 0
+                var x = xByTime[String(eventTime)]
+                if (x === undefined)
+                    x = left + ((eventTime || t0) - t0) / span * pw
                 ctx.beginPath()
                 ctx.arc(x, centerY, 1.7, 0, Math.PI * 2)
                 ctx.fill()

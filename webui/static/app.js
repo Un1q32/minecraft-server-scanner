@@ -247,6 +247,62 @@ function historyRange(points, players) {
   return [lo, hi];
 }
 
+function historyTimes(points) {
+  return points.map((point) => Number(point.t) || 0);
+}
+
+function uniqueHistoryTimes(points, players) {
+  const seen = new Map();
+  const out = [];
+  const add = (value) => {
+    const t = Number(value) || 0;
+    if (t <= 0 || seen.has(t)) {
+      return;
+    }
+    seen.set(t, true);
+    out.push(t);
+  };
+  for (const point of points) {
+    add(point.t);
+  }
+  for (const player of players) {
+    for (const value of player.times || []) {
+      add(value);
+    }
+  }
+  out.sort((a, b) => a - b);
+  return out;
+}
+
+// Time-proportional x positions with a small minimum gap, so quick rescans
+// remain distinct instead of collapsing into a single pixel.
+function chartPositions(times, left, pw, t0, t1) {
+  const out = [];
+  const n = times.length;
+  if (!n) {
+    return out;
+  }
+  const span = Math.max(1, t1 - t0);
+  const minGap = Math.min(4, pw / Math.max(1, n - 1));
+  let prev = -1e12;
+  for (const value of times) {
+    let x = left + (((Number(value) || t0) - t0) / span) * pw;
+    if (x < prev + minGap) {
+      x = prev + minGap;
+    }
+    out.push(x);
+    prev = x;
+  }
+  const last = out[n - 1];
+  if (last > left + pw) {
+    const scale = pw / Math.max(1, last - left);
+    for (let i = 0; i < n; i += 1) {
+      out[i] = left + (out[i] - left) * scale;
+    }
+  }
+  return out;
+}
+
 function chartSetup(canvas, height) {
   const dpr = window.devicePixelRatio || 1;
   const width = Math.max(80, canvas.clientWidth || 320);
@@ -299,6 +355,7 @@ function drawServerChart(points) {
   const ph = Math.max(1, h - top - bottom);
   const [t0, t1] = historyRange(points, []);
   const span = Math.max(1, t1 - t0);
+  const xs = chartPositions(historyTimes(points), left, pw, t0, t1);
   const peak = peakPlayers(points);
   const counted = points.filter((p) => p.p !== null && p.p !== undefined).length;
   const mid = "rgba(128,128,128,0.4)";
@@ -325,7 +382,8 @@ function drawServerChart(points) {
   ctx.strokeStyle = CHART_COLORS[0];
   ctx.lineWidth = 1.5;
   ctx.beginPath();
-  for (const point of points) {
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
     if (point.p === null || point.p === undefined) {
       if (drawing) {
         ctx.stroke();
@@ -334,7 +392,7 @@ function drawServerChart(points) {
       }
       continue;
     }
-    const x = left + (((Number(point.t) || t0) - t0) / span) * pw;
+    const x = xs[index];
     const y = top + ph - Math.min(1, (Number(point.p) || 0) / peak) * ph;
     if (!drawing) {
       ctx.moveTo(x, y);
@@ -354,7 +412,7 @@ function drawServerChart(points) {
     if (point.p === null || point.p === undefined) {
       continue;
     }
-    const x = left + (((Number(point.t) || t0) - t0) / span) * pw;
+    const x = xs[i];
     const y = top + ph - Math.min(1, (Number(point.p) || 0) / peak) * ph;
     ctx.beginPath();
     ctx.arc(x, y, 1.6, 0, Math.PI * 2);
@@ -367,7 +425,7 @@ function drawServerChart(points) {
   ctx.lineWidth = 1;
   const tickStep = Math.max(1, Math.floor(points.length / 800));
   for (let i = 0; i < points.length; i += tickStep) {
-    const x = left + (((Number(points[i].t) || t0) - t0) / span) * pw;
+    const x = xs[i];
     ctx.beginPath();
     ctx.moveTo(x + 0.5, top + ph + 2);
     ctx.lineTo(x + 0.5, top + ph + 6);
@@ -391,7 +449,7 @@ function drawServerChart(points) {
     ctx.globalAlpha = 1;
   }
 
-  serverGeom = { left, top, pw, ph, t0, span, points };
+  serverGeom = { left, top, pw, ph, t0, span, points, xs };
 }
 
 function drawPlayerChart(players) {
@@ -410,8 +468,15 @@ function drawPlayerChart(players) {
   const top = 6;
   const rowHeight = 13;
   const pw = Math.max(1, w - left - right);
-  const [t0, t1] = historyRange((historyData && historyData.points) || [], players);
+  const points = (historyData && historyData.points) || [];
+  const [t0, t1] = historyRange(points, players);
   const span = Math.max(1, t1 - t0);
+  const uniqueTimes = uniqueHistoryTimes(points, players);
+  const xs = chartPositions(uniqueTimes, left, pw, t0, t1);
+  const xByTime = new Map();
+  for (let i = 0; i < uniqueTimes.length; i += 1) {
+    xByTime.set(uniqueTimes[i], xs[i]);
+  }
   const mid = "rgba(128,128,128,0.35)";
   const rows = [];
 
@@ -439,15 +504,22 @@ function drawPlayerChart(players) {
     ctx.globalAlpha = 1;
 
     const times = (player.times || []).map(Number);
+    const eventXs = times.map((t) => {
+      const known = xByTime.get(t);
+      if (known !== undefined) {
+        return known;
+      }
+      return left + (((t || t0) - t0) / span) * pw;
+    });
     ctx.fillStyle = color;
     const eventStep = Math.max(1, Math.floor(times.length / 400));
     for (let k = 0; k < times.length; k += eventStep) {
-      const x = left + ((times[k] - t0) / span) * pw;
+      const x = eventXs[k];
       ctx.beginPath();
       ctx.arc(x, centerY, 1.7, 0, Math.PI * 2);
       ctx.fill();
     }
-    rows.push({ player, centerY, times });
+    rows.push({ player, centerY, times, xs: eventXs });
   }
 
   if (overflow > 0) {
@@ -551,13 +623,12 @@ serverChart.addEventListener("mousemove", (event) => {
     hideTip();
     return;
   }
-  const target = geom.t0 + ((x - geom.left) / geom.pw) * geom.span;
   let best = null;
   let bestDistance = Infinity;
-  for (const point of geom.points) {
-    const distance = Math.abs((Number(point.t) || 0) - target);
+  for (let i = 0; i < geom.points.length; i += 1) {
+    const distance = Math.abs(geom.xs[i] - x);
     if (distance < bestDistance) {
-      best = point;
+      best = geom.points[i];
       bestDistance = distance;
     }
   }
@@ -590,14 +661,17 @@ playerChart.addEventListener("mousemove", (event) => {
     hideTip();
     return;
   }
-  const target = playerGeom.t0 + ((x - playerGeom.left) / playerGeom.pw) * playerGeom.span;
-  let best = row.times[0];
-  for (const time of row.times) {
-    if (Math.abs(time - target) < Math.abs(best - target)) {
-      best = time;
+  let bestIndex = 0;
+  let bestDistance = Infinity;
+  for (let i = 0; i < row.xs.length; i += 1) {
+    const distance = Math.abs(row.xs[i] - x);
+    if (distance < bestDistance) {
+      bestIndex = i;
+      bestDistance = distance;
     }
   }
-  showTip(`${row.player.name} — ${chartTime(best)}`, event.clientX, event.clientY);
+  showTip(`${row.player.name} — ${chartTime(row.times[bestIndex])}`,
+          event.clientX, event.clientY);
 });
 
 serverChart.addEventListener("mouseleave", hideTip);
