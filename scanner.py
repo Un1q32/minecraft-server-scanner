@@ -261,6 +261,9 @@ _WHITELIST_LAST_ONLINE_PROBE = {}
 # "Connection throttled").
 _PROTOCOL_CACHE = {}
 _PROTOCOL_CACHE_LOCK = threading.Lock()
+_OFFLINE_UUID_CACHE = {}
+_OFFLINE_UUID_CACHE_LOCK = threading.Lock()
+MAX_OFFLINE_UUID_CACHE = 50000
 
 def sanitize_protocol(value, default=None):
     """Return a usable protocol number, or ``default``.
@@ -4056,6 +4059,57 @@ def recv_bounded(sock, length, limit, timeout=15.0):
         data.extend(chunk)
     return bytes(data)
 
+
+def _varint_from_buffer(buf, pos):
+    """(value, next_pos), or (None, pos) when the buffer is too short."""
+    value = 0
+    shift = 0
+    while True:
+        if pos >= len(buf):
+            return None, pos
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return value, pos
+        shift += 7
+        if shift > 35:
+            raise ValueError("Varint too big")
+
+
+def recv_status_json(sock, limit=MAX_STATUS_RESPONSE_BYTES):
+    """Read a status-response JSON body with as few recv() calls as possible.
+
+    The common case is one packet: a length varint, packet id varint, JSON
+    length varint, then the JSON.  A single buffered read usually contains
+    all of it, avoiding four separate tiny recv() calls per server.
+    """
+    buf = bytearray()
+    while True:
+        chunk = sock.recv(8192)
+        if not chunk:
+            raise IOError("Socket closed")
+        buf.extend(chunk)
+        packet_length, pos = _varint_from_buffer(buf, 0)
+        if packet_length is None:
+            continue
+        packet_id, pos2 = _varint_from_buffer(buf, pos)
+        if packet_id is None:
+            continue
+        json_length, pos3 = _varint_from_buffer(buf, pos2)
+        if json_length is None:
+            continue
+        if packet_length < 0 or packet_length > limit + 10:
+            raise ValueError(f"Packet too large ({packet_length} bytes; limit {limit})")
+        if json_length < 0 or json_length > limit:
+            raise ValueError(f"Packet too large ({json_length} bytes; limit {limit})")
+        end = pos3 + json_length
+        if len(buf) >= end:
+            return bytes(buf[pos3:end])
+        # Large status payload (often a favicon): read only the remainder.
+        buf.extend(recv_bounded(sock, end - len(buf), limit))
+        return bytes(buf[pos3:end])
+
 def parse_description(desc):
     if isinstance(desc, str):
         return sanitize_motd(desc)
@@ -4084,10 +4138,7 @@ def ping_server(entry, proxy=None, persist=True):
             sock.sendall(varint_encode(len(handshake)) + handshake +
                          varint_encode(1) + b'\x00')
 
-            _ = varint_decode(sock)
-            _ = varint_decode(sock)
-            json_length = varint_decode(sock)
-            data = recv_bounded(sock, json_length, MAX_STATUS_RESPONSE_BYTES).decode('utf-8')
+            data = recv_status_json(sock).decode('utf-8')
             response = json.loads(data)
             if not isinstance(response, dict):
                 return None
@@ -4123,24 +4174,15 @@ def ping_server(entry, proxy=None, persist=True):
                 if pname:
                     players_sample.append((pid, pname))
 
-            # cracked detection: if any reported player id matches the offline-mode UUID for that name
-            def _offline_uuid_for_name(name: str) -> str:
-                # Replicate Java's UUID.nameUUIDFromBytes("OfflinePlayer:" + name)
-                h = hashlib.md5()
-                h.update(b"OfflinePlayer:")
-                h.update(name.encode('utf-8'))
-                d = bytearray(h.digest())
-                # set variant and version bits like Java's nameUUIDFromBytes (version 3)
-                d[6] = (d[6] & 0x0f) | 0x30
-                d[8] = (d[8] & 0x3f) | 0x80
-                return str(uuid.UUID(bytes=bytes(d)))
-
+            # cracked detection: if any reported player id matches the
+            # offline-mode UUID for that name.  offline_uuid_nodash() caches
+            # by name because players repeat across servers.
             cracked = None
             for pid, pname in players_sample:
                 if not pname:
                     continue
                 try:
-                    off_uuid = _offline_uuid_for_name(pname).replace('-', '').lower()
+                    off_uuid = offline_uuid_nodash(pname)
                     reported = pid.replace('-', '').lower()
                     if reported == off_uuid:
                         cracked = True
@@ -4324,13 +4366,24 @@ def unpack_login_packet(packet_data, compression_threshold):
     return packet_data
 
 def offline_uuid_nodash(name):
+    """Java's OfflinePlayer UUID (no dashes), cached per player name."""
+    name = str(name or "")
+    try:
+        return _OFFLINE_UUID_CACHE[name]
+    except KeyError:
+        pass
     h = hashlib.md5()
     h.update(b"OfflinePlayer:")
     h.update(name.encode("utf-8"))
     data = bytearray(h.digest())
     data[6] = (data[6] & 0x0F) | 0x30
     data[8] = (data[8] & 0x3F) | 0x80
-    return uuid.UUID(bytes=bytes(data)).hex
+    result = bytes(data).hex()
+    with _OFFLINE_UUID_CACHE_LOCK:
+        if len(_OFFLINE_UUID_CACHE) >= MAX_OFFLINE_UUID_CACHE:
+            _OFFLINE_UUID_CACHE.clear()
+        _OFFLINE_UUID_CACHE[name] = result
+    return result
 
 # --- Modloader (Forge / NeoForge) detection ---------------------------------
 # NeoForge/Forge servers advertise themselves in the status ping
@@ -4438,10 +4491,7 @@ def get_server_status_full(host, port=25565, proxy=None):
         sock.sendall(varint_encode(len(handshake)) + handshake +
                      varint_encode(1) + b"\x00")
 
-        _ = recv_varint(sock)
-        _ = recv_varint(sock)
-        json_length = recv_varint(sock)
-        status_json = recv_bounded(sock, json_length, MAX_STATUS_RESPONSE_BYTES).decode("utf-8", errors="ignore")
+        status_json = recv_status_json(sock).decode("utf-8", errors="ignore")
         data = json.loads(status_json)
         if not isinstance(data, dict):
             data = {}
@@ -7627,10 +7677,8 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
             )
             sock.sendall(varint_encode(len(handshake)) + handshake +
                          varint_encode(1) + b'\x00')
-            _ = varint_decode(sock)
-            _ = varint_decode(sock)
-            json_length = varint_decode(sock)
-            data = recv_bounded(sock, json_length, MAX_FAVICON_RESPONSE_BYTES).decode('utf-8')
+            data = recv_status_json(
+                sock, MAX_FAVICON_RESPONSE_BYTES).decode('utf-8')
             response = json.loads(data)
             fav = response.get('favicon')
             if isinstance(fav, str) and fav.startswith('data:image/'):
