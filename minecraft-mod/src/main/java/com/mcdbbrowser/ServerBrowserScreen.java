@@ -16,6 +16,7 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.ObjectSelectionList;
 import net.minecraft.client.gui.components.Tooltip;
+import net.minecraft.client.gui.components.events.GuiEventListener;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
@@ -431,6 +432,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		private static final int MAX_VERSION_WIDTH = 140;
 
 		private @Nullable Entry hoveredEntry;
+		private double scrollOffset;
 
 		ServerListWidget(int width, int height, int y) {
 			super(ServerBrowserScreen.this.minecraft, width, height, y, ENTRY_HEIGHT);
@@ -464,6 +466,24 @@ public class ServerBrowserScreen extends DropdownScreen {
 			return this.children().size() * ENTRY_HEIGHT + 2 * LIST_PADDING;
 		}
 
+		@Override
+		public double scrollAmount() {
+			return this.scrollOffset;
+		}
+
+		@Override
+		public void setScrollAmount(double amount) {
+			// AbstractSelectionList.setScrollAmount() calls repositionEntries(),
+			// which walks every one of the ~200k entries on every wheel tick.
+			// Rows are positioned from the scroll offset while drawing instead.
+			this.scrollOffset = Math.max(0.0, Math.min(amount, this.maxScrollAmount()));
+		}
+
+		@Override
+		public Optional<GuiEventListener> getChildAt(double x, double y) {
+			return Optional.ofNullable(this.entryAt(x, y));
+		}
+
 		private @Nullable Entry entryAt(double x, double y) {
 			int index = this.rowIndexAt(y);
 			if (index < 0 || index >= this.children().size() || x < this.getRowLeft() || x >= this.getRowRight()) {
@@ -494,8 +514,17 @@ public class ServerBrowserScreen extends DropdownScreen {
 			List<Entry> entries = this.children();
 			int first = Math.max(0, this.rowIndexAt(this.getY()));
 			int last = Math.min(entries.size() - 1, this.rowIndexAt(this.getBottom()));
+			int rowLeft = this.getRowLeft();
+			int rowWidth = this.getRowWidth();
+			int top = this.firstRowY();
 			for (int i = first; i <= last; i++) {
-				this.extractItem(graphics, mouseX, mouseY, a, entries.get(i));
+				Entry entry = entries.get(i);
+				// Only the rows about to be drawn get their coordinates
+				// updated; the rest stay untouched until they scroll in.
+				entry.setX(rowLeft);
+				entry.setY(top + i * ENTRY_HEIGHT);
+				entry.setWidth(rowWidth);
+				this.extractItem(graphics, mouseX, mouseY, a, entry);
 			}
 		}
 
