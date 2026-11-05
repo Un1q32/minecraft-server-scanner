@@ -3,7 +3,8 @@
 	"package": "com.mcdbbrowser.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
-		"ConnectScreenMixin"
+		"ConnectScreenMixin",
+		"DisconnectedScreenMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

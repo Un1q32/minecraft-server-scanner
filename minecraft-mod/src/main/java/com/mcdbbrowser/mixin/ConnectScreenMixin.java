@@ -1,6 +1,7 @@
 package com.mcdbbrowser.mixin;
 
 import com.mcdbbrowser.ConnectionHistory;
+import com.mcdbbrowser.WhitelistAutoUpdate;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.Screen;
@@ -20,6 +21,7 @@ abstract class ConnectScreenMixin {
 	private static void mcdbbrowser$logAttempt(Screen parent, Minecraft minecraft, ServerAddress address, @Nullable ServerData server, boolean quickPlay, @Nullable TransferState transferState, CallbackInfo ci) {
 		if (server != null && !server.isRealm()) {
 			ConnectionHistory.add(server.name, server.ip);
+			WhitelistAutoUpdate.track(server.ip);
 		}
 	}
 }

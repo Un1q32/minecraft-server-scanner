@@ -56,6 +56,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		List.of(new ServerDatabase.SortKey(ServerDatabase.Sort.LAST_SEEN, true)));
 	private @Nullable QueryResult result;
 	private int ticksUntilSearch = -1;
+	private long queryGeneration;
 	private boolean loading;
 	private volatile long downloadedBytes;
 	private volatile long totalBytes = -1;
@@ -89,6 +90,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 	@Override
 	protected void init() {
+		WhitelistAutoUpdate.attach(this);
 		int right = this.width - MARGIN;
 		int directionX = right - ROW_HEIGHT;
 		int sortX = directionX - GAP - SORT_BUTTON_WIDTH;
@@ -244,7 +246,8 @@ public class ServerBrowserScreen extends DropdownScreen {
 		}
 		if (this.result != null) {
 			this.result.rows().sort(ServerDatabase.comparator(this.sortKeys));
-			this.list.updateRows(this.result.rows());
+			this.list.clearSelection();
+			this.list.setRowsPreservingScroll(this.result.rows());
 		} else {
 			this.runQuery();
 		}
@@ -268,7 +271,13 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 	private void runQuery() {
 		List<ServerDatabase.SortKey> requestedSort = List.copyOf(this.sortKeys);
+		long generation = ++this.queryGeneration;
 		ServerDatabase.query(this.query, requestedSort).whenComplete((queryResult, throwable) -> this.minecraft.execute(() -> {
+			// A newer keystroke or filter change superseded this query. Applying
+			// its rows would only wake up the list for a result nobody sees.
+			if (generation != this.queryGeneration) {
+				return;
+			}
 			if (throwable != null) {
 				McdbBrowserClient.LOGGER.error("Server list query failed", throwable);
 				this.error = "Query failed: " + describe(throwable);
@@ -297,7 +306,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	}
 
 	private void updateButtonStates() {
-		boolean hasSelection = this.list.getSelected() != null;
+		boolean hasSelection = this.list.hasSelection();
 		boolean idle = !this.loading && !this.scannerBusy;
 		this.joinButton.active = hasSelection && this.canJoin();
 		this.addButton.active = hasSelection;
@@ -310,8 +319,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	}
 
 	private @Nullable ServerRecord selectedServer() {
-		ServerListWidget.Entry entry = this.list.getSelected();
-		return entry == null ? null : entry.server;
+		return this.list.selectedServer();
 	}
 
 	private void joinSelected() {
@@ -372,10 +380,13 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 	private void recheckWhitelistSelected() {
 		ServerRecord server = this.selectedServer();
-		if (server != null) {
-			this.runScannerAction("Checking whitelist for " + server.address() + "…",
-				() -> ScannerRunner.recheckWhitelist(server.address(), this::setScannerStatus));
+		if (server == null) {
+			return;
 		}
+		String address = server.address();
+		this.runScannerAction("Checking whitelist for " + address + "…",
+			() -> ScannerRunner.recheckWhitelist(address, this::setScannerStatus),
+			() -> this.refreshWhitelist(address), true);
 	}
 
 	private void syncDatabase() {
@@ -384,6 +395,16 @@ public class ServerBrowserScreen extends DropdownScreen {
 	}
 
 	private void runScannerAction(String status, Supplier<CompletableFuture<ScannerRunner.Result>> action) {
+		this.runScannerAction(status, action, () -> this.load(true));
+	}
+
+	private void runScannerAction(String status, Supplier<CompletableFuture<ScannerRunner.Result>> action,
+			Runnable onSuccess) {
+		this.runScannerAction(status, action, onSuccess, false);
+	}
+
+	private void runScannerAction(String status, Supplier<CompletableFuture<ScannerRunner.Result>> action,
+			Runnable onSuccess, boolean refreshEvenOnFailure) {
 		if (this.scannerBusy) {
 			return;
 		}
@@ -397,15 +418,55 @@ public class ServerBrowserScreen extends DropdownScreen {
 			this.scannerStatus = null;
 			if (throwable != null) {
 				this.error = "Scanner failed: " + describe(throwable);
+				if (refreshEvenOnFailure) {
+					onSuccess.run();
+				}
 			} else if (result == null || !result.ok()) {
 				this.error = result == null ? "Scanner failed" : result.message();
+				if (refreshEvenOnFailure) {
+					onSuccess.run();
+				}
 			} else {
 				this.showNotice(result.message());
-				// mcscan.py --sync has updated the shared DB; pull the result.
-				this.load(true);
+				onSuccess.run();
 			}
 			this.updateButtonStates();
 		}));
+	}
+
+	/** Read back the scanner verdict so the list updates without a full re-download. */
+	private void refreshWhitelist(String address) {
+		ScannerRunner.storedWhitelist(address).whenComplete((label, throwable) -> this.minecraft.execute(() -> {
+			if (throwable != null) {
+				McdbBrowserClient.LOGGER.warn("Could not read the whitelist result for {}", address, throwable);
+				return;
+			}
+			if (label != null && !label.isBlank()) {
+				this.applyWhitelist(address, label);
+			}
+			this.updateButtonStates();
+		}));
+	}
+
+	/** Replace one loaded row's whitelist verdict and cache it for the next visit. */
+	void applyWhitelist(String address, String label) {
+		ServerDatabase.setWhitelist(address, label);
+		if (this.result == null) {
+			return;
+		}
+		List<ServerRecord> rows = this.result.rows();
+		boolean changed = false;
+		for (int i = 0; i < rows.size(); i++) {
+			ServerRecord row = rows.get(i);
+			if (row.address().equalsIgnoreCase(address)) {
+				rows.set(i, row.withWhitelist(label));
+				changed = true;
+				break;
+			}
+		}
+		if (changed) {
+			this.list.setRowsPreservingScroll(rows);
+		}
 	}
 
 	private void setScannerStatus(String line) {
@@ -493,32 +554,119 @@ public class ServerBrowserScreen extends DropdownScreen {
 		private static final int LIST_PADDING = 2;
 		private static final int MAX_ROW_WIDTH = 420;
 		private static final int MAX_VERSION_WIDTH = 140;
+		/** Rows kept ready above and below the viewport so small scrolls don't rebuild. */
+		private static final int WINDOW_BUFFER = 4;
 
 		private @Nullable Entry hoveredEntry;
 		private double scrollOffset;
+		private List<ServerRecord> rows = List.of();
+		private int windowStart;
+		private int windowEnd;
+		private int selectedIndex = -1;
+		private final Entry offscreenSelection = new Entry();
 
 		ServerListWidget(int width, int height, int y) {
 			super(ServerBrowserScreen.this.minecraft, width, height, y, ENTRY_HEIGHT);
 		}
 
+		/** Replace the result set, keeping a window of visible entries instead of one object per row. */
 		void setRows(List<ServerRecord> servers) {
-			if (this.children().size() == servers.size()) {
-				this.updateRows(servers);
-			} else {
-				this.replaceEntries(servers.stream().map(Entry::new).toList());
-			}
-			this.setScrollAmount(0);
+			this.rows = servers == null ? List.of() : servers;
+			this.selectedIndex = -1;
+			this.scrollOffset = 0;
+			this.refreshWindow(true);
 		}
 
-		/** Reorder existing row objects to match a new list, preserving scroll. */
-		void updateRows(List<ServerRecord> servers) {
-			List<Entry> entries = this.children();
-			int count = Math.min(entries.size(), servers.size());
-			for (int i = 0; i < count; i++) {
-				entries.get(i).setServer(servers.get(i));
+		/** Reorder the result set without jumping the viewport (used when the sort changes). */
+		void setRowsPreservingScroll(List<ServerRecord> servers) {
+			this.rows = servers == null ? List.of() : servers;
+			if (this.selectedIndex >= this.rows.size()) {
+				this.selectedIndex = -1;
 			}
-			this.hoveredEntry = null;
-			this.setSelected(null);
+			this.setScrollAmount(this.scrollOffset);
+			this.refreshWindow(true);
+		}
+
+		void clearSelection() {
+			this.selectedIndex = -1;
+		}
+
+		boolean hasSelection() {
+			return this.selectedIndex >= 0 && this.selectedIndex < this.rows.size();
+		}
+
+		@Nullable ServerRecord selectedServer() {
+			return this.hasSelection() ? this.rows.get(this.selectedIndex) : null;
+		}
+
+		@Override
+		public @Nullable Entry getSelected() {
+			if (!this.hasSelection()) {
+				return null;
+			}
+			int index = this.selectedIndex;
+			if (index >= this.windowStart && index < this.windowEnd
+				&& index - this.windowStart < this.children().size()) {
+				return this.children().get(index - this.windowStart);
+			}
+			// The selected row scrolled out of the window: keep the buttons enabled
+			// by handing back a detached entry for that row.
+			this.offscreenSelection.assign(index, this.rows.get(index));
+			this.offscreenSelection.setX(this.getRowLeft());
+			this.offscreenSelection.setY(this.firstRowY() + index * ENTRY_HEIGHT);
+			this.offscreenSelection.setWidth(this.getRowWidth());
+			this.offscreenSelection.setHeight(ENTRY_HEIGHT);
+			return this.offscreenSelection;
+		}
+
+		@Override
+		public void setSelected(@Nullable Entry entry) {
+			this.selectedIndex = entry == null || entry.index < 0 || entry.index >= this.rows.size()
+				? -1 : entry.index;
+		}
+
+		/** Keep children() limited to the visible rows plus a small buffer. */
+		private void refreshWindow(boolean force) {
+			if (this.rows == null) {
+				return;
+			}
+			int count = this.rows.size();
+			int firstRow = Math.max(0, Mth.floor(this.scrollOffset / ENTRY_HEIGHT));
+			int visibleRows = (this.getHeight() + ENTRY_HEIGHT - 1) / ENTRY_HEIGHT + 1;
+			int start = Math.max(0, firstRow - WINDOW_BUFFER);
+			int end = Math.min(count, firstRow + visibleRows + WINDOW_BUFFER);
+			List<Entry> entries = this.children();
+			if (!force && start == this.windowStart && end == this.windowEnd
+				&& entries.size() == end - start) {
+				return;
+			}
+
+			int needed = end - start;
+			if (entries.size() != needed) {
+				// children() is an unmodifiable view, so resize through the
+				// list's own helpers. Only the window is ever cleared, not all
+				// ~250k result rows.
+				this.clearEntries();
+				for (int i = 0; i < needed; i++) {
+					this.addEntry(new Entry(), ENTRY_HEIGHT);
+				}
+				entries = this.children();
+			}
+
+			int rowLeft = this.getRowLeft();
+			int rowWidth = this.getRowWidth();
+			int top = this.firstRowY();
+			for (int i = 0; i < needed; i++) {
+				int row = start + i;
+				Entry entry = entries.get(i);
+				entry.assign(row, this.rows.get(row));
+				entry.setX(rowLeft);
+				entry.setWidth(rowWidth);
+				entry.setHeight(ENTRY_HEIGHT);
+				entry.setY(top + row * ENTRY_HEIGHT);
+			}
+			this.windowStart = start;
+			this.windowEnd = end;
 		}
 
 		@Override
@@ -541,7 +689,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 		@Override
 		protected int contentHeight() {
-			return this.children().size() * ENTRY_HEIGHT + 2 * LIST_PADDING;
+			return (this.rows == null ? 0 : this.rows.size()) * ENTRY_HEIGHT + 2 * LIST_PADDING;
 		}
 
 		@Override
@@ -552,9 +700,10 @@ public class ServerBrowserScreen extends DropdownScreen {
 		@Override
 		public void setScrollAmount(double amount) {
 			// AbstractSelectionList.setScrollAmount() calls repositionEntries(),
-			// which walks every one of the ~200k entries on every wheel tick.
-			// Rows are positioned from the scroll offset while drawing instead.
+			// which would walk every entry on every wheel tick. Rows are positioned
+			// from the scroll offset while drawing instead.
 			this.scrollOffset = Math.max(0.0, Math.min(amount, this.maxScrollAmount()));
+			this.refreshWindow(false);
 		}
 
 		@Override
@@ -582,10 +731,16 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 		private @Nullable Entry entryAt(double x, double y) {
 			int index = this.rowIndexAt(y);
-			if (index < 0 || index >= this.children().size() || x < this.getRowLeft() || x >= this.getRowRight()) {
+			if (index < 0 || index >= this.rows.size() || x < this.getRowLeft() || x >= this.getRowRight()) {
 				return null;
 			}
-			return this.children().get(index);
+			if (index < this.windowStart || index >= this.windowEnd) {
+				this.refreshWindow(true);
+			}
+			if (index < this.windowStart || index >= this.windowEnd) {
+				return null;
+			}
+			return this.children().get(index - this.windowStart);
 		}
 
 		@Override
@@ -607,18 +762,18 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 		@Override
 		protected void extractListItems(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a) {
-			List<Entry> entries = this.children();
-			int first = Math.max(0, this.rowIndexAt(this.getY()));
-			int last = Math.min(entries.size() - 1, this.rowIndexAt(this.getBottom()));
+			this.refreshWindow(false);
+			int first = Math.max(this.windowStart, Math.max(0, this.rowIndexAt(this.getY())));
+			int last = Math.min(this.windowEnd - 1, this.rowIndexAt(this.getBottom()));
 			int rowLeft = this.getRowLeft();
 			int rowWidth = this.getRowWidth();
 			int top = this.firstRowY();
-			for (int i = first; i <= last; i++) {
-				Entry entry = entries.get(i);
+			for (int row = first; row <= last; row++) {
+				Entry entry = this.children().get(row - this.windowStart);
 				// Only the rows about to be drawn get their coordinates
 				// updated; the rest stay untouched until they scroll in.
 				entry.setX(rowLeft);
-				entry.setY(top + i * ENTRY_HEIGHT);
+				entry.setY(top + row * ENTRY_HEIGHT);
 				entry.setWidth(rowWidth);
 				this.extractItem(graphics, mouseX, mouseY, a, entry);
 			}
@@ -626,7 +781,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 		@Override
 		protected void extractItem(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a, Entry entry) {
-			if (this.getSelected() == entry) {
+			if (entry.index == this.selectedIndex) {
 				this.extractSelection(graphics, entry, this.isFocused() ? WHITE : GRAY);
 			}
 			entry.extractContent(graphics, mouseX, mouseY, entry == this.hoveredEntry, a);
@@ -636,6 +791,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 			private static final Component SEPARATOR = Component.literal(" • ").withStyle(ChatFormatting.DARK_GRAY);
 
 			ServerRecord server;
+			int index = -1;
 			// Built on first draw, since most rows are never scrolled into view
 			private @Nullable String playerCount;
 			private @Nullable Component motd;
@@ -645,11 +801,12 @@ public class ServerBrowserScreen extends DropdownScreen {
 			private @Nullable List<Component> playersTooltip;
 			private @Nullable List<Component> detailsTooltip;
 
-			Entry(ServerRecord server) {
-				this.server = server;
+			Entry() {
 			}
 
-			void setServer(ServerRecord server) {
+			/** Recycled window slots point at a new row without allocating a new entry. */
+			void assign(int index, ServerRecord server) {
+				this.index = index;
 				this.server = server;
 				this.playerCount = null;
 				this.motd = null;

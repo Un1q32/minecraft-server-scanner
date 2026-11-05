@@ -45,6 +45,13 @@ public record ServerRecord(
 		return s == null ? "" : s;
 	}
 
+	ServerRecord withWhitelist(String newWhitelist) {
+		return new ServerRecord(this.address, this.motd, this.playersOnline, this.maxPlayers,
+			this.version, this.protocol, this.cracked, newWhitelist == null ? "" : newWhitelist,
+			this.firstSeenEpochSeconds, this.lastSeenEpochSeconds, this.timesSeen,
+			this.playersNowJson, this.playersEverJson);
+	}
+
 	public WhitelistState whitelistState() {
 		if (this.whitelist.startsWith("Not Whitelisted")) {
 			return WhitelistState.OPEN;

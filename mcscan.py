@@ -12,6 +12,8 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --recheck-whitelist IP:PORT ...
                                     probe whitelist status for those servers
+  mcscan.py --set-whitelist IP:PORT LABEL
+                                    store a whitelist verdict observed directly
   mcscan.py --rescan IP:PORT ...    re-ping those servers, update local DB
   mcscan.py --scan 1.0.0.0/8 ...    scan, print hits live, then sync
   mcscan.py --export out.csv        dump the full local DB to CSV
@@ -228,6 +230,21 @@ def cmd_sync():
         print("notes sync not supported by this server; skipped.")
     if summary.get("notes_error"):
         print(f"warning: notes sync failed: {summary['notes_error']}")
+    return 0
+
+
+def cmd_set_whitelist(ip, label):
+    """Store a whitelist verdict that a real client join already produced."""
+    ip = scanner.strict_ip_port(ip)
+    if not ip:
+        print(f"error: {ip!r} is not a valid ip:port", flush=True)
+        return 2
+    label = (label or "").strip()
+    if not label:
+        print("error: whitelist label is empty", flush=True)
+        return 2
+    scanner.update_server_whitelist(ip, label)
+    print(f"whitelist set: {ip}: {label}", flush=True)
     return 0
 
 
@@ -815,6 +832,9 @@ def main(argv=None):
         help="probe whitelist status for these servers and update the DB "
              "(same probes as the GUI's Check Whitelist)")
     parser.add_argument(
+        "--set-whitelist", nargs=2, metavar=("IP:PORT", "LABEL"), default=None,
+        help="store a whitelist verdict observed from a real client join")
+    parser.add_argument(
         "--rescan", nargs="+", metavar="IP:PORT", default=None,
         help="re-ping these servers and update the local DB (status ping "
              "only; no masscan and no shared-DB sync)")
@@ -891,7 +911,8 @@ def main(argv=None):
 
     if not args.sync and args.targets is None and not args.export \
             and args.init_db is None and not args.continuous \
-            and args.recheck_whitelist is None and args.rescan is None \
+            and args.recheck_whitelist is None and args.set_whitelist is None \
+            and args.rescan is None \
             and not args.download_db and not args.vacuum_db:
         parser.print_help()
         return 2
@@ -916,6 +937,8 @@ def main(argv=None):
             rc = cmd_sync() or rc
         if args.recheck_whitelist is not None:
             rc = cmd_recheck_whitelist(args.recheck_whitelist) or rc
+        if args.set_whitelist is not None:
+            rc = cmd_set_whitelist(*args.set_whitelist) or rc
         if args.rescan is not None:
             rc = cmd_rescan(args.rescan) or rc
         if args.continuous:

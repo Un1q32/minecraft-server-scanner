@@ -7,6 +7,9 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -16,6 +19,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.jspecify.annotations.Nullable;
+import org.sqlite.SQLiteConfig;
+import org.sqlite.SQLiteDataSource;
+import org.sqlite.SQLiteOpenMode;
 
 /**
  * Runs the bundled mcscan.py commands used by the Rescan, Recheck Whitelist
@@ -64,6 +70,48 @@ final class ScannerRunner {
 			return sync.ok()
 				? new Result(true, "Whitelist checked for " + address + " and synced")
 				: new Result(false, "Whitelist check finished, but sync failed: " + sync.message());
+		}, WORKER);
+	}
+
+	/** Store a whitelist verdict observed from the real client join, then publish it. */
+	static CompletableFuture<Result> setWhitelist(String address, String label, Consumer<String> progress) {
+		return CompletableFuture.supplyAsync(() -> {
+			Result update = runStep(List.of("--set-whitelist", address, label),
+				SCAN_TIMEOUT_SECONDS, progress);
+			if (!update.ok()) {
+				return update;
+			}
+			Result sync = runStep(List.of("--sync"), SYNC_TIMEOUT_SECONDS, progress);
+			return sync.ok()
+				? new Result(true, "Whitelist saved for " + address)
+				: new Result(false, "Whitelist saved locally, but sync failed: " + sync.message());
+		}, WORKER);
+	}
+
+	/** Read the label the scanner stored locally after a recheck. */
+	static CompletableFuture<@Nullable String> storedWhitelist(String address) {
+		return CompletableFuture.supplyAsync(() -> {
+			Path directory = BundledScanner.directory();
+			Path database = directory.resolve("servers.db");
+			if (!Files.isRegularFile(database)) {
+				return null;
+			}
+			SQLiteConfig config = new SQLiteConfig();
+			config.setReadOnly(true);
+			config.setOpenMode(SQLiteOpenMode.OPEN_URI);
+			SQLiteDataSource source = new SQLiteDataSource(config);
+			source.setUrl("jdbc:sqlite:" + database.toAbsolutePath().toUri() + "?mode=ro");
+			try (Connection connection = source.getConnection();
+				 PreparedStatement statement = connection.prepareStatement(
+					 "SELECT whitelist FROM server_state WHERE ip_port = ?")) {
+				statement.setString(1, address);
+				try (ResultSet rs = statement.executeQuery()) {
+					return rs.next() ? rs.getString(1) : null;
+				}
+			} catch (Exception e) {
+				McdbBrowserClient.LOGGER.warn("Could not read the scanner whitelist for {}", address, e);
+				return null;
+			}
 		}, WORKER);
 	}
 

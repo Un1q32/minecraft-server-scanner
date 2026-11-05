@@ -266,6 +266,69 @@ public final class ServerDatabase {
 		}, WORKER);
 	}
 
+	/** Current whitelist label for an address, or null when the DB is not the source of truth. */
+	public static CompletableFuture<@Nullable String> whitelistOf(String address) {
+		return CompletableFuture.supplyAsync(() -> {
+			if (connection == null) {
+				return null;
+			}
+			try (PreparedStatement statement = connection.prepareStatement(
+					"SELECT whitelist FROM server_state WHERE ip_port = ?")) {
+				statement.setString(1, address);
+				try (ResultSet rs = statement.executeQuery()) {
+					return rs.next() ? rs.getString(1) : null;
+				}
+			} catch (SQLException e) {
+				throw new CompletionException(e);
+			}
+		}, WORKER);
+	}
+
+	/**
+	 * Patch the downloaded browser cache with a whitelist verdict we observed
+	 * directly. The cache is replaced by the next full download anyway, so this
+	 * only avoids a 250 MB round-trip (and keeps the list correct immediately).
+	 */
+	public static CompletableFuture<Void> setWhitelist(String address, String label) {
+		return CompletableFuture.runAsync(() -> {
+			if (!Files.isRegularFile(DB_FILE)) {
+				return;
+			}
+			boolean wasOpen = connection != null;
+			if (wasOpen) {
+				close();
+			}
+			try {
+				SQLiteConfig config = new SQLiteConfig();
+				config.setReadOnly(false);
+				config.setOpenMode(SQLiteOpenMode.OPEN_URI);
+				SQLiteDataSource source = new SQLiteDataSource(config);
+				source.setUrl("jdbc:sqlite:" + DB_FILE.toAbsolutePath().toUri());
+				try (Connection database = source.getConnection()) {
+					try (Statement pragma = database.createStatement()) {
+						pragma.execute("PRAGMA journal_mode=DELETE");
+					}
+					try (PreparedStatement statement = database.prepareStatement(
+							"UPDATE server_state SET whitelist = ? WHERE ip_port = ?")) {
+						statement.setString(1, label);
+						statement.setString(2, address);
+						statement.executeUpdate();
+					}
+				}
+			} catch (SQLException e) {
+				McdbBrowserClient.LOGGER.warn("Could not cache the whitelist for {}", address, e);
+			} finally {
+				if (wasOpen) {
+					try {
+						open();
+					} catch (SQLException e) {
+						McdbBrowserClient.LOGGER.warn("Could not reopen the server list after a whitelist update", e);
+					}
+				}
+			}
+		}, WORKER);
+	}
+
 	/** Completes with null if the address isn't in the database. */
 	public static CompletableFuture<@Nullable List<String>> historicalPlayers(String hostAndPort) {
 		return CompletableFuture.supplyAsync(() -> {

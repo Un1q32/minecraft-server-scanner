@@ -1,6 +1,7 @@
 package com.mcdbbrowser;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.fabricmc.fabric.api.client.screen.v1.Screens;
 import net.minecraft.client.gui.components.Button;
@@ -22,6 +23,7 @@ public class McdbBrowserClient implements ClientModInitializer {
 		ServerDatabase.deleteLeftoverFiles();
 		McdbConfig.load();
 		ConnectionHistory.load();
+		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> WhitelistAutoUpdate.onJoined());
 
 		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
 			if (screen instanceof PauseScreen pauseScreen) {
