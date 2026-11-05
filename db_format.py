@@ -4,32 +4,281 @@ Format 1 stored ``cracked`` as a display string ("Yes", "No",
 "Yes (cached)", ...).  Format 2 stores it as a SQLite integer state
 (1 = yes, 0 = no, NULL = unset/unknown) and also drops redundant/empty
 payloads (host duplicated by ip_port, empty player lists as NULL).
+
+Format 3 removes the dedicated ``first_seen`` and ``last_seen`` columns.
+The source of truth is ``server_history`` (one row per sighting); the
+read-only view ``servers`` adds back ``first_seen``/``last_seen`` as
+MIN/MAX over that history so existing queries keep working.  The base table
+is named ``server_state`` because SQLite cannot have a table and a view with
+the same name.
+
 SQLite's ``PRAGMA user_version`` marks the format; older databases have 0
 and are migrated in place.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
-CURRENT_FORMAT = 2
+CURRENT_FORMAT = 3
 BASE_FORMAT = 1
+STATE_TABLE = "server_state"
+SERVER_VIEW = "servers"
+
+SERVER_STATE_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS server_state ("
+    " ip_port TEXT PRIMARY KEY,"
+    " host TEXT DEFAULT '',"
+    " port INTEGER DEFAULT 25565,"
+    " motd TEXT DEFAULT '',"
+    " players_online INTEGER DEFAULT 0,"
+    " max_players INTEGER DEFAULT 0,"
+    " version TEXT DEFAULT '',"
+    " protocol INTEGER,"
+    " cracked INTEGER DEFAULT NULL,"
+    " whitelist TEXT DEFAULT '',"
+    " times_seen INTEGER DEFAULT 1,"
+    " last_source TEXT DEFAULT '',"
+    " needs_sync INTEGER DEFAULT 1,"
+    " players_now TEXT,"
+    " players_ever TEXT"
+    ")"
+)
+
+HISTORY_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS server_history ("
+    " ip_port TEXT NOT NULL,"
+    " seen_at REAL NOT NULL,"
+    " players_online INTEGER,"
+    " max_players INTEGER,"
+    " PRIMARY KEY (ip_port, seen_at)"
+    ")",
+    "CREATE TABLE IF NOT EXISTS player_history ("
+    " ip_port TEXT NOT NULL,"
+    " player_name TEXT NOT NULL,"
+    " seen_at REAL NOT NULL,"
+    " PRIMARY KEY (ip_port, player_name, seen_at)"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_player_history_ip_time"
+    " ON player_history(ip_port, seen_at ASC)",
+)
+
+
+def init_history_schema(con: sqlite3.Connection):
+    """Create the per-sighting tables used by the viewer graphs."""
+    for statement in HISTORY_SCHEMA:
+        con.execute(statement)
+
+
+def object_type(con: sqlite3.Connection, name: str):
+    """'table', 'view', or None for one schema object."""
+    row = con.execute(
+        "SELECT type FROM sqlite_master WHERE name=?", (name,)).fetchone()
+    return str(row[0]) if row else None
+
+
+def base_table(con: sqlite3.Connection) -> str:
+    """Name of the writable servers table (v3 uses ``server_state``)."""
+    if object_type(con, STATE_TABLE) == "table":
+        return STATE_TABLE
+    return "servers"
+
+
+def ensure_view(con: sqlite3.Connection, recreate: bool = False):
+    """Create the derived ``servers`` view, optionally replacing it so it
+    picks up columns added to ``server_state`` after migration."""
+    if object_type(con, STATE_TABLE) != "table":
+        return
+    existing = object_type(con, SERVER_VIEW)
+    if existing == "view":
+        if not recreate:
+            return
+        con.execute("DROP VIEW servers")
+    elif existing == "table":
+        # A format-2 table was not migrated; leave it alone.
+        return
+    con.execute(
+        "CREATE VIEW servers AS SELECT s.*,"
+        " (SELECT MIN(seen_at) FROM server_history h"
+        "  WHERE h.ip_port=s.ip_port) AS first_seen,"
+        " (SELECT MAX(seen_at) FROM server_history h"
+        "  WHERE h.ip_port=s.ip_port) AS last_seen"
+        " FROM server_state s"
+    )
 
 
 def _table_columns(con: sqlite3.Connection):
     return list(con.execute("PRAGMA table_info(servers)"))
 
 
-def detect_format(con: sqlite3.Connection) -> int:
-    """2 when the table is format 2; 1 for the legacy schema.
+def _column_names(con: sqlite3.Connection, table: str):
+    return [str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")]
 
-    ``user_version`` is authoritative, but the cracked column type is a
-    useful fallback for databases created by an interrupted migration.
+
+def _to_float(value) -> float:
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
+def _to_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _name_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        text = str(value).strip()
+        if not text or text == "[]":
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        raw = parsed
+    out = []
+    seen = set()
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _insert_history(con, ip_port, seen_at, players_online, max_players,
+                    names=()):
+    if not ip_port or seen_at <= 0:
+        return
+    con.execute(
+        "INSERT OR IGNORE INTO server_history"
+        " (ip_port, seen_at, players_online, max_players)"
+        " VALUES (?, ?, ?, ?)",
+        (ip_port, seen_at, players_online, max_players))
+    rows = [(ip_port, name, seen_at) for name in names]
+    if rows:
+        con.executemany(
+            "INSERT OR IGNORE INTO player_history"
+            " (ip_port, player_name, seen_at) VALUES (?, ?, ?)", rows)
+
+
+def name_list(value) -> list[str]:
+    """Decode a players_now/players_ever JSON value into names."""
+    return _name_list(value)
+
+
+def insert_history(con, ip_port, seen_at, players_online=None,
+                   max_players=None, names=()):
+    """Insert one sighting (and its player samples) with duplicate safety."""
+    _insert_history(con, ip_port, seen_at, players_online, max_players, names)
+
+
+def insert_range(con, ip_port, first_seen, last_seen, players_online,
+                 max_players, now_names=(), ever_names=()):
+    """Insert the two endpoints of an aggregated first/last-seen record.
+
+    Used by sync and by the format migration: the current roster/count
+    belongs to the last sighting, while the ever-seen names are attached to
+    the first sighting so they are not lost.  When both endpoints are the
+    same, there is one sighting with both player lists.
+    """
+    first_seen = _to_float(first_seen)
+    last_seen = _to_float(last_seen)
+    if first_seen <= 0 and last_seen <= 0:
+        return
+    if first_seen <= 0:
+        first_seen = last_seen
+    if last_seen <= 0:
+        last_seen = first_seen
+    if abs(last_seen - first_seen) < 1e-9:
+        _insert_history(con, ip_port, first_seen, players_online,
+                        max_players, ever_names)
+        _insert_history(con, ip_port, first_seen, None, None, now_names)
+    else:
+        _insert_history(con, ip_port, first_seen, None, None, ever_names)
+        _insert_history(con, ip_port, last_seen, players_online,
+                        max_players, now_names)
+        if not ever_names:
+            _insert_history(con, ip_port, last_seen, None, None, now_names)
+
+
+def _populate_history_from_columns(con: sqlite3.Connection):
+    """Seed history from a format-2 ``servers`` table."""
+    names = set(_column_names(con, "servers"))
+    if "first_seen" not in names and "last_seen" not in names:
+        return
+    extra = [name for name in
+             ("players_online", "max_players", "players_now", "players_ever")
+             if name in names]
+    select = ["ip_port"]
+    if "first_seen" in names:
+        select.append("first_seen")
+    else:
+        select.append("NULL")
+    if "last_seen" in names:
+        select.append("last_seen")
+    else:
+        select.append("NULL")
+    for name in extra:
+        select.append(name)
+    # Pad missing optional columns so unpacking below is simple.
+    rows = con.execute(
+        f"SELECT {', '.join(select)} FROM servers").fetchall()
+    for row in rows:
+        ip_port = str(row[0] or "")
+        first_seen = _to_float(row[1])
+        last_seen = _to_float(row[2])
+        values = dict(zip(extra, row[3:]))
+        online = _to_int(values.get("players_online"), 0)
+        maximum = _to_int(values.get("max_players"), 0)
+        now_names = _name_list(values.get("players_now"))
+        ever_names = _name_list(values.get("players_ever"))
+        if first_seen <= 0 and last_seen <= 0:
+            continue
+        if first_seen <= 0:
+            first_seen = last_seen
+        if last_seen <= 0:
+            last_seen = first_seen
+        if abs(last_seen - first_seen) < 1e-9:
+            # Single known sighting: its current player data belongs here.
+            _insert_history(con, ip_port, first_seen, online, maximum,
+                            ever_names)
+            _insert_history(con, ip_port, first_seen, None, None, now_names)
+        else:
+            # Every-seen names go to the first sighting so they survive;
+            # today's online count/roster belongs to the last sighting.
+            _insert_history(con, ip_port, first_seen, None, None, ever_names)
+            _insert_history(con, ip_port, last_seen, online, maximum,
+                            now_names)
+            if not ever_names:
+                _insert_history(con, ip_port, last_seen, None, None, now_names)
+
+
+def detect_format(con: sqlite3.Connection) -> int:
+    """3 for history-derived servers, 2/1 for the legacy schemas.
+
+    ``user_version`` is authoritative, but the schema is a useful fallback
+    for databases created by an interrupted migration.
     """
     try:
         version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
     except Exception:
         version = 0
+    if object_type(con, SERVER_VIEW) == "view" and \
+            object_type(con, STATE_TABLE) == "table":
+        return 3
+    if version >= 3:
+        return 3
     if version >= 2:
         return 2
     for _cid, name, ctype, _notnull, _default, _pk in _table_columns(con):
@@ -146,20 +395,9 @@ def _select_expr(name: str) -> str:
     return name
 
 
-def migrate(con: sqlite3.Connection) -> bool:
-    """Upgrade servers to format 2 in place. Returns True if it changed."""
-    if detect_format(con) >= 2:
-        try:
-            version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
-        except Exception:
-            version = 0
-        if version < CURRENT_FORMAT:
-            try:
-                con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
-                con.commit()
-            except Exception:
-                pass
-        return False
+def _migrate_1_to_2(con: sqlite3.Connection) -> bool:
+    """Rebuild the format-1 servers table as format 2. Returns True if
+    it changed anything."""
     columns = _table_columns(con)
     if not columns:
         return False
@@ -186,7 +424,7 @@ def migrate(con: sqlite3.Connection) -> bool:
         if "seq" in names:
             con.execute("CREATE INDEX IF NOT EXISTS idx_servers_seq "
                         "ON servers(seq ASC)")
-        con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+        con.execute("PRAGMA user_version=2")
         con.commit()
         try:
             con.execute("VACUUM")
@@ -201,6 +439,78 @@ def migrate(con: sqlite3.Connection) -> bool:
         raise
 
 
+def _init_v3(con: sqlite3.Connection):
+    con.execute(SERVER_STATE_SCHEMA)
+    init_history_schema(con)
+    ensure_view(con)
+    con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+
+
+def _migrate_2_to_3(con: sqlite3.Connection) -> bool:
+    """Convert first/last-seen columns into history points. Returns True."""
+    if object_type(con, "servers") != "table":
+        if object_type(con, STATE_TABLE) != "table":
+            _init_v3(con)
+            return True
+        init_history_schema(con)
+        ensure_view(con)
+        con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+        return False
+    changed = False
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        init_history_schema(con)
+        _populate_history_from_columns(con)
+        names = set(_column_names(con, "servers"))
+        con.execute("DROP INDEX IF EXISTS idx_servers_last_seen")
+        con.execute("ALTER TABLE servers RENAME TO server_state")
+        if "first_seen" in names:
+            con.execute("ALTER TABLE server_state DROP COLUMN first_seen")
+        if "last_seen" in names:
+            con.execute("ALTER TABLE server_state DROP COLUMN last_seen")
+        ensure_view(con)
+        con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+        con.commit()
+        changed = True
+        try:
+            con.execute("VACUUM")
+        except Exception:
+            pass
+        return changed
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def migrate(con: sqlite3.Connection) -> bool:
+    """Upgrade the database to the current format in place."""
+    changed = False
+    if detect_format(con) < 2:
+        changed = _migrate_1_to_2(con) or changed
+    if detect_format(con) < CURRENT_FORMAT:
+        changed = _migrate_2_to_3(con) or changed
+    try:
+        version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
+    except Exception:
+        version = 0
+    if version < CURRENT_FORMAT:
+        try:
+            con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+            con.commit()
+        except Exception:
+            pass
+    return changed
+
+
 def ensure_format(con: sqlite3.Connection) -> int:
     migrate(con)
+    fmt = detect_format(con)
+    if fmt >= CURRENT_FORMAT:
+        init_history_schema(con)
+        ensure_view(con)
+        con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+        con.commit()
     return detect_format(con)

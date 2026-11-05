@@ -214,6 +214,7 @@ _CRACKED_CACHE_LOCK = threading.Lock()
 _WHITELIST_LOG_LOCK = threading.Lock()
 _SERVER_DB_LOCK = threading.Lock()
 _NOTES_DB_LOCK = threading.Lock()
+_SERVER_DB_INITIALIZED = set()
 
 # Cooperative shutdown. Ctrl+C / SIGTERM / window close sets this so that
 # (a) probes bail between steps instead of finishing every queued target,
@@ -337,7 +338,7 @@ def _persist_protocol(ip_port, protocol):
                 if old == protocol:
                     return
                 con.execute(
-                    "UPDATE servers SET protocol=?, needs_sync=1"
+                    "UPDATE server_state SET protocol=?, needs_sync=1"
                     " WHERE ip_port=?", (protocol, ip_port))
                 con.commit()
             finally:
@@ -461,12 +462,14 @@ def _add_column_if_missing(con, table, column, ddl):
         column = _safe_sql_ident(column)
         ddl = str(ddl or "")
         if not re.fullmatch(r"[A-Za-z0-9_ ()\[\]'.,+-]+", ddl):
-            return
+            return False
         existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            return True
     except Exception:
         pass
+    return False
 
 
 # Player-name tracking: every server keeps two lists, stored as JSON arrays.
@@ -578,84 +581,27 @@ def _server_db_connect():
 
 def _init_history_schema(con, backfill=False):
     """Create the per-sighting tables used by the viewer graphs."""
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS server_history ("
-        " ip_port TEXT NOT NULL,"
-        " seen_at REAL NOT NULL,"
-        " players_online INTEGER,"
-        " max_players INTEGER,"
-        " PRIMARY KEY (ip_port, seen_at)"
-        ")"
-    )
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS player_history ("
-        " ip_port TEXT NOT NULL,"
-        " player_name TEXT NOT NULL,"
-        " seen_at REAL NOT NULL,"
-        " PRIMARY KEY (ip_port, player_name, seen_at)"
-        ")"
-    )
-    con.execute(
-        "CREATE INDEX IF NOT EXISTS idx_player_history_ip_time"
-        " ON player_history(ip_port, seen_at ASC)"
-    )
-    if backfill:
-        try:
-            count = con.execute(
-                "SELECT COUNT(*) FROM server_history").fetchone()[0]
-            if not count:
-                # Existing DBs only have first/last seen; seed those two
-                # points.  Player counts are unknown (NULL) for the seed rows.
-                con.execute(
-                    "INSERT OR IGNORE INTO server_history"
-                    " (ip_port, seen_at, players_online, max_players)"
-                    " SELECT ip_port, first_seen, NULL, NULL FROM servers"
-                    " WHERE first_seen > 0"
-                )
-                con.execute(
-                    "INSERT OR IGNORE INTO server_history"
-                    " (ip_port, seen_at, players_online, max_players)"
-                    " SELECT ip_port, last_seen, NULL, NULL FROM servers"
-                    " WHERE last_seen > 0"
-                )
-        except Exception:
-            pass
+    db_format.init_history_schema(con)
 
 
 def init_server_db():
-    import sqlite3
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            con.execute(
-                "CREATE TABLE IF NOT EXISTS servers ("
-                " ip_port TEXT PRIMARY KEY,"
-                " host TEXT DEFAULT '',"
-                " port INTEGER DEFAULT 25565,"
-                " motd TEXT DEFAULT '',"
-                " players_online INTEGER DEFAULT 0,"
-                " max_players INTEGER DEFAULT 0,"
-                " version TEXT DEFAULT '',"
-                " protocol INTEGER,"
-                " cracked INTEGER DEFAULT NULL,"
-                " whitelist TEXT DEFAULT '',"
-                " first_seen REAL DEFAULT 0,"
-                " last_seen REAL DEFAULT 0,"
-                " times_seen INTEGER DEFAULT 1,"
-                " last_source TEXT DEFAULT '',"
-                " needs_sync INTEGER DEFAULT 1,"
-                " players_now TEXT,"
-                " players_ever TEXT"
-                ")"
-            )
-            con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen ON servers(last_seen DESC)")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_servers_version ON servers(version)")
-            _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
-            _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
-            _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
-            _init_history_schema(con, backfill=True)
-            con.commit()
+            # Creates/migrates the v3 base table and the derived servers view.
             db_format.ensure_format(con)
+            added = _add_column_if_missing(con, "server_state", "needs_sync",
+                                          "INTEGER DEFAULT 1")
+            added |= _add_column_if_missing(con, "server_state", "players_now",
+                                            "TEXT DEFAULT '[]'")
+            added |= _add_column_if_missing(con, "server_state", "players_ever",
+                                            "TEXT DEFAULT '[]'")
+            _init_history_schema(con)
+            db_format.ensure_view(con, recreate=added)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_server_state_version"
+                        " ON server_state(version)")
+            con.commit()
+            _SERVER_DB_INITIALIZED.add(os.path.abspath(SERVERS_DB_FILE))
             # One-time cleanup: bogons (loopback/LAN test servers) are no
             # longer persisted, so drop any rows from before this rule
             # (the sync-import filter keeps them from coming back).
@@ -669,7 +615,12 @@ def init_server_db():
                     except Exception:
                         continue
                 if drop:
-                    con.executemany("DELETE FROM servers WHERE ip_port=?", drop)
+                    con.executemany(
+                        "DELETE FROM server_state WHERE ip_port=?", drop)
+                    con.executemany(
+                        "DELETE FROM server_history WHERE ip_port=?", drop)
+                    con.executemany(
+                        "DELETE FROM player_history WHERE ip_port=?", drop)
                     con.commit()
             except Exception:
                 pass
@@ -726,23 +677,25 @@ def record_server_result(result, source="scan"):
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            cur = con.execute("SELECT first_seen, times_seen, cracked, whitelist, last_source, players_now, players_ever FROM servers WHERE ip_port=?",
-                              (ip_port,))
+            cur = con.execute(
+                "SELECT times_seen, cracked, whitelist, last_source,"
+                " players_now, players_ever FROM server_state"
+                " WHERE ip_port=?", (ip_port,))
             row = cur.fetchone()
             if row is None:
                 con.execute(
-                    "INSERT INTO servers (ip_port, host, port, motd, players_online,"
-                    " max_players, version, protocol, cracked, needs_sync,"
-                    " first_seen, last_seen, times_seen, last_source,"
-                    " players_now, players_ever)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?)",
+                    "INSERT INTO server_state (ip_port, host, port, motd,"
+                    " players_online, max_players, version, protocol, cracked,"
+                    " needs_sync, times_seen, last_source, players_now,"
+                    " players_ever)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
                     (ip_port, None, port, motd, online, maximum, version,
-                     protocol, cracked, now, now, source,
+                     protocol, cracked, source,
                      _encode_player_list(sample_names if has_sample else []),
                      _encode_player_list(sample_names)),
                 )
             else:
-                (first_seen, times_seen, old_cracked, old_whitelist,
+                (times_seen, old_cracked, old_whitelist,
                  old_source, old_now, old_ever) = row
                 try:
                     times_seen = int(times_seen or 0) + 1
@@ -761,26 +714,25 @@ def record_server_result(result, source="scan"):
                 ever_json = _encode_player_list(
                     _merge_player_lists(old_ever, sample_names))
                 con.execute(
-                    "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
-                    " max_players=?, version=?, protocol=COALESCE(?, protocol),"
-                    " cracked=?, needs_sync=1, last_seen=?, times_seen=?,"
-                    " last_source=?, players_now=?, players_ever=? WHERE ip_port=?",
+                    "UPDATE server_state SET host=?, port=?, motd=?,"
+                    " players_online=?, max_players=?, version=?,"
+                    " protocol=COALESCE(?, protocol), cracked=?, needs_sync=1,"
+                    " times_seen=?, last_source=?, players_now=?, players_ever=?"
+                    " WHERE ip_port=?",
                     (None, port, motd, online, maximum, version, protocol,
-                     keep_cracked, now, times_seen, source, now_json, ever_json, ip_port),
+                     keep_cracked, times_seen, source, now_json, ever_json,
+                     ip_port),
                 )
-            try:
-                con.execute(
-                    "INSERT OR IGNORE INTO server_history"
-                    " (ip_port, seen_at, players_online, max_players)"
-                    " VALUES (?, ?, ?, ?)",
-                    (ip_port, now, online, maximum))
-                if sample_names:
-                    con.executemany(
-                        "INSERT OR IGNORE INTO player_history"
-                        " (ip_port, player_name, seen_at) VALUES (?, ?, ?)",
-                        [(ip_port, name, now) for name in sample_names])
-            except Exception:
-                pass
+            con.execute(
+                "INSERT OR IGNORE INTO server_history"
+                " (ip_port, seen_at, players_online, max_players)"
+                " VALUES (?, ?, ?, ?)",
+                (ip_port, now, online, maximum))
+            if sample_names:
+                con.executemany(
+                    "INSERT OR IGNORE INTO player_history"
+                    " (ip_port, player_name, seen_at) VALUES (?, ?, ?)",
+                    [(ip_port, name, now) for name in sample_names])
             con.commit()
         finally:
             con.close()
@@ -811,22 +763,27 @@ def update_server_cracked(ip_port, cracked_label, message=""):
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            cur = con.execute("SELECT first_seen FROM servers WHERE ip_port=?", (ip_port,))
-            if cur.fetchone() is None:
+            cur = con.execute(
+                "SELECT players_online, max_players FROM server_state"
+                " WHERE ip_port=?", (ip_port,))
+            current = cur.fetchone()
+            if current is None:
                 try:
                     host, port = split_host_port(ip_port)
                 except Exception:
                     host, port = ip_port, 25565
                 con.execute(
-                    "INSERT INTO servers (ip_port, host, port, cracked, first_seen,"
-                    " last_seen, times_seen, last_source) VALUES (?, ?, ?, ?, ?, ?, 1, 'cracked')",
-                    (ip_port, None, port, cracked, now, now),
+                    "INSERT INTO server_state (ip_port, host, port, cracked,"
+                    " times_seen, last_source) VALUES (?, ?, ?, ?, 1, 'cracked')",
+                    (ip_port, None, port, cracked),
                 )
+                db_format.insert_history(con, ip_port, now)
             else:
-                con.execute("UPDATE servers SET cracked=?, needs_sync=1,"
-                            " last_source='cracked', last_seen=?"
-                            " WHERE ip_port=?",
-                            (cracked, now, ip_port))
+                con.execute("UPDATE server_state SET cracked=?, needs_sync=1,"
+                            " last_source='cracked' WHERE ip_port=?",
+                            (cracked, ip_port))
+                db_format.insert_history(con, ip_port, now, current[0],
+                                         current[1])
             con.commit()
         finally:
             con.close()
@@ -850,24 +807,28 @@ def unset_server_cracked(ip_port, message=""):
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            cur = con.execute("SELECT first_seen FROM servers WHERE ip_port=?",
-                              (ip_port,))
-            if cur.fetchone() is None:
+            cur = con.execute(
+                "SELECT players_online, max_players FROM server_state"
+                " WHERE ip_port=?", (ip_port,))
+            current = cur.fetchone()
+            if current is None:
                 try:
                     host, port = split_host_port(ip_port)
                 except Exception:
                     host, port = ip_port, 25565
                 con.execute(
-                    "INSERT INTO servers (ip_port, host, port, cracked,"
-                    " first_seen, last_seen, times_seen, last_source)"
-                    " VALUES (?, ?, ?, NULL, ?, ?, 1, 'cracked')",
-                    (ip_port, None, port, now, now),
+                    "INSERT INTO server_state (ip_port, host, port, cracked,"
+                    " times_seen, last_source)"
+                    " VALUES (?, ?, ?, NULL, 1, 'cracked')",
+                    (ip_port, None, port),
                 )
+                db_format.insert_history(con, ip_port, now)
             else:
                 con.execute(
-                    "UPDATE servers SET cracked=NULL, needs_sync=1,"
-                    " last_source='cracked', last_seen=? WHERE ip_port=?",
-                    (now, ip_port))
+                    "UPDATE server_state SET cracked=NULL, needs_sync=1,"
+                    " last_source='cracked' WHERE ip_port=?", (ip_port,))
+                db_format.insert_history(con, ip_port, now, current[0],
+                                         current[1])
             con.commit()
         finally:
             con.close()
@@ -891,21 +852,28 @@ def update_server_whitelist(ip_port, whitelist_label):
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            cur = con.execute("SELECT first_seen FROM servers WHERE ip_port=?", (ip_port,))
-            if cur.fetchone() is None:
+            cur = con.execute(
+                "SELECT players_online, max_players FROM server_state"
+                " WHERE ip_port=?", (ip_port,))
+            current = cur.fetchone()
+            if current is None:
                 try:
                     host, port = split_host_port(ip_port)
                 except Exception:
                     host, port = ip_port, 25565
                 con.execute(
-                    "INSERT INTO servers (ip_port, host, port, cracked, whitelist,"
-                    " first_seen, last_seen, times_seen, last_source)"
-                    " VALUES (?, ?, ?, NULL, ?, ?, ?, 1, 'whitelist')",
-                    (ip_port, None, port, label, now, now),
+                    "INSERT INTO server_state (ip_port, host, port, cracked,"
+                    " whitelist, times_seen, last_source)"
+                    " VALUES (?, ?, ?, NULL, ?, 1, 'whitelist')",
+                    (ip_port, None, port, label),
                 )
+                db_format.insert_history(con, ip_port, now)
             else:
-                con.execute("UPDATE servers SET whitelist=?, needs_sync=1, last_seen=? WHERE ip_port=?",
-                            (label, now, ip_port))
+                con.execute(
+                    "UPDATE server_state SET whitelist=?, needs_sync=1"
+                    " WHERE ip_port=?", (label, ip_port))
+                db_format.insert_history(con, ip_port, now, current[0],
+                                         current[1])
             con.commit()
         finally:
             con.close()
@@ -953,8 +921,10 @@ def delete_servers_from_db(ip_ports):
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            con.executemany("DELETE FROM servers WHERE ip_port=?",
-                            [(ip,) for ip in ip_ports])
+            rows = [(ip,) for ip in ip_ports]
+            con.executemany("DELETE FROM server_state WHERE ip_port=?", rows)
+            con.executemany("DELETE FROM server_history WHERE ip_port=?", rows)
+            con.executemany("DELETE FROM player_history WHERE ip_port=?", rows)
             con.commit()
         finally:
             con.close()
@@ -1154,37 +1124,27 @@ def _timestamp_display_key(value):
 def _ensure_server_db():
     # Idempotent table creation (safe to call at any point, including
     # before later-defined helpers exist).
+    path = os.path.abspath(SERVERS_DB_FILE)
+    if path in _SERVER_DB_INITIALIZED and os.path.exists(path):
+        return
     try:
         with _SERVER_DB_LOCK:
             con = _server_db_connect()
             try:
-                con.execute(
-                    "CREATE TABLE IF NOT EXISTS servers ("
-                    " ip_port TEXT PRIMARY KEY,"
-                    " host TEXT DEFAULT '',"
-                    " port INTEGER DEFAULT 25565,"
-                    " motd TEXT DEFAULT '',"
-                    " players_online INTEGER DEFAULT 0,"
-                    " max_players INTEGER DEFAULT 0,"
-                    " version TEXT DEFAULT '',"
-                    " protocol INTEGER,"
-                    " cracked INTEGER DEFAULT NULL,"
-                    " whitelist TEXT DEFAULT '',"
-                    " first_seen REAL DEFAULT 0,"
-                    " last_seen REAL DEFAULT 0,"
-                    " times_seen INTEGER DEFAULT 1,"
-                    " last_source TEXT DEFAULT '',"
-                    " needs_sync INTEGER DEFAULT 1,"
-                    " players_now TEXT,"
-                    " players_ever TEXT"
-                    ")"
-                )
-                _add_column_if_missing(con, "servers", "needs_sync", "INTEGER DEFAULT 1")
-                _add_column_if_missing(con, "servers", "players_now", "TEXT DEFAULT '[]'")
-                _add_column_if_missing(con, "servers", "players_ever", "TEXT DEFAULT '[]'")
-                _init_history_schema(con)
-                con.commit()
                 db_format.ensure_format(con)
+                added = _add_column_if_missing(con, "server_state",
+                                               "needs_sync",
+                                               "INTEGER DEFAULT 1")
+                added |= _add_column_if_missing(con, "server_state",
+                                                "players_now",
+                                                "TEXT DEFAULT '[]'")
+                added |= _add_column_if_missing(con, "server_state",
+                                                "players_ever",
+                                                "TEXT DEFAULT '[]'")
+                _init_history_schema(con)
+                db_format.ensure_view(con, recreate=added)
+                con.commit()
+                _SERVER_DB_INITIALIZED.add(path)
             finally:
                 con.close()
     except Exception:
@@ -1411,8 +1371,12 @@ def netdb_mark_synced(ip_ports, watermark):
                 for i in range(0, len(ids), 500):
                     chunk = ids[i:i + 500]
                     con.execute(
-                        "UPDATE servers SET needs_sync=0 WHERE needs_sync=1"
-                        " AND last_seen <= ? AND ip_port IN (%s)"
+                        "UPDATE server_state SET needs_sync=0"
+                        " WHERE needs_sync=1"
+                        " AND COALESCE((SELECT MAX(seen_at)"
+                        "  FROM server_history h"
+                        "  WHERE h.ip_port=server_state.ip_port), 0) <= ?"
+                        " AND ip_port IN (%s)"
                         % ",".join("?" * len(chunk)),
                         (watermark, *chunk))
                 con.commit()
@@ -1467,6 +1431,10 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     r_times = int(raw.get("times_seen", 1) or 1)
                 except Exception:
                     r_times = 1
+                r_online = int(raw.get("players_online", 0) or 0)
+                r_maximum = int(raw.get("max_players", 0) or 0)
+                r_now = _decode_player_list(raw.get("players_now"))
+                r_ever = _decode_player_list(raw.get("players_ever"))
                 cur = con.execute("SELECT motd, players_online, max_players, version,"
                                   " protocol, cracked, whitelist, first_seen, last_seen,"
                                   " times_seen, last_source, needs_sync, players_now,"
@@ -1475,29 +1443,32 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 old = cur.fetchone()
                 if old is None:
                     cur = con.execute(
-                        "INSERT OR IGNORE INTO servers (ip_port, host, port, motd, players_online,"
-                        " max_players, version, protocol, cracked, whitelist,"
-                        " first_seen, last_seen, times_seen, last_source, needs_sync,"
-                        " players_now, players_ever)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                        "INSERT OR IGNORE INTO server_state (ip_port, host, port,"
+                        " motd, players_online, max_players, version, protocol,"
+                        " cracked, whitelist, times_seen, last_source,"
+                        " needs_sync, players_now, players_ever)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                         (ip_port, None, port,
                          sanitize_motd(raw.get("motd", "")),
-                         int(raw.get("players_online", 0) or 0),
-                         int(raw.get("max_players", 0) or 0),
+                         r_online, r_maximum,
                          sanitize_motd(raw.get("version", "") or ""),
                          raw.get("protocol"), db_format.cracked_state(raw.get("cracked")),
                          str(raw.get("whitelist", "") or ""),
-                         r_first or r_last, r_last or r_first, max(1, r_times),
+                         max(1, r_times),
                          str(raw.get("last_source", "") or "netdb"),
-                         _encode_player_list(_decode_player_list(raw.get("players_now"))),
-                         _encode_player_list(_decode_player_list(raw.get("players_ever")))))
+                         _encode_player_list(r_now),
+                         _encode_player_list(r_ever)))
+                    db_format.insert_range(
+                        con, ip_port, r_first, r_last, r_online, r_maximum,
+                        r_now, r_ever)
                     if cur.rowcount:
                         inserted += 1
                     else:
                         # Appeared locally mid-sync (concurrent rescan won the
                         # race): keep it dirty so its sighting uploads next.
-                        con.execute("UPDATE servers SET needs_sync=1 WHERE ip_port=?",
-                                    (ip_port,))
+                        con.execute(
+                            "UPDATE server_state SET needs_sync=1"
+                            " WHERE ip_port=?", (ip_port,))
                         updated += 1
                     continue
                 (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
@@ -1515,9 +1486,6 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 except Exception:
                     o_times = 1
                 remote_newer = r_last > o_last
-                first_seen = min(o_first, r_first) if (o_first and r_first) \
-                    else (o_first or r_first)
-                last_seen = max(o_last, r_last)
                 if remote_newer:
                     motd = sanitize_motd(raw.get("motd", ""))
                     online = int(raw.get("players_online", 0) or 0)
@@ -1548,8 +1516,6 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 times_seen = max(o_times, r_times) + (1 if remote_newer else 0)
                 # Player lists: current roster follows the newer sighting; the
                 # ever-seen list is the union of both sides (capped).
-                r_now = _decode_player_list(raw.get("players_now"))
-                r_ever = _decode_player_list(raw.get("players_ever"))
                 now_names = r_now if remote_newer else _decode_player_list(o_now)
                 ever_names = _merge_player_lists(
                     _merge_player_lists(o_ever, o_now), _merge_player_lists(r_ever, r_now))
@@ -1564,15 +1530,18 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 else:
                     still_dirty = 1 if o_last > upload_watermark else 0
                 con.execute(
-                    "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
-                    " max_players=?, version=?, protocol=COALESCE(?, protocol),"
-                    " cracked=?, whitelist=?, first_seen=?, last_seen=?,"
+                    "UPDATE server_state SET host=?, port=?, motd=?,"
+                    " players_online=?, max_players=?, version=?,"
+                    " protocol=COALESCE(?, protocol), cracked=?, whitelist=?,"
                     " times_seen=?, last_source=?, needs_sync=?,"
                     " players_now=?, players_ever=? WHERE ip_port=?",
                     (None, port, motd, online, maximum, version, protocol,
-                     cracked, whitelist, first_seen, last_seen, times_seen,
-                     src, still_dirty, _encode_player_list(now_names),
+                     cracked, whitelist, times_seen, src, still_dirty,
+                     _encode_player_list(now_names),
                      _encode_player_list(ever_names), ip_port))
+                db_format.insert_range(
+                    con, ip_port, r_first, r_last, r_online, r_maximum,
+                    r_now, r_ever)
                 updated += 1
             con.commit()
         finally:
@@ -1679,7 +1648,8 @@ def netdb_local_db_ready():
         try:
             if not con.execute(
                     "SELECT 1 FROM sqlite_master"
-                    " WHERE type='table' AND name='servers'").fetchone():
+                    " WHERE type IN ('table','view') AND name='servers'"
+                    ).fetchone():
                 return False
             return con.execute("SELECT 1 FROM servers LIMIT 1").fetchone() is not None
         finally:
@@ -1691,9 +1661,9 @@ def netdb_local_db_ready():
 def _merge_previous_history(con):
     """Carry local sighting history across a direct DB-file replacement.
 
-    The shared DB has no history tables (history is local-only), so after a
-    direct download the new file would otherwise start empty.  Copy the old
-    file's rows for servers that still exist in the downloaded DB.
+    A downloaded DB may carry only the shared server's aggregated sighting
+    endpoints; copy the previous local rows for servers that still exist so
+    the local graph keeps its per-sighting detail.
     """
     try:
         local = os.path.abspath(SERVERS_DB_FILE)
@@ -1736,29 +1706,25 @@ def _prepare_downloaded_db(path):
     try:
         con.row_factory = sqlite3.Row
         db_format.ensure_format(con)
-        cols = {str(r[1]) for r in con.execute("PRAGMA table_info(servers)")}
+        base = db_format.base_table(con)
+        cols = {str(r[1]) for r in con.execute(f"PRAGMA table_info({base})")}
         if not cols:
             raise ConnectionError("downloaded database has no servers table")
+        added_columns = False
         if "needs_sync" not in cols:
             con.execute(
-                "ALTER TABLE servers ADD COLUMN needs_sync INTEGER DEFAULT 0")
-        con.execute("UPDATE servers SET needs_sync=0")
+                f"ALTER TABLE {base} ADD COLUMN needs_sync INTEGER DEFAULT 0")
+            added_columns = True
+        con.execute(f"UPDATE {base} SET needs_sync=0")
         max_seq = 0
         if "seq" in cols:
             max_seq = int(con.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM servers").fetchone()[0] or 0)
-            try:
-                # The local schema does not need the server-only change cursor.
-                con.execute("DROP INDEX IF EXISTS idx_servers_seq")
-                con.execute("ALTER TABLE servers DROP COLUMN seq")
-            except Exception:
-                pass
-        con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen "
-                    "ON servers(last_seen DESC)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_servers_version "
-                    "ON servers(version)")
+                f"SELECT COALESCE(MAX(seq), 0) FROM {base}").fetchone()[0] or 0)
+        con.execute(f"CREATE INDEX IF NOT EXISTS idx_server_state_version"
+                    f" ON {base}(version)")
         _init_history_schema(con)
         _merge_previous_history(con)
+        db_format.ensure_view(con, recreate=added_columns)
         con.commit()
         try:
             con.execute("VACUUM")
@@ -1954,7 +1920,9 @@ def netdb_replace_all(rows):
         con = _server_db_connect()
         try:
             con.execute("BEGIN IMMEDIATE")
-            con.execute("DELETE FROM servers")
+            con.execute("DELETE FROM server_state")
+            con.execute("DELETE FROM server_history")
+            con.execute("DELETE FROM player_history")
             for raw in rows or []:
                 if not isinstance(raw, dict):
                     continue
@@ -1987,12 +1955,14 @@ def netdb_replace_all(rows):
                     times_seen = max(1, int(raw.get("times_seen", 1) or 1))
                 except Exception:
                     times_seen = 1
+                now_names = _decode_player_list(raw.get("players_now"))
+                ever_names = _decode_player_list(raw.get("players_ever"))
                 con.execute(
-                    "INSERT OR REPLACE INTO servers (ip_port, host, port, motd,"
-                    " players_online, max_players, version, protocol, cracked,"
-                    " whitelist, first_seen, last_seen, times_seen, last_source,"
-                    " needs_sync, players_now, players_ever)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    "INSERT OR REPLACE INTO server_state (ip_port, host, port,"
+                    " motd, players_online, max_players, version, protocol,"
+                    " cracked, whitelist, times_seen, last_source, needs_sync,"
+                    " players_now, players_ever)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                     (ip_port, None, port,
                      sanitize_motd(raw.get("motd", ""))[:MAX_MOTD_CHARS],
                      online, maximum,
@@ -2000,12 +1970,13 @@ def netdb_replace_all(rows):
                      sanitize_protocol(raw.get("protocol")),
                      db_format.cracked_state(raw.get("cracked")),
                      sanitize_motd(raw.get("whitelist", ""))[:200],
-                     first_seen or last_seen, last_seen or first_seen,
                      times_seen,
                      str(raw.get("last_source", "") or "netdb")[:MAX_SOURCE_CHARS],
-                     _encode_player_list(_decode_player_list(raw.get("players_now"))),
-                     _encode_player_list(_decode_player_list(raw.get("players_ever")))),
+                     _encode_player_list(now_names),
+                     _encode_player_list(ever_names)),
                 )
+                db_format.insert_range(con, ip_port, first_seen, last_seen,
+                                       online, maximum, now_names, ever_names)
                 inserted += 1
             con.commit()
         except Exception:

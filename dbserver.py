@@ -96,7 +96,9 @@ Row shape (mirrors the client's ``servers.db``)::
      "players_now": ["Alice"], "players_ever": ["Alice", "Bob"]}
 
 Merge rule (both directions): ``first_seen`` = oldest non-zero,
-``last_seen`` = newest, mutable display fields (motd/players/version/...)
+``last_seen`` = newest.  The DB stores sightings in ``server_history`` and
+derives those two fields in the ``servers`` view; sync endpoints are merged
+into that history.  Mutable display fields (motd/players/version/...)
 come from whichever side saw the server most recently, and a cracked
 verdict only changes when a client runs an explicit cracked check or
 whitelist probe; a plain status ping never changes an existing verdict.
@@ -144,28 +146,6 @@ SQLITE_MAX_INT = 2 ** 63 - 1     # larger ints overflow the sqlite3 binding
 MAX_TIMESTAMP = 1e18             # far beyond any real epoch, still finite
 TIMESTAMP_SKEW = 300
 NONCE_CACHE_MAX = 20000
-
-SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS servers ("
-    " ip_port TEXT PRIMARY KEY,"
-    " host TEXT DEFAULT '',"
-    " port INTEGER DEFAULT 25565,"
-    " motd TEXT DEFAULT '',"
-    " players_online INTEGER DEFAULT 0,"
-    " max_players INTEGER DEFAULT 0,"
-    " version TEXT DEFAULT '',"
-    " protocol INTEGER,"
-    " cracked INTEGER DEFAULT NULL,"
-    " whitelist TEXT DEFAULT '',"
-    " first_seen REAL DEFAULT 0,"
-    " last_seen REAL DEFAULT 0,"
-    " times_seen INTEGER DEFAULT 1,"
-    " last_source TEXT DEFAULT '',"
-    " players_now TEXT,"
-    " players_ever TEXT,"
-    " seq INTEGER DEFAULT 0"
-    ")"
-)
 
 PLAYERS_EVER_MAX = 500  # per-server cap on the ever-seen name list
 PLAYER_NAME_MAX_LEN = 32
@@ -312,32 +292,37 @@ def _add_column_if_missing(con, column, ddl):
         ddl = str(ddl or "")
         if not re.fullmatch(r"[A-Za-z0-9_ ()\[\]'.,+-]+", ddl):
             return
-        existing = {row[1] for row in con.execute("PRAGMA table_info(servers)")}
+        base = db_format.base_table(con)
+        existing = {row[1] for row in con.execute(f"PRAGMA table_info({base})")}
         if column not in existing:
-            con.execute(f"ALTER TABLE servers ADD COLUMN {column} {ddl}")
+            con.execute(f"ALTER TABLE {base} ADD COLUMN {column} {ddl}")
+            return True
     except Exception:
         pass
+    return False
 
 
 def init_db(db_path):
     con = db_connect(db_path)
     try:
-        con.execute(SCHEMA)
-        con.execute("CREATE INDEX IF NOT EXISTS idx_servers_last_seen "
-                    "ON servers(last_seen DESC)")
+        # Creates the v3 state table/history, or migrates an older DB.
+        db_format.ensure_format(con)
+        base = db_format.base_table(con)
         # Transport cursor for sync: every insert/change gets a fresh seq, so
         # clients page by seq (not wall-clock) and can never miss rows that
         # arrived with old last_seen timestamps.
-        _add_column_if_missing(con, "seq", "INTEGER DEFAULT 0")
-        _add_column_if_missing(con, "players_now", "TEXT DEFAULT '[]'")
-        _add_column_if_missing(con, "players_ever", "TEXT DEFAULT '[]'")
+        added = _add_column_if_missing(con, "seq", "INTEGER DEFAULT 0")
+        added |= _add_column_if_missing(con, "players_now", "TEXT DEFAULT '[]'")
+        added |= _add_column_if_missing(con, "players_ever", "TEXT DEFAULT '[]'")
         try:
-            con.execute("UPDATE servers SET seq=rowid WHERE seq IS NULL OR seq=0")
+            con.execute(f"UPDATE {base} SET seq=rowid"
+                        " WHERE seq IS NULL OR seq=0")
         except Exception:
             pass
-        con.execute("CREATE INDEX IF NOT EXISTS idx_servers_seq ON servers(seq ASC)")
+        con.execute(f"CREATE INDEX IF NOT EXISTS idx_server_state_seq"
+                    f" ON {base}(seq ASC)")
+        db_format.ensure_view(con, recreate=added)
         con.commit()
-        db_format.ensure_format(con)
     finally:
         con.close()
 
@@ -625,20 +610,25 @@ def merge_row(con, row):
     old = cur.fetchone()
     if old is None:
         con.execute(
-            "INSERT INTO servers (ip_port, host, port, motd, players_online,"
-            " max_players, version, protocol, cracked, whitelist,"
-            " first_seen, last_seen, times_seen, last_source,"
-            " players_now, players_ever,"
+            "INSERT INTO server_state (ip_port, host, port, motd,"
+            " players_online, max_players, version, protocol, cracked,"
+            " whitelist, times_seen, last_source, players_now, players_ever,"
             " seq)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM servers))",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM server_state))",
             (row["ip_port"], None, row["port"], row["motd"],
              row["players_online"], row["max_players"], row["version"],
              row["protocol"], row["cracked"], row["whitelist"],
-             row["first_seen"] or row["last_seen"] or _utcnow(),
-             row["last_seen"] or row["first_seen"] or _utcnow(),
              row["times_seen"], row["last_source"],
              row["players_now"], row["players_ever"]))
+        fallback_now = _utcnow()
+        db_format.insert_range(
+            con, row["ip_port"],
+            row["first_seen"] or row["last_seen"] or fallback_now,
+            row["last_seen"] or row["first_seen"] or fallback_now,
+            row["players_online"], row["max_players"],
+            db_format.name_list(row["players_now"]),
+            db_format.name_list(row["players_ever"]))
         return True
     (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
      o_first, o_last, o_times, o_src, o_now, o_ever) = old
@@ -703,15 +693,19 @@ def merge_row(con, row):
             o_first, o_last, o_times, o_src, o_now, o_ever):
         return False
     con.execute(
-        "UPDATE servers SET host=?, port=?, motd=?, players_online=?,"
+        "UPDATE server_state SET host=?, port=?, motd=?, players_online=?,"
         " max_players=?, version=?, protocol=?, cracked=?, whitelist=?,"
-        " first_seen=?, last_seen=?, times_seen=?, last_source=?,"
-        " players_now=?, players_ever=?,"
-        " seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM servers)"
+        " times_seen=?, last_source=?, players_now=?, players_ever=?,"
+        " seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM server_state)"
         " WHERE ip_port=?",
         (None, row["port"], motd, online, maximum, version, protocol,
-         cracked, whitelist, first_seen, last_seen, times_seen, src,
+         cracked, whitelist, times_seen, src,
          now, ever, row["ip_port"]))
+    db_format.insert_range(
+        con, row["ip_port"], row["first_seen"], row["last_seen"],
+        row["players_online"], row["max_players"],
+        db_format.name_list(row["players_now"]),
+        db_format.name_list(row["players_ever"]))
     return True
 
 

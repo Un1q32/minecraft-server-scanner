@@ -120,12 +120,13 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
 - Every sighting is stored separately in `server_history` (timestamp,
   players online, max players), and every sampled player name is stored in
   `player_history` (timestamp, name). This is what the viewers graph.
-  Existing databases are seeded with their `first_seen`/`last_seen` points
-  once; player counts are unknown (`NULL`) for those older points. Until
-  that backfill runs, the viewers fall back to the same first/last-seen
-  points, so every known server still has a graph. History is local-only:
-  normal sync and `--download-db` keep the local history for servers that
-  still exist, but history is not uploaded to the shared DB.
+  Older databases are converted once: their old `first_seen` becomes a
+  sighting (with the every-seen names), and `last_seen` becomes another
+  sighting carrying today's online count/roster. If both were the same
+  time, there is one sighting. Sync sends the derived first/last endpoints
+  rather than every sighting, and the shared DB merges those endpoints into
+  its own history; `--download-db` keeps the local history for servers that
+  still exist.
 - The Servers tab browses that history (search, rescan, copy, export, add to
   Saved/Ignore/Monitor, delete). Search also matches player names, so you
   can find every server a player has been seen on.
@@ -565,8 +566,19 @@ SQLite checkpoint can still make a main-file/WAL pair inconsistent.
 
 ## Database format
 
-`servers.db` and the shared DB use format 2, marked with
-`PRAGMA user_version=2`.
+`servers.db` and the shared DB use format 3, marked with
+`PRAGMA user_version=3`.
+
+Changes from format 2:
+
+- The dedicated `first_seen` and `last_seen` columns are gone. The writable
+  table is `server_state`; the read-only view `servers` adds them back as
+  `MIN(seen_at)` / `MAX(seen_at)` over `server_history`, so existing
+  queries and viewers keep working.
+- Format-2 databases are converted once: `first_seen` becomes a history
+  point and `last_seen` becomes another. The current online count/roster is
+  attached to the last point; the every-seen names are attached to the
+  first point. If both timestamps are the same, one point holds both.
 
 Changes from format 1:
 
@@ -579,14 +591,14 @@ Changes from format 1:
 - Empty `players_now` and `players_ever` lists are `NULL` instead of `"[]"`.
 
 Existing local and server databases are converted once on startup, then
-`VACUUM`ed. On the current data this reduced the DB from about 46 MB to
-36 MB.
+`VACUUM`ed.
 
-The local database also has two history tables: `server_history` (one row
-per sighting) and `player_history` (one row per sampled player per
-sighting). They are not part of the shared format; the viewer JSON is capped
-at 5000 sighting points and 20000 player events while storage keeps every
-row.
+Both local and shared databases have two history tables:
+`server_history` (one row per sighting) and `player_history` (one row per
+sampled player per sighting). The viewer JSON is capped at 5000 sighting
+points and 20000 player events while storage keeps every row. Sync sends
+first/last endpoints rather than every sighting; the shared DB merges those
+endpoints into its own history.
 
 Sync clients send `"format": 2` in `/api/sync`; a missing field means a
 format-1 client. The server converts rows at the sync boundary, so old

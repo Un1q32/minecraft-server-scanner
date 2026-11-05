@@ -98,6 +98,12 @@ def cmd_download_db(include_notes=True):
         print("error: netdb.json has no URL/token yet -- run "
               "'mcscan.py --init-db URL TOKEN' first.")
         return 2
+    # Migrate/seed the local history before replacing the file so the
+    # direct-download merge can carry it into the new database.
+    try:
+        scanner.init_server_db()
+    except Exception:
+        pass
     print(f"downloading shared DB at {url} ...", flush=True)
 
     def _size(value):
