@@ -607,7 +607,7 @@ def init_server_db():
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            # Creates/migrates the v3 base table and the derived servers view.
+            # Creates/migrates the current base table and the derived servers view.
             db_format.ensure_format(con)
             added = _add_column_if_missing(con, "server_state", "needs_sync",
                                           "INTEGER DEFAULT 1")
@@ -638,8 +638,6 @@ def init_server_db():
                         "DELETE FROM server_state WHERE ip_port=?", drop)
                     con.executemany(
                         "DELETE FROM server_history WHERE ip_port=?", drop)
-                    con.executemany(
-                        "DELETE FROM player_history WHERE ip_port=?", drop)
                     con.commit()
             except Exception:
                 pass
@@ -748,14 +746,10 @@ def _record_server_result_locked(con, result, source, now):
         )
     con.execute(
         "INSERT OR IGNORE INTO server_history"
-        " (ip_port, seen_at, players_online, max_players)"
-        " VALUES (?, ?, ?, ?)",
-        (ip_port, now, online, maximum))
-    if activity_names:
-        con.executemany(
-            "INSERT OR IGNORE INTO player_history"
-            " (ip_port, player_name, seen_at) VALUES (?, ?, ?)",
-            [(ip_port, name, now) for name in activity_names])
+        " (ip_port, seen_at, players_online, max_players, players)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (ip_port, now, online, maximum,
+         db_format.encode_player_blob(activity_names)))
     return True
 
 
@@ -991,7 +985,6 @@ def delete_servers_from_db(ip_ports):
             rows = [(ip,) for ip in ip_ports]
             con.executemany("DELETE FROM server_state WHERE ip_port=?", rows)
             con.executemany("DELETE FROM server_history WHERE ip_port=?", rows)
-            con.executemany("DELETE FROM player_history WHERE ip_port=?", rows)
             con.commit()
         finally:
             con.close()
@@ -1515,16 +1508,13 @@ def netdb_collect_history_dirty(history_limit=NETDB_MAX_HISTORY_UPLOAD,
         try:
             con.row_factory = sqlite3.Row
             history = [dict(r) for r in con.execute(
-                "SELECT ip_port, seen_at, players_online, max_players"
-                " FROM server_history WHERE synced=0"
+                "SELECT ip_port, seen_at, players_online, max_players,"
+                " players FROM server_history WHERE synced=0"
                 " ORDER BY seen_at ASC, ip_port ASC LIMIT ?",
                 (max(1, int(history_limit)),))]
-            players = [dict(r) for r in con.execute(
-                "SELECT ip_port, player_name, seen_at"
-                " FROM player_history WHERE synced=0"
-                " ORDER BY seen_at ASC, ip_port ASC LIMIT ?",
-                (max(1, int(player_limit)),))]
-            return history, players
+            # Format 4 carries the roster on the history row; the separate
+            # player-event stream is kept for wire compatibility only.
+            return history, []
         finally:
             con.close()
 
@@ -1542,12 +1532,6 @@ def netdb_mark_history_synced(history_rows, player_rows):
                     "UPDATE server_history SET synced=1"
                     " WHERE ip_port=? AND seen_at=?",
                     [(r["ip_port"], r["seen_at"]) for r in history_rows])
-            if player_rows:
-                con.executemany(
-                    "UPDATE player_history SET synced=1"
-                    " WHERE ip_port=? AND player_name=? AND seen_at=?",
-                    [(r["ip_port"], r["player_name"], r["seen_at"])
-                     for r in player_rows])
             con.commit()
         finally:
             con.close()
@@ -1558,7 +1542,7 @@ def netdb_merge_history(history_rows, player_rows):
     if not history_rows and not player_rows:
         return 0, 0
     _ensure_server_db()
-    history_values = []
+    history_by_key = {}
     for raw in history_rows:
         if not isinstance(raw, dict):
             continue
@@ -1578,8 +1562,17 @@ def netdb_merge_history(history_rows, player_rows):
             maximum = None if maximum in (None, "") else max(0, int(maximum))
         except Exception:
             online = maximum = None
-        history_values.append((ip_port, seen_at, online, maximum))
-    player_values = []
+        players = db_format.encode_player_blob(raw.get("players"))
+        key = (ip_port, seen_at)
+        existing = history_by_key.get(key)
+        if existing is None:
+            history_by_key[key] = [online, maximum, players]
+        else:
+            existing[2] = db_format.merge_player_blobs(existing[2], players)
+    history_values = [(ip, seen, vals[0], vals[1], vals[2])
+                      for (ip, seen), vals in history_by_key.items()]
+    # Old servers still return player events separately from history rows.
+    player_groups = {}
     for raw in player_rows:
         if not isinstance(raw, dict):
             continue
@@ -1595,24 +1588,40 @@ def netdb_merge_history(history_rows, player_rows):
         except Exception:
             continue
         if seen_at > 0:
-            player_values.append((ip_port, name[:32], seen_at))
+            player_groups.setdefault((ip_port, seen_at), []).append(name[:32])
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
             if history_values:
                 con.executemany(
-                    "INSERT OR IGNORE INTO server_history"
-                    " (ip_port, seen_at, players_online, max_players, synced)"
-                    " VALUES (?, ?, ?, ?, 1)", history_values)
-            if player_values:
-                con.executemany(
-                    "INSERT OR IGNORE INTO player_history"
-                    " (ip_port, player_name, seen_at, synced)"
-                    " VALUES (?, ?, ?, 1)", player_values)
+                    "INSERT INTO server_history"
+                    " (ip_port, seen_at, players_online, max_players,"
+                    " players, synced) VALUES (?, ?, ?, ?, ?, 1)"
+                    " ON CONFLICT(ip_port, seen_at) DO UPDATE SET"
+                    " players=COALESCE(server_history.players,"
+                    " excluded.players)", history_values)
+            for (ip_port, seen_at), names in player_groups.items():
+                row = con.execute(
+                    "SELECT players FROM server_history"
+                    " WHERE ip_port=? AND seen_at=?",
+                    (ip_port, seen_at)).fetchone()
+                merged = db_format.merge_player_blobs(
+                    row[0] if row else None, names)
+                if row is None:
+                    con.execute(
+                        "INSERT OR IGNORE INTO server_history"
+                        " (ip_port, seen_at, players_online, max_players,"
+                        " players, synced) VALUES (?, ?, NULL, NULL, ?, 1)",
+                        (ip_port, seen_at, merged))
+                elif merged != row[0]:
+                    con.execute(
+                        "UPDATE server_history SET players=?, synced=1"
+                        " WHERE ip_port=? AND seen_at=?",
+                        (merged, ip_port, seen_at))
             con.commit()
         finally:
             con.close()
-    return len(history_values), len(player_values)
+    return len(history_values), sum(len(v) for v in player_groups.values())
 
 
 def netdb_sync_history(url, token, timeout=None, compress=False,
@@ -1996,21 +2005,18 @@ def _merge_previous_history(con):
     except Exception:
         return
     try:
-        tables = (
-            ("server_history", "ip_port, seen_at, players_online, max_players"),
-            ("player_history", "ip_port, player_name, seen_at"),
-        )
-        for table, columns in tables:
-            found = con.execute(
-                "SELECT 1 FROM previous.sqlite_master"
-                " WHERE type='table' AND name=?", (table,)).fetchone()
-            if not found:
-                continue
+        found = con.execute(
+            "SELECT 1 FROM previous.sqlite_master"
+            " WHERE type='table' AND name='server_history'").fetchone()
+        if found:
             try:
                 prev_cols = {str(row[1]) for row in con.execute(
-                    f"PRAGMA previous.table_info({table})")}
+                    "PRAGMA previous.table_info(server_history)")}
             except Exception:
                 prev_cols = set()
+            columns = "ip_port, seen_at, players_online, max_players"
+            if "players" in prev_cols:
+                columns += ", players"
             has_synced = "synced" in prev_cols
             source = columns + (", synced" if has_synced else ", 0")
             # Rows already uploaded are in the shared snapshot too; only
@@ -2020,8 +2026,9 @@ def _merge_previous_history(con):
             if has_synced:
                 where += " AND synced=0"
             con.execute(
-                f"INSERT OR IGNORE INTO main.{table} ({columns}, synced)"
-                f" SELECT {source} FROM previous.{table}{where}")
+                f"INSERT OR IGNORE INTO main.server_history"
+                f" ({columns}, synced)"
+                f" SELECT {source} FROM previous.server_history{where}")
     finally:
         try:
             con.execute("DETACH DATABASE previous")
@@ -2051,7 +2058,6 @@ def _prepare_downloaded_db(path):
         # Everything in a downloaded DB already came from the shared server.
         # Most rows should already be synced; only fix the leftovers.
         con.execute("UPDATE server_history SET synced=1 WHERE synced=0")
-        con.execute("UPDATE player_history SET synced=1 WHERE synced=0")
         base = db_format.base_table(con)
         cols = {str(r[1]) for r in con.execute(f"PRAGMA table_info({base})")}
         if not cols:
@@ -2358,7 +2364,6 @@ def netdb_replace_all(rows):
             con.execute("BEGIN IMMEDIATE")
             con.execute("DELETE FROM server_state")
             con.execute("DELETE FROM server_history")
-            con.execute("DELETE FROM player_history")
             for raw in rows or []:
                 if not isinstance(raw, dict):
                     continue
@@ -7742,10 +7747,11 @@ class UserLogManager:
     """
     Thread-safe player -> latest server view.
 
-    The database is the source of truth: ``player_history`` has every player
-    sample and ``server_state`` supplies the MOTD.  This in-memory cache only
-    keeps the User Log tab responsive.  Legacy ``user_log.json`` data is
-    imported into the DB once, then the JSON file is retired.
+    The database is the source of truth: each ``server_history`` row carries
+    its sampled roster blob and ``server_state`` supplies the MOTD.  This
+    in-memory cache only keeps the User Log tab responsive.  Legacy
+    ``user_log.json`` data is imported into the DB once, then the JSON file
+    is retired.
     """
     def __init__(self):
         self._entries = {}
@@ -7790,13 +7796,16 @@ class UserLogManager:
         try:
             _ensure_server_db()
             if rows:
+                grouped = {}
+                for ip_port, player, seen_at in rows:
+                    grouped.setdefault((ip_port, seen_at), []).append(player)
                 with _SERVER_DB_LOCK:
                     con = _server_db_connect()
                     try:
-                        con.executemany(
-                            "INSERT OR IGNORE INTO player_history"
-                            " (ip_port, player_name, seen_at, synced)"
-                            " VALUES (?, ?, ?, 0)", rows)
+                        for (ip_port, seen_at), names in grouped.items():
+                            db_format.insert_history(
+                                con, ip_port, seen_at, None, None, names,
+                                synced=0)
                         con.commit()
                     finally:
                         con.close()
@@ -7817,27 +7826,42 @@ class UserLogManager:
                 con = _server_db_connect()
                 try:
                     con.row_factory = sqlite3.Row
-                    rows = con.execute(
-                        "SELECT latest.player_name AS player,"
-                        " latest.ip_port AS ip,"
-                        " COALESCE(s.motd, '') AS motd,"
-                        " latest.last_seen AS last_seen"
-                        " FROM ("
-                        "   SELECT player_name, ip_port, MAX(seen_at) AS last_seen"
-                        "   FROM player_history GROUP BY player_name"
-                        " ) latest"
-                        " LEFT JOIN server_state s ON s.ip_port=latest.ip_port"
-                        " ORDER BY latest.last_seen DESC LIMIT ?",
-                        (MAX_USER_LOG_ENTRIES,)).fetchall()
-                    for row in rows:
-                        player = str(row["player"] or "")
-                        if not player:
-                            continue
-                        loaded[player] = {
-                            "ip": str(row["ip"] or ""),
-                            "motd": str(row["motd"] or ""),
-                            "last_seen": float(row["last_seen"] or 0),
-                        }
+                    # Newest sighting first; the first appearance of a name
+                    # is its latest sighting.  Rosters are parsed only until
+                    # the User Log cap is reached.
+                    cur = con.execute(
+                        "SELECT ip_port, seen_at, players FROM server_history"
+                        " WHERE players IS NOT NULL"
+                        " ORDER BY seen_at DESC")
+                    for row in cur:
+                        ip = str(row["ip_port"] or "")
+                        seen_at = float(row["seen_at"] or 0)
+                        for player in db_format.decode_player_blob(
+                                row["players"]):
+                            if player in loaded:
+                                continue
+                            loaded[player] = {
+                                "ip": ip,
+                                "motd": "",
+                                "last_seen": seen_at,
+                            }
+                            if len(loaded) >= MAX_USER_LOG_ENTRIES:
+                                break
+                        if len(loaded) >= MAX_USER_LOG_ENTRIES:
+                            break
+                    motd_by_ip = {}
+                    ips = list({entry["ip"] for entry in loaded.values()
+                                if entry["ip"]})
+                    for start in range(0, len(ips), 500):
+                        chunk = ips[start:start + 500]
+                        marks = ",".join("?" * len(chunk))
+                        for row in con.execute(
+                                f"SELECT ip_port, motd FROM server_state"
+                                f" WHERE ip_port IN ({marks})", chunk):
+                            motd_by_ip[str(row["ip_port"] or "")] = str(
+                                row["motd"] or "")
+                    for entry in loaded.values():
+                        entry["motd"] = motd_by_ip.get(entry["ip"], "")
                 finally:
                     con.close()
         except Exception:

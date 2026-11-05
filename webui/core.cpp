@@ -1051,25 +1051,44 @@ std::string history_text(const std::string &ip) {
 
     out += "],\"players\":[";
     std::map<std::string, std::vector<double>> players;
-    if (g_db && table_exists("player_history")) {
+    if (g_db && table_exists("server_history")) {
         sqlite3_stmt *stmt = nullptr;
         const char *sql =
-            "SELECT player_name, seen_at FROM ("
-            "  SELECT player_name, seen_at FROM player_history"
-            "  WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?"
-            ") ORDER BY player_name ASC, seen_at ASC";
+            "SELECT seen_at, players FROM server_history"
+            " WHERE ip_port=? AND players IS NOT NULL"
+            " ORDER BY seen_at DESC LIMIT ?";
         if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, ip.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(stmt, 2, event_limit);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                players[text_col(stmt, 0)].push_back(
-                    sqlite3_column_double(stmt, 1));
+            size_t total = 0;
+            const size_t max_total = static_cast<size_t>(event_limit);
+            while (total < max_total && sqlite3_step(stmt) == SQLITE_ROW) {
+                double seen_at = sqlite3_column_double(stmt, 0);
+                const unsigned char *raw = sqlite3_column_text(stmt, 1);
+                std::string blob = raw
+                    ? reinterpret_cast<const char *>(raw) : "";
+                size_t start = 0;
+                while (total < max_total && start <= blob.size()) {
+                    size_t end = blob.find('\x1f', start);
+                    std::string name = blob.substr(
+                        start, end == std::string::npos
+                            ? std::string::npos : end - start);
+                    if (!name.empty()) {
+                        players[name].push_back(seen_at);
+                        ++total;
+                    }
+                    if (end == std::string::npos) {
+                        break;
+                    }
+                    start = end + 1;
+                }
             }
         }
         sqlite3_finalize(stmt);
     }
     bool first_player = true;
-    for (const auto &entry : players) {
+    for (auto &entry : players) {
+        std::sort(entry.second.begin(), entry.second.end());
         if (!first_player) {
             out += ',';
         }

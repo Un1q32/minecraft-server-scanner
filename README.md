@@ -119,10 +119,13 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
   samples, kept after logout, capped at 500 names per server). Names
   containing `§`, emoji, control characters or other symbol-only ad text are
   discarded. `Anonymous Player` stays in these lists but is not recorded in
-  `player_history` or the activity graphs because it is not a real account.
+  the activity history or the activity graphs because it is not a real
+  account.
 - Every sighting is stored separately in `server_history` (timestamp,
-  players online, max players), and every sampled player name is stored in
-  `player_history` (timestamp, name). This is what the viewers graph.
+  players online, max players, and the sampled roster). The roster is one
+  compact name blob per sighting rather than one row per player per scan,
+  because the same names repeat across sightings and the sample is often
+  partial. This is what the viewers graph.
   Older databases are converted once: their old `first_seen` becomes a
   sighting (with the every-seen names), and `last_seen` becomes another
   sighting carrying today's online count/roster. If both were the same
@@ -138,8 +141,8 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
   downloads other clients' servers, refreshing last-seen dates both ways.
 - Maintains Saved and Ignore lists with optional reasons.
 - Filters ignored servers from scan workflows.
-- Derives each player’s latest known server from `player_history` in the DB
-  (the old `user_log.json` is imported once and then retired).
+- Derives each player’s latest known server from the roster blobs in the
+  DB (the old `user_log.json` is imported once and then retired).
 - Copies selected IPs and exports selected result sets.
 
 ### Server Monitor
@@ -609,8 +612,20 @@ SQLite checkpoint can still make a main-file/WAL pair inconsistent.
 
 ## Database format
 
-`servers.db` and the shared DB use format 3, marked with
-`PRAGMA user_version=3`.
+`servers.db` and the shared DB use format 4, marked with
+`PRAGMA user_version=4`.
+
+Changes from format 3:
+
+- `player_history` is gone. Each `server_history` row carries a `players`
+  blob: sampled activity names separated by `\x1f`, sorted, deduplicated,
+  capped at 500. A sighting with no sampled names stores `NULL`.
+- Format-3 databases are converted once: every `(ip_port, seen_at)` group
+  in `player_history` is folded into the matching `server_history.players`
+  blob, then `player_history` is dropped and the database is vacuumed.
+- The roster blob stores only real activity names; `§`/emoji/control/ad
+  names and `Anonymous Player` are filtered out. `players_now` and
+  `players_ever` in `server_state` still keep `Anonymous Player`.
 
 Changes from format 2:
 
@@ -636,27 +651,29 @@ Changes from format 1:
 Existing local and server databases are converted once on startup, then
 `VACUUM`ed.
 
-Both local and shared databases have two history tables:
-`server_history` (one row per sighting) and `player_history` (one row per
-sampled player per sighting). The viewer JSON is capped at 5000 sighting
-points and 20000 player events while storage keeps every row. Upload indexes
-are partial (`WHERE synced=0`), so they shrink back to almost nothing after a
-sync; obsolete full-history indexes are dropped at startup. The shared server
-vacuums automatically when the freed space exceeds 10%; scanner nodes can run
+Both local and shared databases have one history table: `server_history`
+(one row per sighting, including its roster blob). The viewer JSON is capped
+at 5000 sighting points and 20000 player events while storage keeps every
+row. Upload indexes are partial (`WHERE synced=0`), so they shrink back to
+almost nothing after a sync; a partial
+`idx_server_history_players_time` index serves the User Log. Obsolete
+full-history indexes are dropped at startup. The shared server vacuums
+automatically when the freed space exceeds 10%; scanner nodes can run
 `mcscan.py --vacuum-db` when convenient.
 
 History is synced incrementally as well: local rows carry a `synced` flag,
-and `/api/history/sync` uploads unsynced sightings/player events and pages
-new shared rows back using rowid cursors stored in `netdb.json`
-(`last_history_seq`, `last_player_seq`). The server row sync still sends
-first/last endpoints, so older clients keep working; newer clients fill in
-the full per-sighting history.
+and `/api/history/sync` uploads unsynced sightings (including their roster
+blob) and pages new shared rows back using rowid cursors stored in
+`netdb.json` (`last_history_seq`; `last_player_seq` remains for old
+clients). The server row sync still sends first/last endpoints, so older
+clients keep working; newer clients fill in the full per-sighting history.
 
-Sync clients send `"format": 3` in `/api/sync`; a missing field means a
+Sync clients send `"format": 4` in `/api/sync`; a missing field means a
 format-1 client. The server converts rows at the sync boundary, so old
-clients can still sync against a format-3 server and new clients can sync
+clients can still sync against a format-4 server and new clients can sync
 against an old server. The conversion is per row and does not require a
-full-table pass.
+full-table pass. Old clients that upload separate player events have them
+folded into the roster blob on the matching sighting.
 
 ## Text format
 

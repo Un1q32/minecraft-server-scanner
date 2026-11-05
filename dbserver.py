@@ -77,12 +77,15 @@ gzip is the fallback).
 
 * ``POST /api/history/sync``
   ``{"history": [...], "players": [...], "history_since": N, "player_since": N}``
-  merges uploaded sightings/player events and returns new shared rows with
-  rowid cursors, so each client can page through the complete history::
+  merges uploaded sightings and returns new shared rows with rowid
+  cursors, so each client can page through the complete history::
 
       {"history": [...], "players": [...],
        "history_seq": N, "player_seq": N, "has_history": true}
 
+  Each history row carries its sampled ``players`` roster blob.  The
+  separate ``players`` event list remains only for old clients; their
+  events are folded into the matching history row's blob.
   A missing endpoint on older servers is treated as "history unsupported";
   clients keep their rows unsynced for a later server upgrade.
 
@@ -337,7 +340,7 @@ def init_db(db_path):
     cleanup_stale_snapshots(db_path)
     con = db_connect(db_path)
     try:
-        # Creates the v3 state table/history, or migrates an older DB.
+        # Creates the current state table/history, or migrates an older DB.
         db_format.ensure_format(con)
         base = db_format.base_table(con)
         # Transport cursor for sync: every insert/change gets a fresh seq, so
@@ -355,11 +358,10 @@ def init_db(db_path):
                     f" ON {base}(seq ASC)")
         # The server is the sync source; its history must not be marked as
         # pending upload when a client downloads the DB file.
-        for table in ("server_history", "player_history"):
-            try:
-                con.execute(f"UPDATE {table} SET synced=1 WHERE synced=0")
-            except Exception:
-                pass
+        try:
+            con.execute("UPDATE server_history SET synced=1 WHERE synced=0")
+        except Exception:
+            pass
         db_format.ensure_view(con, recreate=added)
         con.commit()
         # Server DBs live on a fast host; reclaim pages freed by index
@@ -631,6 +633,7 @@ def sanitize_history_row(raw, now=None):
         "seen_at": seen_at,
         "players_online": _history_count(raw.get("players_online")),
         "max_players": _history_count(raw.get("max_players")),
+        "players": db_format.encode_player_blob(raw.get("players")),
     }
 
 
@@ -1097,12 +1100,6 @@ class Handler(BaseHTTPRequestHandler):
                             " FROM server_history").fetchone()[0] or 0)
                     except Exception:
                         history_seq = 0
-                    try:
-                        player_seq = int(src.execute(
-                            "SELECT COALESCE(MAX(rowid), 0)"
-                            " FROM player_history").fetchone()[0] or 0)
-                    except Exception:
-                        player_seq = 0
                     src.execute("VACUUM INTO ?", (tmp,))
                 finally:
                     src.close()
@@ -1393,19 +1390,32 @@ class Handler(BaseHTTPRequestHandler):
             limit = max(1, min(limit, MAX_HISTORY_PER_RESPONSE))
             download = bool(payload.get("download", True))
             now = _utcnow()
-            history_values = []
+            history_by_key = {}
             for raw_row in history_in:
                 row = sanitize_history_row(raw_row, now)
-                if row is not None:
-                    history_values.append(
-                        (row["ip_port"], row["seen_at"],
-                         row["players_online"], row["max_players"]))
-            player_values = []
+                if row is None:
+                    continue
+                key = (row["ip_port"], row["seen_at"])
+                existing = history_by_key.get(key)
+                if existing is None:
+                    history_by_key[key] = [
+                        row["players_online"], row["max_players"],
+                        row["players"]]
+                else:
+                    existing[2] = db_format.merge_player_blobs(
+                        existing[2], row["players"])
+            history_values = [
+                (ip, seen, vals[0], vals[1], vals[2])
+                for (ip, seen), vals in history_by_key.items()]
+            # Old clients still upload player events separately.  Fold them
+            # into the roster blob on the matching sighting.
+            player_groups = {}
             for raw_row in players_in:
                 row = sanitize_player_event(raw_row, now)
                 if row is not None:
-                    player_values.append(
-                        (row["ip_port"], row["player_name"], row["seen_at"]))
+                    player_groups.setdefault(
+                        (row["ip_port"], row["seen_at"]), []).append(
+                            row["player_name"])
             merged_history = merged_players = 0
             with _db_lock:
                 con = db_connect(self.server.db_path)
@@ -1413,41 +1423,50 @@ class Handler(BaseHTTPRequestHandler):
                     before = con.total_changes
                     if history_values:
                         con.executemany(
-                            "INSERT OR IGNORE INTO server_history"
+                            "INSERT INTO server_history"
                             " (ip_port, seen_at, players_online, max_players,"
-                            " synced) VALUES (?, ?, ?, ?, 1)",
+                            " players, synced) VALUES (?, ?, ?, ?, ?, 1)"
+                            " ON CONFLICT(ip_port, seen_at) DO UPDATE SET"
+                            " players=COALESCE(server_history.players,"
+                            " excluded.players)",
                             history_values)
                     merged_history = con.total_changes - before
                     before = con.total_changes
-                    if player_values:
-                        con.executemany(
-                            "INSERT OR IGNORE INTO player_history"
-                            " (ip_port, player_name, seen_at, synced)"
-                            " VALUES (?, ?, ?, 1)",
-                            player_values)
+                    for (ip_port, seen_at), names in player_groups.items():
+                        row = con.execute(
+                            "SELECT players FROM server_history"
+                            " WHERE ip_port=? AND seen_at=?",
+                            (ip_port, seen_at)).fetchone()
+                        merged = db_format.merge_player_blobs(
+                            row[0] if row else None, names)
+                        if row is None:
+                            con.execute(
+                                "INSERT OR IGNORE INTO server_history"
+                                " (ip_port, seen_at, players_online,"
+                                " max_players, players, synced)"
+                                " VALUES (?, ?, NULL, NULL, ?, 1)",
+                                (ip_port, seen_at, merged))
+                        elif merged != row[0]:
+                            con.execute(
+                                "UPDATE server_history SET players=?,"
+                                " synced=1 WHERE ip_port=? AND seen_at=?",
+                                (merged, ip_port, seen_at))
                     merged_players = con.total_changes - before
                     con.commit()
                     if download:
                         con.row_factory = sqlite3.Row
                         cur = con.execute(
                             "SELECT rowid AS seq, ip_port, seen_at,"
-                            " players_online, max_players"
+                            " players_online, max_players, players"
                             " FROM server_history WHERE rowid > ?"
                             " ORDER BY rowid ASC LIMIT ?",
                             (history_since, limit))
                         history_out = [dict(r) for r in cur.fetchall()]
-                        cur = con.execute(
-                            "SELECT rowid AS seq, ip_port, player_name, seen_at"
-                            " FROM player_history WHERE rowid > ?"
-                            " ORDER BY rowid ASC LIMIT ?",
-                            (player_since, limit))
-                        players_out = [dict(r) for r in cur.fetchall()]
+                        players_out = []
                         history_seq = max(
                             [history_since] +
                             [int(r.get("seq", 0) or 0) for r in history_out])
-                        player_seq = max(
-                            [player_since] +
-                            [int(r.get("seq", 0) or 0) for r in players_out])
+                        player_seq = player_since
                     else:
                         history_out = []
                         players_out = []

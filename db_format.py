@@ -12,6 +12,13 @@ MIN/MAX over that history so existing queries keep working.  The base table
 is named ``server_state`` because SQLite cannot have a table and a view with
 the same name.
 
+Format 4 stores the sampled player roster as one compact blob on each
+``server_history`` row instead of a ``player_history`` row per player per
+sighting.  Rosters are often nearly identical and the server sample is
+partial, so per-player rows dominated the database and duplicated the same
+names over and over.  Names are separated by ``\\x1f`` (a control character
+that filtered player names cannot contain).
+
 SQLite's ``PRAGMA user_version`` marks the format; older databases have 0
 and are migrated in place.
 """
@@ -22,7 +29,7 @@ import json
 import sqlite3
 import unicodedata
 
-CURRENT_FORMAT = 3
+CURRENT_FORMAT = 4
 BASE_FORMAT = 1
 STATE_TABLE = "server_state"
 SERVER_VIEW = "servers"
@@ -53,28 +60,20 @@ HISTORY_TABLES = (
     " seen_at REAL NOT NULL,"
     " players_online INTEGER,"
     " max_players INTEGER,"
+    " players TEXT,"
     " synced INTEGER DEFAULT 0,"
     " PRIMARY KEY (ip_port, seen_at)"
-    ")",
-    "CREATE TABLE IF NOT EXISTS player_history ("
-    " ip_port TEXT NOT NULL,"
-    " player_name TEXT NOT NULL,"
-    " seen_at REAL NOT NULL,"
-    " synced INTEGER DEFAULT 0,"
-    " PRIMARY KEY (ip_port, player_name, seen_at)"
     ")",
 )
 
 HISTORY_INDEXES = (
-    # The User Log needs the latest server per player.
-    "CREATE INDEX IF NOT EXISTS idx_player_history_name_time"
-    " ON player_history(player_name, seen_at DESC)",
     # Only unsynced rows need upload indexes.  After a sync these are
     # nearly empty instead of indexing the entire history.
     "CREATE INDEX IF NOT EXISTS idx_server_history_unsynced"
     " ON server_history(seen_at ASC) WHERE synced=0",
-    "CREATE INDEX IF NOT EXISTS idx_player_history_unsynced"
-    " ON player_history(seen_at ASC) WHERE synced=0",
+    # The User Log only needs sightings that actually sampled players.
+    "CREATE INDEX IF NOT EXISTS idx_server_history_players_time"
+    " ON server_history(seen_at DESC) WHERE players IS NOT NULL",
 )
 
 # Older format-3 builds created these full-table indexes.  They are either
@@ -82,24 +81,29 @@ HISTORY_INDEXES = (
 # needed for graph queries.
 OLD_HISTORY_INDEXES = (
     "idx_player_history_ip_time",
+    "idx_player_history_name_time",
     "idx_server_history_synced",
     "idx_player_history_synced",
 )
+PLAYER_BLOB_SEP = "\x1f"
+PLAYER_BLOB_MAX = 500
 
 
 def init_history_schema(con: sqlite3.Connection):
     """Create the per-sighting tables used by the viewer graphs."""
     for statement in HISTORY_TABLES:
         con.execute(statement)
-    # Format 3 originally shipped without the sync flag.  Existing rows
-    # become unsynced so the next sync uploads the local history once.
-    # The upload indexes must be created after this ALTER.
-    for table in ("server_history", "player_history"):
-        columns = {str(row[1]) for row in
-                   con.execute(f"PRAGMA table_info({table})")}
-        if "synced" not in columns:
-            con.execute(f"ALTER TABLE {table}"
-                        " ADD COLUMN synced INTEGER DEFAULT 0")
+    # Format 3 originally shipped without the sync flag; format 4 adds the
+    # roster blob.  Existing rows become unsynced so the next sync uploads
+    # the local history once.  The upload indexes must be created after
+    # these ALTERs.
+    columns = {str(row[1]) for row in
+               con.execute("PRAGMA table_info(server_history)")}
+    if "synced" not in columns:
+        con.execute("ALTER TABLE server_history"
+                    " ADD COLUMN synced INTEGER DEFAULT 0")
+    if "players" not in columns:
+        con.execute("ALTER TABLE server_history ADD COLUMN players TEXT")
     # Drop the old, much larger indexes.  This is a no-op after the first
     # startup; the pages are reclaimed by vacuum_if_bloated().
     for name in OLD_HISTORY_INDEXES:
@@ -238,23 +242,87 @@ def _name_list(value) -> list[str]:
     return out
 
 
+def _blob_names(value) -> list[str]:
+    """Decode a player roster blob (or legacy JSON/list) into names."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        text = str(value)
+        if not text:
+            return []
+        if text.lstrip().startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return []
+            raw = parsed if isinstance(parsed, list) else []
+        else:
+            raw = text.split(PLAYER_BLOB_SEP)
+    out = []
+    seen = set()
+    for item in raw:
+        name = str(item or "").strip()
+        if (name and not is_spoofed_player_name(name)
+                and not is_anonymous_player_name(name)
+                and name not in seen):
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def encode_player_blob(names) -> str | None:
+    """One compact roster -> stored blob (None when empty)."""
+    values = _blob_names(names)
+    if not values:
+        return None
+    values = sorted(values, key=str.lower)[:PLAYER_BLOB_MAX]
+    return PLAYER_BLOB_SEP.join(values)
+
+
+def decode_player_blob(value) -> list[str]:
+    """Stored blob (or legacy JSON/list) -> sorted activity names."""
+    values = _blob_names(value)
+    return sorted(values, key=str.lower)
+
+
+def merge_player_blobs(old, new) -> str | None:
+    """Union two rosters, keeping established (old) names first."""
+    merged = _blob_names(old)
+    seen = set(merged)
+    for name in _blob_names(new):
+        if name not in seen:
+            seen.add(name)
+            merged.append(name)
+    return encode_player_blob(merged)
+
+
 def _insert_history(con, ip_port, seen_at, players_online, max_players,
-                    names=(), synced=0):
+                    names=(), synced=0, merge=False):
     if not ip_port or seen_at <= 0:
         return
+    players = encode_player_blob(names)
+    if merge and players is not None:
+        row = con.execute(
+            "SELECT players FROM server_history"
+            " WHERE ip_port=? AND seen_at=?", (ip_port, seen_at)).fetchone()
+        if row is not None:
+            players = merge_player_blobs(row[0], players)
+            con.execute(
+                "UPDATE server_history SET players=?"
+                " WHERE ip_port=? AND seen_at=?",
+                (players, ip_port, seen_at))
+            if players:
+                con.execute(
+                    "UPDATE server_history SET synced=0"
+                    " WHERE ip_port=? AND seen_at=?", (ip_port, seen_at))
+            return
     con.execute(
         "INSERT OR IGNORE INTO server_history"
-        " (ip_port, seen_at, players_online, max_players, synced)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (ip_port, seen_at, players_online, max_players, synced))
-    rows = [(ip_port, name, seen_at, synced) for name in names
-            if name and not is_spoofed_player_name(name)
-            and not is_anonymous_player_name(name)]
-    if rows:
-        con.executemany(
-            "INSERT OR IGNORE INTO player_history"
-            " (ip_port, player_name, seen_at, synced) VALUES (?, ?, ?, ?)",
-            rows)
+        " (ip_port, seen_at, players_online, max_players, players, synced)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (ip_port, seen_at, players_online, max_players, players, synced))
 
 
 def name_list(value) -> list[str]:
@@ -263,10 +331,10 @@ def name_list(value) -> list[str]:
 
 
 def insert_history(con, ip_port, seen_at, players_online=None,
-                   max_players=None, names=(), synced=0):
+                   max_players=None, names=(), synced=0, merge=False):
     """Insert one sighting (and its player samples) with duplicate safety."""
     _insert_history(con, ip_port, seen_at, players_online, max_players, names,
-                    synced)
+                    synced, merge=merge)
 
 
 def insert_range(con, ip_port, first_seen, last_seen, players_online,
@@ -288,17 +356,13 @@ def insert_range(con, ip_port, first_seen, last_seen, players_online,
         last_seen = first_seen
     if abs(last_seen - first_seen) < 1e-9:
         _insert_history(con, ip_port, first_seen, players_online,
-                        max_players, ever_names, synced)
-        _insert_history(con, ip_port, first_seen, None, None, now_names,
+                        max_players, list(ever_names) + list(now_names),
                         synced)
     else:
         _insert_history(con, ip_port, first_seen, None, None, ever_names,
                         synced)
         _insert_history(con, ip_port, last_seen, players_online,
                         max_players, now_names, synced)
-        if not ever_names:
-            _insert_history(con, ip_port, last_seen, None, None, now_names,
-                            synced)
 
 
 def _populate_history_from_columns(con: sqlite3.Connection):
@@ -341,20 +405,17 @@ def _populate_history_from_columns(con: sqlite3.Connection):
         if abs(last_seen - first_seen) < 1e-9:
             # Single known sighting: its current player data belongs here.
             _insert_history(con, ip_port, first_seen, online, maximum,
-                            ever_names)
-            _insert_history(con, ip_port, first_seen, None, None, now_names)
+                            list(ever_names) + list(now_names))
         else:
             # Every-seen names go to the first sighting so they survive;
             # today's online count/roster belongs to the last sighting.
             _insert_history(con, ip_port, first_seen, None, None, ever_names)
             _insert_history(con, ip_port, last_seen, online, maximum,
                             now_names)
-            if not ever_names:
-                _insert_history(con, ip_port, last_seen, None, None, now_names)
 
 
 def detect_format(con: sqlite3.Connection) -> int:
-    """3 for history-derived servers, 2/1 for the legacy schemas.
+    """4 for blob rosters, 3 for history-derived servers, 2/1 legacy.
 
     ``user_version`` is authoritative, but the schema is a useful fallback
     for databases created by an interrupted migration.
@@ -363,6 +424,14 @@ def detect_format(con: sqlite3.Connection) -> int:
         version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
     except Exception:
         version = 0
+    if version >= 4:
+        return 4
+    if object_type(con, "server_history") == "table":
+        columns = {str(row[1]) for row in
+                   con.execute("PRAGMA table_info(server_history)")}
+        if ("players" in columns
+                and object_type(con, "player_history") != "table"):
+            return 4
     if object_type(con, SERVER_VIEW) == "view" and \
             object_type(con, STATE_TABLE) == "table":
         return 3
@@ -532,7 +601,7 @@ def _init_v3(con: sqlite3.Connection):
     con.execute(SERVER_STATE_SCHEMA)
     init_history_schema(con)
     ensure_view(con)
-    con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+    con.execute("PRAGMA user_version=3")
 
 
 def _migrate_2_to_3(con: sqlite3.Connection) -> bool:
@@ -543,7 +612,7 @@ def _migrate_2_to_3(con: sqlite3.Connection) -> bool:
             return True
         init_history_schema(con)
         ensure_view(con)
-        con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+        con.execute("PRAGMA user_version=3")
         return False
     changed = False
     try:
@@ -558,7 +627,7 @@ def _migrate_2_to_3(con: sqlite3.Connection) -> bool:
         if "last_seen" in names:
             con.execute("ALTER TABLE server_state DROP COLUMN last_seen")
         ensure_view(con)
-        con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
+        con.execute("PRAGMA user_version=3")
         con.commit()
         changed = True
         try:
@@ -574,13 +643,96 @@ def _migrate_2_to_3(con: sqlite3.Connection) -> bool:
         raise
 
 
+def _migrate_3_to_4(con: sqlite3.Connection) -> bool:
+    """Fold ``player_history`` into a roster blob on each sighting."""
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS server_history ("
+        " ip_port TEXT NOT NULL, seen_at REAL NOT NULL,"
+        " players_online INTEGER, max_players INTEGER,"
+        " players TEXT, synced INTEGER DEFAULT 0,"
+        " PRIMARY KEY (ip_port, seen_at))")
+    columns = {str(row[1]) for row in
+               con.execute("PRAGMA table_info(server_history)")}
+    if "players" not in columns:
+        con.execute("ALTER TABLE server_history ADD COLUMN players TEXT")
+    if "synced" not in columns:
+        con.execute("ALTER TABLE server_history"
+                    " ADD COLUMN synced INTEGER DEFAULT 0")
+    if object_type(con, "player_history") != "table":
+        con.execute("PRAGMA user_version=4")
+        return False
+    changed = False
+    state = {"key": None, "names": []}
+
+    def flush():
+        nonlocal changed
+        ip_port, seen_at = state["key"]
+        blob = encode_player_blob(state["names"])
+        state["names"] = []
+        if blob is None:
+            return
+        row = con.execute(
+            "SELECT players FROM server_history"
+            " WHERE ip_port=? AND seen_at=?",
+            (ip_port, seen_at)).fetchone()
+        if row is None:
+            con.execute(
+                "INSERT OR IGNORE INTO server_history"
+                " (ip_port, seen_at, players_online, max_players,"
+                " players, synced) VALUES (?, ?, NULL, NULL, ?, 0)",
+                (ip_port, seen_at, blob))
+            changed = True
+            return
+        merged = merge_player_blobs(row[0], blob)
+        if merged != row[0]:
+            con.execute(
+                "UPDATE server_history SET players=?, synced=0"
+                " WHERE ip_port=? AND seen_at=?",
+                (merged, ip_port, seen_at))
+            changed = True
+
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        # Streamed, not grouped in memory: a Pi with a large history file
+        # should not need hundreds of MB just to migrate.
+        for ip_port, seen_at, name in con.execute(
+                "SELECT ip_port, seen_at, player_name FROM player_history"
+                " ORDER BY ip_port, seen_at"):
+            key = (str(ip_port or ""), float(seen_at or 0))
+            if not key[0] or key[1] <= 0:
+                continue
+            if key != state["key"]:
+                if state["key"] is not None:
+                    flush()
+                state["key"] = key
+            state["names"].append(name)
+        if state["key"] is not None:
+            flush()
+        con.execute("DROP TABLE player_history")
+        con.execute("PRAGMA user_version=4")
+        con.commit()
+        try:
+            con.execute("VACUUM")
+        except Exception:
+            pass
+        return True
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+
+
 def migrate(con: sqlite3.Connection) -> bool:
     """Upgrade the database to the current format in place."""
     changed = False
     if detect_format(con) < 2:
         changed = _migrate_1_to_2(con) or changed
-    if detect_format(con) < CURRENT_FORMAT:
+    if detect_format(con) < 3:
         changed = _migrate_2_to_3(con) or changed
+    if detect_format(con) < CURRENT_FORMAT:
+        changed = _migrate_3_to_4(con) or changed
     try:
         version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
     except Exception:
@@ -602,7 +754,7 @@ def clean_spoofed_player_data(con: sqlite3.Connection):
     """Drop ad/spoof names from activity and scrub stored player lists.
 
     "Anonymous Player" is kept in the players_now/players_ever lists but is
-    not a real player, so it is removed from player_history.
+    not a real player, so it is removed from the roster history.
     """
     try:
         con.execute(
@@ -612,7 +764,7 @@ def clean_spoofed_player_data(con: sqlite3.Connection):
         row = con.execute(
             "SELECT value FROM db_meta WHERE key='player_name_filter'"
         ).fetchone()
-        if row and str(row[0]) == "2":
+        if row and str(row[0]) == "3":
             return
         if object_type(con, "player_history") == "table":
             names = [r[0] for r in con.execute(
@@ -624,6 +776,28 @@ def clean_spoofed_player_data(con: sqlite3.Connection):
                 con.executemany(
                     "DELETE FROM player_history WHERE player_name=?",
                     [(name,) for name in bad])
+        if object_type(con, "server_history") == "table":
+            cur = con.execute(
+                "SELECT rowid, players FROM server_history"
+                " WHERE players IS NOT NULL")
+            updates = []
+            while True:
+                rows = cur.fetchmany(1000)
+                if not rows:
+                    break
+                for rowid, blob in rows:
+                    cleaned = encode_player_blob(_blob_names(blob))
+                    if cleaned != blob:
+                        updates.append((cleaned, rowid))
+                if len(updates) >= 1000:
+                    con.executemany(
+                        "UPDATE server_history SET players=?"
+                        " WHERE rowid=?", updates)
+                    updates.clear()
+            if updates:
+                con.executemany(
+                    "UPDATE server_history SET players=? WHERE rowid=?",
+                    updates)
         if object_type(con, STATE_TABLE) == "table":
             cur = con.execute(
                 "SELECT ip_port, players_now, players_ever FROM server_state")
@@ -648,7 +822,7 @@ def clean_spoofed_player_data(con: sqlite3.Connection):
                     " players_ever=? WHERE ip_port=?", updates)
         con.execute(
             "INSERT OR REPLACE INTO db_meta (key, value)"
-            " VALUES ('player_name_filter', '2')")
+            " VALUES ('player_name_filter', '3')")
         con.commit()
     except Exception:
         pass

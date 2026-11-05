@@ -506,24 +506,35 @@ pub fn history_json(servers_path: &str, ip: &str) -> String {
             }
         }
         if let Ok(mut stmt) = con.prepare(
-            "SELECT player_name, seen_at FROM (\
-               SELECT player_name, seen_at FROM player_history \
-               WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?\
-             ) ORDER BY player_name ASC, seen_at ASC",
+            "SELECT seen_at, players FROM server_history \
+             WHERE ip_port=? AND players IS NOT NULL \
+             ORDER BY seen_at DESC LIMIT ?",
         ) {
             if let Ok(rows) = stmt.query_map(
                 rusqlite::params![ip, PLAYER_EVENT_LIMIT],
-                |r| Ok((r.get::<_, String>(0).unwrap_or_default(),
-                        r.get::<_, f64>(1).unwrap_or(0.0))),
+                |r| Ok((r.get::<_, f64>(0).unwrap_or(0.0),
+                        r.get::<_, String>(1).unwrap_or_default())),
             ) {
                 let mut grouped: std::collections::BTreeMap<String, Vec<f64>> =
                     std::collections::BTreeMap::new();
-                for (name, seen_at) in rows.flatten() {
-                    grouped.entry(name).or_default().push(seen_at);
+                let mut total = 0i64;
+                'rows: for (seen_at, blob) in rows.flatten() {
+                    for name in blob.split('\u{1f}') {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        if total >= PLAYER_EVENT_LIMIT {
+                            break 'rows;
+                        }
+                        grouped.entry(name.to_string())
+                            .or_default().push(seen_at);
+                        total += 1;
+                    }
                 }
                 players = grouped
                     .into_iter()
-                    .map(|(name, times)| {
+                    .map(|(name, mut times)| {
+                        times.sort_by(|a, b| a.total_cmp(b));
                         serde_json::json!({"name": name, "times": times})
                     })
                     .collect();
@@ -667,38 +678,19 @@ mod tests {
         let con = Connection::open(&path).unwrap();
         con.execute(
             "CREATE TABLE server_history (ip_port TEXT, seen_at REAL, \
-             players_online INTEGER, max_players INTEGER)",
+             players_online INTEGER, max_players INTEGER, players TEXT)",
             [],
         )
         .unwrap();
         con.execute(
-            "CREATE TABLE player_history (ip_port TEXT, player_name TEXT, \
-             seen_at REAL)",
+            "INSERT INTO server_history VALUES \
+             ('1.2.3.4:25565', 100.0, 2, 20, 'alice')",
             [],
         )
         .unwrap();
         con.execute(
-            "INSERT INTO server_history VALUES ('1.2.3.4:25565', 100.0, 2, 20)",
-            [],
-        )
-        .unwrap();
-        con.execute(
-            "INSERT INTO server_history VALUES ('1.2.3.4:25565', 200.0, NULL, NULL)",
-            [],
-        )
-        .unwrap();
-        con.execute(
-            "INSERT INTO player_history VALUES ('1.2.3.4:25565', 'alice', 100.0)",
-            [],
-        )
-        .unwrap();
-        con.execute(
-            "INSERT INTO player_history VALUES ('1.2.3.4:25565', 'alice', 200.0)",
-            [],
-        )
-        .unwrap();
-        con.execute(
-            "INSERT INTO player_history VALUES ('1.2.3.4:25565', 'bob', 200.0)",
+            "INSERT INTO server_history VALUES \
+             ('1.2.3.4:25565', 200.0, NULL, NULL, 'alice\u{1f}bob')",
             [],
         )
         .unwrap();
