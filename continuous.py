@@ -547,6 +547,7 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
 
     if use_masscan:
         pool = scanner.ThreadPoolExecutor(max_workers=scanner.STATUS_WORKERS)
+        sweep_deadline = time.monotonic() + max(1, scan_duration)
 
         def handshake(ip_port):
             if scanner.shutdown_requested():
@@ -557,7 +558,10 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 pass
 
         def on_open(ip_port):
-            if scanner.shutdown_requested() or stop_event.is_set():
+            if (scanner.shutdown_requested() or stop_event.is_set()
+                    or time.monotonic() > sweep_deadline):
+                # Do not let a burst of late masscan hits grow a handshake
+                # queue that outlives the round's time box.
                 return
             pool.submit(handshake, ip_port)
 
@@ -1040,18 +1044,36 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     for spec, port in targets:
                         by_port.setdefault(port, []).append(spec)
                     status.start(f"round {rounds} rescan")
+                    # This is one round, not one round per port.  Without a
+                    # shared deadline a node with 40 known ports ran 40 x
+                    # (scan_duration/2) = 6000s at the default settings.
+                    rescan_deadline = (time.monotonic()
+                                       + max(30, scan_duration))
+                    processed_ports = 0
                     try:
                         for port, specs in sorted(by_port.items()):
                             if stop_event.is_set():
                                 break
+                            remaining = rescan_deadline - time.monotonic()
+                            if remaining <= 1:
+                                break
+                            # Use at most half the configured round for one
+                            # port, but never go past the shared deadline.
+                            duration = min(
+                                max(30, scan_duration // 2), remaining)
                             batch, fatal = do_round(
-                                specs, [port],
-                                duration=max(30, scan_duration // 2),
+                                specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note)
                             results.extend(batch)
+                            processed_ports += 1
                             if fatal:
                                 _sync_now(url, token)
                                 return 1
+                        skipped_ports = len(by_port) - processed_ports
+                        if skipped_ports > 0 and not stop_event.is_set():
+                            status.note(
+                                f"  rescan time budget exhausted; skipped "
+                                f"{skipped_ports} port group(s)")
                     finally:
                         status.stop()
                 else:

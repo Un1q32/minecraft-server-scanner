@@ -344,6 +344,9 @@ synced every `--sync-every` seconds (default 300) and once more on exit, so
 peers see new finds promptly. Continuous nodes publish their sighting and
 player history but do not download the shared activity history; run a normal
 `--sync` later if you want the full activity history on that machine.
+Each rescan round has one shared `--scan-duration` budget even when the due
+servers use many different ports, so a 40-port rescan cannot turn into
+40 separate full-length sweeps.
 
 `--strategies slash24a,slash32b` restricts the pool, `--no-rescan` skips
 the rescan half, and `--rounds N` stops after N rounds (useful for
