@@ -563,6 +563,8 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 pass
 
     if use_masscan:
+        _log(f"  masscan: ~{est:,} probe(s) across {len(ranges):,} "
+             f"target spec(s)")
         pool = scanner.ThreadPoolExecutor(max_workers=scanner.STATUS_WORKERS)
         sweep_deadline = time.monotonic() + max(1, scan_duration)
         futures = set()
@@ -660,9 +662,24 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
     def on_result(result, _line):
         emit(result)
 
+    deadline = time.monotonic() + max(1, scan_duration)
+
+    class _RoundDeadline:
+        """Stop the Python pool at the round's time box too.
+
+        masscan rounds are killed after scan_duration, but the Python
+        backend used to run until every target finished, so a large rescan
+        could keep the whole loop busy for many minutes.
+        """
+
+        def is_set(self):
+            return (stop_event.is_set()
+                    or scanner.shutdown_requested()
+                    or time.monotonic() >= deadline)
+
     try:
         scanner.scan_servers_gui(targets, on_result=on_result,
-                                 stop_event=stop_event)
+                                 stop_event=_RoundDeadline())
     except scanner.ScanStopped:
         pass
     return results
@@ -963,8 +980,8 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                   else f" ports={','.join(str(p) for p in base_ports)}")
     rescan_note = (f"every {rescan_every} round(s)" if do_rescan else "off")
     print(f"continuous mode: strategies={','.join(picker.enabled)} "
-          f"rescan={rescan_note} "
-          f"scan_duration={scan_duration}s backend={backend}"
+          f"rescan={rescan_note} scan_duration={scan_duration}s "
+          f"rate={rate}pps wait={wait}s backend={backend}"
           f"{ports_note}{shard_note}")
     print(f"shared-DB sync every {sync_every}s "
           f"({'enabled' if url and token else 'skipped: no netdb.json'})")
@@ -1096,7 +1113,22 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     if added:
                         print(f"  {tier['name']}: {added} due")
                 if targets:
-                    print(f"  {len(targets)} unique due endpoint(s)")
+                    shard_total = 1
+                    try:
+                        if shard_state.get("value"):
+                            shard_total = max(1, int(shard_state["value"][1]))
+                    except Exception:
+                        shard_total = 1
+                    est_secs = (len(targets) / max(1, rate)
+                                / shard_total)
+                    print(f"  {len(targets)} unique due endpoint(s), "
+                          f"~{est_secs:.0f}s at {rate}pps"
+                          + (f" over {shard_total} shards"
+                             if shard_total > 1 else ""))
+                    if est_secs > scan_duration:
+                        print(f"  note: this exceeds the {scan_duration}s "
+                              f"round budget; raise --rate or "
+                              f"--scan-duration, or rescans will be cut off")
                     # Keep per-target ports: group by port for the sweep.
                     by_port = {}
                     for spec, port in targets:
@@ -1119,9 +1151,15 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                             # port, but never go past the shared deadline.
                             duration = min(
                                 max(30, scan_duration // 2), remaining)
+                            status.note(
+                                f"  port {port}: {len(specs)} endpoint(s)")
+                            group_started = time.monotonic()
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note)
+                            status.note(
+                                f"  port {port}: {len(batch)} result(s) in "
+                                f"{time.monotonic() - group_started:.0f}s")
                             results.extend(batch)
                             processed_ports += 1
                             if fatal:
