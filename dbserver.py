@@ -152,6 +152,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import db_format
+import db_zstd
 
 IP_PORT_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$")
 MAX_BODY_BYTES = 25 * 1024 * 1024
@@ -992,6 +993,85 @@ def check_auth(handler, body, token):
 # HTTP handler
 # --------------------------------------------------------------------------- #
 
+class ZstdSnapshotWriter:
+    """Keep a compressed snapshot current without blocking request handlers.
+
+    Writers only call notify(); a background thread coalesces bursts (the
+    continuous scanners write constantly) and writes the snapshot after a
+    short quiet period, with a maximum delay so a busy server still gets
+    fresh files.
+    """
+
+    def __init__(self, db_path, out_path, level=1, debounce=2.0,
+                 max_wait=30.0):
+        self.db_path = os.path.abspath(db_path)
+        self.out_path = os.path.abspath(out_path)
+        self.level = level
+        self.debounce = max(0.2, float(debounce))
+        self.max_wait = max(self.debounce, float(max_wait))
+        self._event = threading.Event()
+        self._stop = threading.Event()
+        self._thread = None
+        self._available = db_zstd.zstd_available()
+        self._last_error = ""
+
+    def start(self):
+        if not self._available:
+            print("web db snapshot: zstd not available; compression disabled",
+                  file=sys.stderr)
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="db-zstd-snapshot", daemon=True)
+        self._thread.start()
+        self.notify()
+
+    def notify(self):
+        if self._available:
+            self._event.set()
+
+    def stop(self):
+        self._stop.set()
+        self._event.set()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=5.0)
+            except Exception:
+                pass
+            self._thread = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            if not self._event.wait(1.0):
+                continue
+            self._event.clear()
+            quiet_start = time.monotonic()
+            # Coalesce a burst of writes, but never defer forever while a
+            # continuous scanner is uploading every few seconds.
+            while not self._stop.is_set():
+                if self._event.wait(self.debounce):
+                    self._event.clear()
+                    if time.monotonic() - quiet_start >= self.max_wait:
+                        break
+                    continue
+                break
+            if self._stop.is_set():
+                break
+            try:
+                before, after, seconds = db_zstd.snapshot_and_compress(
+                    self.db_path, self.out_path, level=self.level)
+                self._last_error = ""
+                print(f"web db snapshot: {os.path.basename(self.out_path)} "
+                      f"{before / 1048576:.1f} MB -> "
+                      f"{after / 1048576:.1f} MB in {seconds:.1f}s",
+                      flush=True)
+            except Exception as exc:
+                msg = str(exc)
+                if msg != self._last_error:
+                    self._last_error = msg
+                    print(f"web db snapshot: {msg}", file=sys.stderr,
+                          flush=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MCNetDB/1.0"
 
@@ -1453,6 +1533,10 @@ class Handler(BaseHTTPRequestHandler):
                                 (merged, ip_port, seen_at))
                     merged_players = con.total_changes - before
                     con.commit()
+                    if history_values or player_groups:
+                        writer = getattr(self.server, "zstd_writer", None)
+                        if writer is not None:
+                            writer.notify()
                     if download:
                         con.row_factory = sqlite3.Row
                         cur = con.execute(
@@ -1521,6 +1605,10 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         continue
                 con.commit()
+                if merged:
+                    writer = getattr(self.server, "zstd_writer", None)
+                    if writer is not None:
+                        writer.notify()
                 con.row_factory = sqlite3.Row
                 if since_seq is not None:
                     cur = con.execute(
@@ -1558,6 +1646,12 @@ def main(argv=None):
                          "directory is used when this file is absent.")
     ap.add_argument("--tls-cert", default="", help="PEM chain for https://")
     ap.add_argument("--tls-key", default="", help="PEM private key for https://")
+    ap.add_argument("--web-db-zst", default="", metavar="PATH",
+                    help="write a consistent zstd snapshot here after DB "
+                         "writes, for the static web viewer "
+                         "(e.g. /srv/mc-scanner/servers.db.zst)")
+    ap.add_argument("--web-db-zst-level", type=int, default=1, metavar="N",
+                    help="zstd level for --web-db-zst (default: 1)")
     args = ap.parse_args(argv)
 
     try:
@@ -1588,6 +1682,13 @@ def main(argv=None):
     server.notes_db_path = os.path.abspath(notes_db)
     server.shared_token = token
     server.daemon_threads = True
+    server.zstd_writer = None
+    writer = None
+    if args.web_db_zst:
+        writer = ZstdSnapshotWriter(
+            server.db_path, args.web_db_zst,
+            level=args.web_db_zst_level)
+        server.zstd_writer = writer
     scheme = "http"
     tls_cert, tls_key = args.tls_cert, args.tls_key
     if not (tls_cert and tls_key):
@@ -1608,6 +1709,10 @@ def main(argv=None):
         print(f"TLS enabled ({tls_cert}, {tls_key}) -- clients must use https:// URLs.")
     print(f"Serving netdb on {scheme}://{args.host}:{args.port} "
           f"(db={server.db_path}, notes={server.notes_db_path})")
+    if writer is not None:
+        print(f"Web DB snapshot: {os.path.abspath(args.web_db_zst)} "
+              f"(zstd level {args.web_db_zst_level})")
+        writer.start()
     if scheme == "http":
         print("NOTE: plain HTTP -- clients auth with HMAC so the token itself "
               "is never sent in cleartext, but drop cert.pem + privkey.pem in "
@@ -1617,6 +1722,9 @@ def main(argv=None):
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        if writer is not None:
+            writer.stop()
 
 
 if __name__ == "__main__":

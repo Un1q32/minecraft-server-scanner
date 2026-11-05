@@ -583,27 +583,41 @@ query and sort. It never starts a scan or a sync.
 
 The viewer first tries `servers.db.zst` and falls back to `servers.db` plus
 `servers.db-wal`. A compressed snapshot avoids serving the live WAL and
-typically transfers about a third as many bytes. `webui/compress_db.py`
-keeps it current:
+typically transfers about a third as many bytes.
+
+`dbserver.py` can maintain that file automatically. Writes only signal a
+background worker; it coalesces bursts (continuous scanners write constantly)
+and rewrites the snapshot after a short quiet period:
+
+    python3 dbserver.py ... \
+        --web-db-zst /srv/mc-scanner/servers.db.zst \
+        --web-db-zst-level 1
+
+If the database is maintained elsewhere, use `webui/compress_db.py` instead;
+it watches the DB/WAL mtimes and supports `--once` for a timer:
 
     python3 webui/compress_db.py \
         --db /path/servers.db \
         --out /path/servers.db.zst \
-        --interval 120 --level 3
+        --interval 120 --level 1
 
-It uses `VACUUM INTO` for a consistent snapshot, compresses it with zstd,
-and atomically replaces the output. It only rewrites when the database or
-WAL changed. On the 127 MB test database a snapshot + level-3 compression
-took about 0.4 seconds (`109 MB -> 44 MB`); browser decompression took about
-0.4 seconds. A Raspberry Pi will take a few seconds, and an SD card will see
-the snapshot writes, so raise `--interval` or run it with `--once` from a
-timer there. Python 3.14's `compression.zstd` is used when available;
+Both use `VACUUM INTO` for a consistent snapshot, compress it with zstd,
+and atomically replace the output. Level 1 is the default: on the 127 MB
+test database it made a 109 MB snapshot and a 47 MB file in well under a
+second; level 3 saved only ~3 MB for several times the CPU. Level 1 is the
+right tradeoff for a continuously refreshed file. A Raspberry Pi will take
+a few seconds, and an SD card will see the snapshot writes, so raise the
+interval there. Python 3.14's `compression.zstd` is used when available;
 otherwise the `zstd` command-line tool is required.
+
+Browsers with `DecompressionStream("zstd")` use the native (C/C++) decoder.
+Older browsers fall back to the bundled `fzstd.js`; that is pure JS and
+slower, but on the test file it still expanded 47 MB to 109 MB in roughly
+0.4 seconds.
 
 Serve the file with the `location = /servers.db.zst` block in
 `webui/nginx.conf.example`. Do not add `Content-Encoding: zstd`: the
-browser fetches the compressed bytes and unpacks them with the bundled
-`fzstd.js`.
+browser fetches the compressed bytes and unpacks them itself.
 
 The generated WASM is committed. Rebuild it after changing `webui/core.cpp`
 with Emscripten installed:

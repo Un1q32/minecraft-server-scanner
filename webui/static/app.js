@@ -1169,6 +1169,24 @@ copyBtn.addEventListener("click", copyIps);
 
 // ----------------------------------------------------------------- database
 
+async function decompressZstd(bytes) {
+  // Prefer the browser's native (C/C++) zstd decoder. It is much faster
+  // than any JS implementation; fzstd is only the compatibility fallback.
+  if (typeof DecompressionStream === "function") {
+    try {
+      const stream = new Blob([bytes]).stream().pipeThrough(
+        new DecompressionStream("zstd"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch (error) {
+      // Older browsers do not implement the zstd decompressor.
+    }
+  }
+  if (typeof fzstd !== "undefined" && fzstd.decompress) {
+    return fzstd.decompress(bytes);
+  }
+  throw new Error("no zstd decompressor available");
+}
+
 async function loadDatabase() {
   let compressed = false;
   try {
@@ -1177,7 +1195,7 @@ async function loadDatabase() {
                             { cache: "no-store" });
     if (zst.ok && typeof fzstd !== "undefined" && fzstd.decompress) {
       const packed = new Uint8Array(await zst.arrayBuffer());
-      const bytes = fzstd.decompress(packed);
+      const bytes = await decompressZstd(packed);
       core.FS.writeFile("/servers.db", bytes);
       try {
         core.FS.unlink("/servers.db-wal");
@@ -1272,12 +1290,12 @@ async function boot() {
     setStatus("Starting WebAssembly…");
     if (typeof createCore !== "function") {
       // The script tag failed or was blocked; try once more explicitly.
-      await loadScript("core.js?v=9-retry");
+      await loadScript("core.js?v=10-retry");
     }
     if (typeof createCore !== "function") {
       let detail = "";
       try {
-        const probe = await fetch(assetUrl("core.js?v=9-probe"), { cache: "no-store" });
+        const probe = await fetch(assetUrl("core.js?v=10-probe"), { cache: "no-store" });
         const body = await probe.text();
         detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
       } catch (probeError) {
@@ -1289,7 +1307,7 @@ async function boot() {
       );
     }
     core = await createCore({
-      locateFile: (file) => assetUrl(file) + "?v=9",
+      locateFile: (file) => assetUrl(file) + "?v=10",
       print: () => {},
       printErr: () => {},
     });
