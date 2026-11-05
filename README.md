@@ -135,7 +135,8 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
   downloads other clients' servers, refreshing last-seen dates both ways.
 - Maintains Saved and Ignore lists with optional reasons.
 - Filters ignored servers from scan workflows.
-- Maintains a player log with each player’s latest known server.
+- Derives each player’s latest known server from `player_history` in the DB
+  (the old `user_log.json` is imported once and then retired).
 - Copies selected IPs and exports selected result sets.
 
 ### Server Monitor
@@ -496,8 +497,9 @@ and no shared-DB sync. It refreshes MOTD, version, player counts/samples and
 finishes. The job log follows the same 10-second / non-zero-exit rule as
 **Sync DB**. Status pings run with 256 workers by default; set
 `MC_STATUS_WORKERS` to tune that. Results are written to SQLite in batches
-and the player log is flushed at most every two seconds, so large rescans
-spend their time on the network instead of one commit per server.
+and the User Log tab refresh is coalesced to at most every two seconds, so
+large rescans spend their time on the network instead of one commit per
+server.
 
 ### Recheck whitelist
 

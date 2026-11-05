@@ -67,6 +67,8 @@ HISTORY_TABLES = (
 HISTORY_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_player_history_ip_time"
     " ON player_history(ip_port, seen_at ASC)",
+    "CREATE INDEX IF NOT EXISTS idx_player_history_name_time"
+    " ON player_history(player_name, seen_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_server_history_synced"
     " ON server_history(synced, seen_at ASC)",
     "CREATE INDEX IF NOT EXISTS idx_player_history_synced"

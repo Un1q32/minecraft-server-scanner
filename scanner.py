@@ -6,7 +6,6 @@ try:
 except ImportError:
     # Optional dependency: everything except Shodan search works without it.
     shodan = None
-import atexit
 import codecs
 import bisect
 import gzip
@@ -170,7 +169,7 @@ try:
     STATUS_WORKERS = max(1, int(os.environ.get("MC_STATUS_WORKERS", "256")))
 except Exception:
     STATUS_WORKERS = 256
-USER_LOG_SAVE_INTERVAL = 2.0
+USER_LOG_REFRESH_INTERVAL = 2.0
 SERVERS_DAT_PATH = os.path.expandvars(r"%APPDATA%\.minecraft\servers.dat")
 BACKUP_PATH = SERVERS_DAT_PATH + ".bak"
 
@@ -494,7 +493,7 @@ MAX_VERSION_CHARS = 100
 MAX_SOURCE_CHARS = 64
 MAX_COUNTED_PLAYERS = 1_000_000
 MAX_SAMPLE_NAMES = 100       # per sighting (vanilla samples ~12)
-MAX_USER_LOG_ENTRIES = 50000 # players tracked in user_log.json
+MAX_USER_LOG_ENTRIES = 50000 # players shown/tracked in the User Log tab
 MAX_SANITIZE_INPUT = 4000    # bound the regex work on hostile strings
 
 
@@ -7438,23 +7437,123 @@ def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wai
 
 class UserLogManager:
     """
-    Thread-safe store that tracks the last seen server for each player name.
+    Thread-safe player -> latest server view.
+
+    The database is the source of truth: ``player_history`` has every player
+    sample and ``server_state`` supplies the MOTD.  This in-memory cache only
+    keeps the User Log tab responsive.  Legacy ``user_log.json`` data is
+    imported into the DB once, then the JSON file is retired.
     """
     def __init__(self):
-        self._entries = {}  # player -> {"ip": ..., "motd": ..., "last_seen": ts}
+        self._entries = {}
         self._lock = threading.Lock()
-        self._save_lock = threading.Lock()
+        self._load_lock = threading.Lock()
+        self._notify_lock = threading.Lock()
         self._tab = None
-        self._dirty = False
-        self._last_save = 0.0
-        self._load_from_disk()
+        self._loaded = False
+        self._last_notify = 0.0
 
     def attach_tab(self, tab: "UserLogTab"):
         self._tab = tab
         tab.bind_manager(self)
         tab.request_refresh(initial=True)
 
+    def _migrate_legacy_json(self):
+        """Import an old user_log.json once, so no player data is lost."""
+        path = USER_LOG_FILE
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if not isinstance(data, list):
+            return
+        rows = []
+        for row in data[:MAX_USER_LOG_ENTRIES]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                player = _clean_player_name(row.get("player"))
+                ip_port = strict_ip_port(row.get("ip"))
+                seen_at = float(row.get("last_seen") or 0)
+            except Exception:
+                continue
+            if player and ip_port and seen_at > 0:
+                rows.append((ip_port, player, seen_at))
+        try:
+            _ensure_server_db()
+            if rows:
+                with _SERVER_DB_LOCK:
+                    con = _server_db_connect()
+                    try:
+                        con.executemany(
+                            "INSERT OR IGNORE INTO player_history"
+                            " (ip_port, player_name, seen_at, synced)"
+                            " VALUES (?, ?, ?, 0)", rows)
+                        con.commit()
+                    finally:
+                        con.close()
+            # Retire the old file so it cannot be imported twice.
+            try:
+                os.replace(path, path + ".migrated")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _load_from_db(self):
+        loaded = {}
+        try:
+            _ensure_server_db()
+            import sqlite3
+            with _SERVER_DB_LOCK:
+                con = _server_db_connect()
+                try:
+                    con.row_factory = sqlite3.Row
+                    rows = con.execute(
+                        "SELECT latest.player_name AS player,"
+                        " latest.ip_port AS ip,"
+                        " COALESCE(s.motd, '') AS motd,"
+                        " latest.last_seen AS last_seen"
+                        " FROM ("
+                        "   SELECT player_name, ip_port, MAX(seen_at) AS last_seen"
+                        "   FROM player_history GROUP BY player_name"
+                        " ) latest"
+                        " LEFT JOIN server_state s ON s.ip_port=latest.ip_port"
+                        " ORDER BY latest.last_seen DESC LIMIT ?",
+                        (MAX_USER_LOG_ENTRIES,)).fetchall()
+                    for row in rows:
+                        player = str(row["player"] or "")
+                        if not player:
+                            continue
+                        loaded[player] = {
+                            "ip": str(row["ip"] or ""),
+                            "motd": str(row["motd"] or ""),
+                            "last_seen": float(row["last_seen"] or 0),
+                        }
+                finally:
+                    con.close()
+        except Exception:
+            loaded = {}
+        with self._lock:
+            # Keep anything observed in memory since the query started.
+            loaded.update(self._entries)
+            self._entries = loaded
+
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        with self._load_lock:
+            if self._loaded:
+                return
+            self._migrate_legacy_json()
+            self._load_from_db()
+            self._loaded = True
+
     def snapshot(self):
+        self._ensure_loaded()
         with self._lock:
             return [
                 {
@@ -7490,73 +7589,29 @@ class UserLogManager:
                 else:
                     self._entries[player]["last_seen"] = now
                 changed = True
-            if changed:
-                self._dirty = True
         if changed:
-            self._flush_due()
+            self._notify_due()
 
-    def _flush_due(self, force=False):
-        """Write at most once per USER_LOG_SAVE_INTERVAL during scans."""
+    def _notify_due(self):
+        """Coalesce tab refreshes during high-rate rescans."""
         now = time.time()
-        with self._save_lock:
-            with self._lock:
-                if not self._dirty:
-                    return
-                if not force and now - self._last_save < USER_LOG_SAVE_INTERVAL:
-                    return
-                self._dirty = False
-            self._last_save = now
-            self._save_to_disk()
-            self._notify_tab()
+        with self._notify_lock:
+            if now - self._last_notify < USER_LOG_REFRESH_INTERVAL:
+                return
+            self._last_notify = now
+        self._notify_tab()
 
     def flush(self):
-        """Force any pending user-log changes to disk."""
-        self._flush_due(force=True)
+        """Force the tab to pick up the latest cached entries."""
+        self._last_notify = 0.0
+        self._notify_due()
 
     def _notify_tab(self):
         if self._tab:
             self._tab.request_refresh()
 
-    def _load_from_disk(self):
-        if not os.path.exists(USER_LOG_FILE):
-            return
-        try:
-            with open(USER_LOG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return
-        if not isinstance(data, list):
-            return
-        entries = {}
-        for row in data:
-            if len(entries) >= MAX_USER_LOG_ENTRIES:
-                break
-            try:
-                player = _clean_player_name(row.get("player"))
-                if not player:
-                    continue
-                ip = str(row.get("ip") or "")[:64]
-                motd = sanitize_motd(row.get("motd", ""))[:MAX_MOTD_CHARS]
-                ts = float(row.get("last_seen") or 0)
-                if not (0 <= ts <= 1e18):
-                    ts = 0.0
-                entries[player] = {"ip": ip, "motd": motd, "last_seen": ts}
-            except Exception:
-                continue
-        with self._lock:
-            self._entries = entries
-
-    def _save_to_disk(self):
-        snapshot = self.snapshot()
-        try:
-            with open(USER_LOG_FILE, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, separators=(",", ":"))
-        except Exception:
-            pass
-
 
 USER_LOG_MANAGER = UserLogManager()
-atexit.register(USER_LOG_MANAGER.flush)
 
 def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
     try:
