@@ -6287,6 +6287,53 @@ def _remove_masscan_exclude_file(path):
         pass
 
 
+def _format_port_spec(ports):
+    """Compact sorted port list into masscan ranges (1024-65535, 80,443)."""
+    values = []
+    for value in ports or []:
+        try:
+            port = int(value)
+        except Exception:
+            continue
+        if 1 <= port <= 65535:
+            values.append(port)
+    if not values:
+        return "25565"
+    values = sorted(set(values))
+    parts = []
+    start = prev = values[0]
+    for port in values[1:]:
+        if port == prev + 1:
+            prev = port
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = port
+    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(parts)
+
+
+def _write_masscan_targets_file(targets):
+    """Write targets to a temp file for masscan -iL (avoids argv limits)."""
+    try:
+        fd, path = tempfile.mkstemp(prefix="mcscan_targets_", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for target in targets or []:
+                target = str(target or "").strip()
+                if target:
+                    f.write(target + "\n")
+        return path
+    except Exception:
+        return None
+
+
+def _remove_masscan_targets_file(path):
+    try:
+        if path:
+            os.unlink(path)
+    except Exception:
+        pass
+
+
 DEFAULT_SHARD_SEED = 0xC0FFEE
 
 
@@ -7390,7 +7437,7 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     if not masscan_targets:
         return [], "no targets"
 
-    port_spec = ",".join(str(p) for p in ports)
+    port_spec = _format_port_spec(ports)
     base_cmd = [exe]
     if use_sudo:
         if not sudo_available():
@@ -7400,9 +7447,12 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             )
         # -S reads the password from stdin, -p "" suppresses sudo's own prompt.
         base_cmd = ["sudo", "-S", "-p", "", exe]
+    targets_path = _write_masscan_targets_file(masscan_targets)
+    target_args = (["-iL", targets_path] if targets_path
+                   else list(masscan_targets))
     exclude_path = _write_masscan_exclude_file()
     exclude_args = ["--excludefile", exclude_path] if exclude_path else []
-    cmd = base_cmd + list(masscan_targets) + exclude_args + [
+    cmd = base_cmd + target_args + exclude_args + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),
@@ -7434,6 +7484,7 @@ def run_masscan_open_ports(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             raise RuntimeError(f"masscan failed to run: {exc}")
     finally:
         _remove_masscan_exclude_file(exclude_path)
+        _remove_masscan_targets_file(targets_path)
     output = (stderr or "").strip()
     opened = parse_masscan_json_text(stdout or "")
     returncode, failed = _masscan_proc_error_info(proc, output)
@@ -7515,7 +7566,7 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     if not masscan_targets:
         return [], "no targets"
 
-    port_spec = ",".join(str(p) for p in ports)
+    port_spec = _format_port_spec(ports)
     base_cmd = [exe]
     if use_sudo:
         if not sudo_available():
@@ -7525,6 +7576,9 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             )
         # -S reads the password from stdin, -p "" suppresses sudo's own prompt.
         base_cmd = ["sudo", "-S", "-p", "", exe]
+    targets_path = _write_masscan_targets_file(masscan_targets)
+    target_args = (["-iL", targets_path] if targets_path
+                   else list(masscan_targets))
     # --interactive prints (and flushes) one 'Discovered open port ...' line
     # per hit; -oL - mirrors the same hits as list lines on the same pipe.
     # --excludefile (when exclusions exist) satisfies masscan's "range too
@@ -7533,7 +7587,7 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
     exclude_path = _write_masscan_exclude_file()
     exclude_args = ["--excludefile", exclude_path] if exclude_path else []
     shard_args = _masscan_shard_args(shard, seed)
-    cmd = base_cmd + list(masscan_targets) + exclude_args + shard_args + [
+    cmd = base_cmd + target_args + exclude_args + shard_args + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),
@@ -7589,7 +7643,7 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
             # An old masscan may not know --interactive; retry plainly (batched).
             if "interactive" in (stderr or "") and "unknown" in (stderr or "").lower():
                 return _run_masscan_streaming_plain(
-                    base_cmd, masscan_targets, port_spec, rate, wait,
+                    base_cmd, target_args, port_spec, rate, wait,
                     timeout, found, seen, emit, sudo_password if use_sudo else None,
                     exclude_args=exclude_args, shard_args=shard_args,
                     on_scan_progress=on_scan_progress, stop_event=stop_event)
@@ -7599,15 +7653,16 @@ def run_masscan_streaming(masscan_targets, ports, rate=MASSCAN_DEFAULT_RATE,
         return found, (stderr[:500] if stderr else "")
     finally:
         _remove_masscan_exclude_file(exclude_path)
+        _remove_masscan_targets_file(targets_path)
 
 
-def _run_masscan_streaming_plain(base_cmd, masscan_targets, port_spec, rate, wait,
+def _run_masscan_streaming_plain(base_cmd, target_args, port_spec, rate, wait,
                                  timeout, found, seen, emit, sudo_password,
                                  exclude_args=None, shard_args=None,
                                  on_scan_progress=None, stop_event=None):
     """Fallback for masscan builds without --interactive: same merged stream
     with only -oL - list lines (still live in chunks, no temp files)."""
-    cmd = base_cmd + list(masscan_targets) + list(exclude_args or []) + list(shard_args or []) + [
+    cmd = base_cmd + list(target_args) + list(exclude_args or []) + list(shard_args or []) + [
         "-p", port_spec,
         "--open",
         "--rate", str(rate),
