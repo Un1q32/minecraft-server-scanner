@@ -623,7 +623,7 @@ def init_server_db():
             try:
                 cur = con.execute("SELECT ip_port FROM server_state")
                 drop = []
-                for (ip_port,) in cur.fetchall():
+                for (ip_port,) in cur:
                     try:
                         if _is_bogon_ip(get_ip_only(ip_port or "")):
                             drop.append((ip_port,))
@@ -2024,11 +2024,13 @@ def _prepare_downloaded_db(path):
     try:
         con.row_factory = sqlite3.Row
         # The download is a temporary file that will be atomically replaced.
-        # Disable journaling/fsync and use a larger cache for the bulk merge.
+        # Disable journaling/fsync and keep memory bounded on small nodes.
+        cache_kb = 16384 if NETDB_LOW_MEMORY else 65536
+        temp_store = "FILE" if NETDB_LOW_MEMORY else "MEMORY"
         for pragma in ("PRAGMA journal_mode=OFF",
                        "PRAGMA synchronous=OFF",
-                       "PRAGMA temp_store=MEMORY",
-                       "PRAGMA cache_size=-65536"):
+                       f"PRAGMA temp_store={temp_store}",
+                       f"PRAGMA cache_size=-{cache_kb}"):
             try:
                 con.execute(pragma)
             except Exception:
@@ -2149,6 +2151,23 @@ def _netdb_download_db(url, token, endpoint, target_file, prepare,
                 player_seq_hdr = int(resp.headers.get("X-Player-Seq"))
             except Exception:
                 player_seq_hdr = None
+            try:
+                db_size_hdr = int(resp.headers.get("X-DB-Size") or 0)
+            except Exception:
+                db_size_hdr = 0
+            if db_size_hdr:
+                try:
+                    free = shutil.disk_usage(target_dir).free
+                    margin = 64 * 1024 * 1024
+                    if free < db_size_hdr + margin:
+                        raise ConnectionError(
+                            "not enough free disk space for the downloaded "
+                            f"database ({db_size_hdr / (1024 * 1024):.0f} MB "
+                            f"needed, {free / (1024 * 1024):.0f} MB free)")
+                except ConnectionError:
+                    raise
+                except OSError:
+                    pass
             try:
                 from email.utils import parsedate_to_datetime
                 dt = parsedate_to_datetime(resp.headers.get("Date") or "")

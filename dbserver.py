@@ -1123,6 +1123,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-History-Seq", str(history_seq))
             self.send_header("X-Player-Seq", str(player_seq))
+            try:
+                self.send_header("X-DB-Size", str(os.path.getsize(tmp)))
+            except OSError:
+                pass
             if encoding:
                 self.send_header("Content-Encoding", encoding)
                 self.send_header("Vary", "Accept-Encoding")
