@@ -27,7 +27,6 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 	private static final int HIGHLIGHT = 0x60FFFFFF;
 	private static final int WHITE = 0xFFFFFFFF;
 	private static final int SELECTED_TEXT = 0xFFFFFF55;
-	private static final int LEFT_BUTTON = 0;
 
 	private final String name;
 	private final List<T> values;
@@ -112,7 +111,7 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
 		if (this.open) {
 			int row = this.rowAt(event.x(), event.y());
-			boolean left = event.button() == LEFT_BUTTON;
+			boolean left = this.isValidClickButton(event.buttonInfo());
 			this.open = false;
 			if (row >= 0 && left) {
 				this.playDownSound(Minecraft.getInstance().getSoundManager());
