@@ -1170,26 +1170,51 @@ copyBtn.addEventListener("click", copyIps);
 // ----------------------------------------------------------------- database
 
 async function loadDatabase() {
-  setStatus("Loading database…");
-  const response = await fetch(assetUrl(`servers.db?ts=${Date.now()}`), { cache: "no-store" });
-  if (!response.ok) {
-    const detail = (await response.text().catch(() => "")).trim();
-    throw new Error(`HTTP ${response.status} loading servers.db${detail ? `: ${detail}` : ""}`);
+  let compressed = false;
+  try {
+    setStatus("Loading compressed database…");
+    const zst = await fetch(assetUrl(`servers.db.zst?ts=${Date.now()}`),
+                            { cache: "no-store" });
+    if (zst.ok && typeof fzstd !== "undefined" && fzstd.decompress) {
+      const packed = new Uint8Array(await zst.arrayBuffer());
+      const bytes = fzstd.decompress(packed);
+      core.FS.writeFile("/servers.db", bytes);
+      try {
+        core.FS.unlink("/servers.db-wal");
+      } catch (error) {
+        // No stale WAL to remove.
+      }
+      compressed = true;
+    }
+  } catch (error) {
+    // A corrupt/missing .zst must not break the viewer; use the raw files.
+    if (typeof console !== "undefined") {
+      console.warn("compressed database unavailable:", error);
+    }
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  core.FS.writeFile("/servers.db", bytes);
+  if (!compressed) {
+    setStatus("Loading database…");
+    const response = await fetch(assetUrl(`servers.db?ts=${Date.now()}`),
+                                 { cache: "no-store" });
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).trim();
+      throw new Error(`HTTP ${response.status} loading servers.db${detail ? `: ${detail}` : ""}`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    core.FS.writeFile("/servers.db", bytes);
 
-  // WAL mode keeps recent commits in servers.db-wal until a checkpoint.
-  // Serve that existing file too; it is not a snapshot, just the live sidecar.
-  const wal = await fetch(assetUrl(`servers.db-wal?ts=${Date.now()}`),
-                          { cache: "no-store" });
-  if (wal.ok) {
-    core.FS.writeFile("/servers.db-wal", new Uint8Array(await wal.arrayBuffer()));
-  } else {
-    try {
-      core.FS.unlink("/servers.db-wal");
-    } catch (error) {
-      // No stale WAL to remove.
+    // WAL mode keeps recent commits in servers.db-wal until a checkpoint.
+    // Serve that existing file too; it is not a snapshot, just the live sidecar.
+    const wal = await fetch(assetUrl(`servers.db-wal?ts=${Date.now()}`),
+                            { cache: "no-store" });
+    if (wal.ok) {
+      core.FS.writeFile("/servers.db-wal", new Uint8Array(await wal.arrayBuffer()));
+    } else {
+      try {
+        core.FS.unlink("/servers.db-wal");
+      } catch (error) {
+        // No stale WAL to remove.
+      }
     }
   }
 
@@ -1247,12 +1272,12 @@ async function boot() {
     setStatus("Starting WebAssembly…");
     if (typeof createCore !== "function") {
       // The script tag failed or was blocked; try once more explicitly.
-      await loadScript("core.js?v=8-retry");
+      await loadScript("core.js?v=9-retry");
     }
     if (typeof createCore !== "function") {
       let detail = "";
       try {
-        const probe = await fetch(assetUrl("core.js?v=8-probe"), { cache: "no-store" });
+        const probe = await fetch(assetUrl("core.js?v=9-probe"), { cache: "no-store" });
         const body = await probe.text();
         detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
       } catch (probeError) {
@@ -1264,7 +1289,7 @@ async function boot() {
       );
     }
     core = await createCore({
-      locateFile: (file) => assetUrl(file) + "?v=8",
+      locateFile: (file) => assetUrl(file) + "?v=9",
       print: () => {},
       printErr: () => {},
     });

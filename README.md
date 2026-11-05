@@ -579,6 +579,32 @@ header to resize a column; widths persist in the browser.
 **Refresh** re-fetches the current database file and re-applies the active
 query and sort. It never starts a scan or a sync.
 
+### Compressed database snapshots
+
+The viewer first tries `servers.db.zst` and falls back to `servers.db` plus
+`servers.db-wal`. A compressed snapshot avoids serving the live WAL and
+typically transfers about a third as many bytes. `webui/compress_db.py`
+keeps it current:
+
+    python3 webui/compress_db.py \
+        --db /path/servers.db \
+        --out /path/servers.db.zst \
+        --interval 120 --level 3
+
+It uses `VACUUM INTO` for a consistent snapshot, compresses it with zstd,
+and atomically replaces the output. It only rewrites when the database or
+WAL changed. On the 127 MB test database a snapshot + level-3 compression
+took about 0.4 seconds (`109 MB -> 44 MB`); browser decompression took about
+0.4 seconds. A Raspberry Pi will take a few seconds, and an SD card will see
+the snapshot writes, so raise `--interval` or run it with `--once` from a
+timer there. Python 3.14's `compression.zstd` is used when available;
+otherwise the `zstd` command-line tool is required.
+
+Serve the file with the `location = /servers.db.zst` block in
+`webui/nginx.conf.example`. Do not add `Content-Encoding: zstd`: the
+browser fetches the compressed bytes and unpacks them with the bundled
+`fzstd.js`.
+
 The generated WASM is committed. Rebuild it after changing `webui/core.cpp`
 with Emscripten installed:
 
@@ -602,8 +628,9 @@ Adjust the `root` and the two `alias` paths in the example to point at
 `webui/static`, `servers.db`, and `servers.db-wal`. The nginx worker user
 must be able to read those files and traverse every parent directory.
 
-Use a dedicated hostname; the page fetches `/core.js`, `/servers.db` and
-`/servers.db-wal` from the site root. There is no authentication, so if the
+Use a dedicated hostname; the page fetches `/core.js`, `/fzstd.js`,
+`/servers.db.zst` (preferred), `/servers.db` and `/servers.db-wal` from
+the site root. There is no authentication, so if the
 hostname is reachable beyond a trusted LAN add nginx Basic auth or an
 `allow`/`deny` rule. WAL serving is best-effort: if the sidecar is absent or
 checkpointed between fetches, the viewer handles the 404, but a concurrent

@@ -3,6 +3,7 @@
 # There is no Python process. Nginx serves:
 #   - webui/static/index.html, app.js, style.css, core.js, core.wasm
 #   - the live servers.db and servers.db-wal directly from disk
+#   - an optional precompressed servers.db.zst snapshot
 #
 # Notes are not part of the web viewer and are not served here.
 #
@@ -43,6 +44,7 @@ server {
         application/wasm wasm;
         application/json json;
         application/octet-stream db;
+        application/zstd zst;
     }
 
     add_header X-Content-Type-Options nosniff always;
@@ -52,6 +54,17 @@ server {
     # an old copy after a scan.
     location = /servers.db {
         alias /home/uniq/devel/minecraft-server-scanner/servers.db;
+        default_type application/octet-stream;
+        gzip off;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+    }
+
+    # Precompressed consistent snapshot (see webui/compress_db.py). The
+    # viewer decompresses it with fzstd.js. Do not set Content-Encoding:
+    # the browser fetches the compressed bytes and unpacks them itself.
+    location = /servers.db.zst {
+        alias /home/uniq/devel/minecraft-server-scanner/servers.db.zst;
         default_type application/octet-stream;
         gzip off;
         add_header Cache-Control "no-store" always;
