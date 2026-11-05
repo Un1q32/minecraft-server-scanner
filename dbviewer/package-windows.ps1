@@ -24,7 +24,14 @@ try {
     foreach ($backendFile in 'mcscan.py','scanner.py','qt_helpers.py','db_format.py') {
         Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) $backendFile) -Destination $appFolder -Force
     }
-    Set-Content -LiteralPath (Join-Path $appFolder 'python-path.txt') -Value (Join-Path $toolsRoot 'python\Scripts\python.exe') -Encoding utf8NoBOM
+    $pythonPath = Join-Path $toolsRoot 'python\Scripts\python.exe'
+    $pythonPathFile = Join-Path $appFolder 'python-path.txt'
+    # Works on both Windows PowerShell 5.1 and PowerShell 7: a BOM would make
+    # the Rust side read "\ufeffC:\..." and fail to launch Python.
+    [System.IO.File]::WriteAllText(
+        $pythonPathFile,
+        $pythonPath,
+        (New-Object System.Text.UTF8Encoding -ArgumentList $false))
     & (Join-Path $qtRoot 'bin\windeployqt.exe') --release --qmldir (Join-Path $PSScriptRoot 'qml') --no-translations $executable
     if ($LASTEXITCODE -ne 0) { throw 'Qt runtime deployment failed.' }
     foreach ($runtimeDll in 'libgcc_s_seh-1.dll','libstdc++-6.dll','libwinpthread-1.dll') {
