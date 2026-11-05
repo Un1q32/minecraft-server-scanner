@@ -13,6 +13,8 @@ abstract class DropdownScreen extends Screen {
 	private static final int LEFT_BUTTON = 0;
 	private static final int NO_MOUSE = -1;
 
+	private @Nullable Dropdown<?> opened;
+
 	protected DropdownScreen(Component title) {
 		super(title);
 	}
@@ -20,7 +22,17 @@ abstract class DropdownScreen extends Screen {
 	/** Draws whatever the screen shows besides its widgets. Open menus are drawn over this. */
 	protected abstract void extractForeground(GuiGraphicsExtractor graphics);
 
+	void markOpen(Dropdown<?> dropdown) {
+		this.opened = dropdown;
+	}
+
 	private @Nullable Dropdown<?> openDropdown() {
+		if (this.opened != null) {
+			if (this.opened.isOpen()) {
+				return this.opened;
+			}
+			this.opened = null;
+		}
 		for (GuiEventListener child : this.children()) {
 			if (child instanceof Dropdown<?> dropdown && dropdown.isOpen()) {
 				return dropdown;

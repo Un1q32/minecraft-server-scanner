@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.StringJoiner;
@@ -53,7 +54,8 @@ public final class ServerDatabase {
 		"(SELECT MIN(seen_at) FROM server_history h WHERE h.ip_port = s.ip_port) AS first_seen",
 		"(SELECT MAX(seen_at) FROM server_history h WHERE h.ip_port = s.ip_port) AS last_seen",
 		"times_seen",
-		"substr(players_now, 1, 16384) AS players_now"
+		"substr(players_now, 1, 16384) AS players_now",
+		"substr(players_ever, 1, 65536) AS players_ever"
 	);
 	private static final String SERVERS_FROM = " FROM server_state s";
 	/** Every object the file may contain, compared against sqlite_schema exactly. See {@link #validateSchema}. */
@@ -248,7 +250,7 @@ public final class ServerDatabase {
 	}
 
 	/** Completes with null if a newer query was submitted before this one started. */
-	public static CompletableFuture<@Nullable QueryResult> query(Query query) {
+	public static CompletableFuture<@Nullable QueryResult> query(Query query, List<SortKey> sortKeys) {
 		long id = latestQueryId.incrementAndGet();
 		return CompletableFuture.supplyAsync(() -> {
 			if (id != latestQueryId.get()) {
@@ -256,7 +258,7 @@ public final class ServerDatabase {
 			}
 
 			try {
-				return runQuery(query);
+				return runQuery(query, sortKeys);
 			} catch (SQLException e) {
 				throw new CompletionException(e);
 			}
@@ -281,7 +283,7 @@ public final class ServerDatabase {
 		}, WORKER);
 	}
 
-	private static QueryResult runQuery(Query query) throws SQLException {
+	private static QueryResult runQuery(Query query, List<SortKey> sortKeys) throws SQLException {
 		if (connection == null) {
 			throw new IllegalStateException("Server list not loaded");
 		}
@@ -308,7 +310,7 @@ public final class ServerDatabase {
 		}
 		// SQLite is already native, but letting it compute derived columns and
 		// then sorting Java records keeps sort changes entirely in memory.
-		rows.sort(query.comparator());
+		rows.sort(comparator(sortKeys));
 
 		return new QueryResult(rows);
 	}
@@ -322,6 +324,134 @@ public final class ServerDatabase {
 		for (int i = 0; i < values.size(); i++) {
 			statement.setString(i + 1, values.get(i));
 		}
+	}
+
+	/** One column in the click-order sort stack (last entry is primary). */
+	public record SortKey(Sort sort, boolean descending) {
+	}
+
+	private record IpKey(boolean v4, int a, int b, int c, int d, int port,
+	                     String other) implements Comparable<IpKey> {
+		@Override
+		public int compareTo(IpKey o) {
+			if (this.v4 != o.v4) {
+				return this.v4 ? -1 : 1;
+			}
+			if (this.v4) {
+				int result = Integer.compare(this.a, o.a);
+				if (result == 0) result = Integer.compare(this.b, o.b);
+				if (result == 0) result = Integer.compare(this.c, o.c);
+				if (result == 0) result = Integer.compare(this.d, o.d);
+				if (result == 0) result = Integer.compare(this.port, o.port);
+				return result;
+			}
+			int result = this.other.compareTo(o.other);
+			return result != 0 ? result : Integer.compare(this.port, o.port);
+		}
+	}
+
+	private static long minuteKey(double epoch) {
+		return epoch > 0.0 ? (long) (epoch / 60.0) : 0L;
+	}
+
+	private static IpKey ipKey(String value) {
+		String host = value == null ? "" : value;
+		int port = 0;
+		int colons = 0;
+		for (int i = 0; i < host.length(); i++) {
+			if (host.charAt(i) == ':') colons++;
+		}
+		if (colons == 1) {
+			int index = host.indexOf(':');
+			try {
+				int parsed = Integer.parseInt(host.substring(index + 1));
+				if (parsed >= 0) {
+					port = parsed;
+					host = host.substring(0, index);
+				}
+			} catch (RuntimeException e) {
+				// Keep the whole value as a hostname.
+			}
+		}
+		String[] parts = host.split("\\.", -1);
+		if (parts.length == 4) {
+			try {
+				int a = Integer.parseInt(parts[0]);
+				int b = Integer.parseInt(parts[1]);
+				int c = Integer.parseInt(parts[2]);
+				int d = Integer.parseInt(parts[3]);
+				if (a >= 0 && b >= 0 && c >= 0 && d >= 0) {
+					return new IpKey(true, a, b, c, d, port, "");
+				}
+			} catch (NumberFormatException e) {
+				// Hostname.
+			}
+		}
+		return new IpKey(false, 0, 0, 0, 0, port,
+			host.toLowerCase(Locale.ROOT));
+	}
+
+	private static List<Long> versionKey(String value) {
+		List<Long> out = new ArrayList<>();
+		for (String token : (value == null ? "" : value.trim()).split("\\.", -1)) {
+			if (token.isEmpty()) {
+				continue;
+			}
+			boolean digits = true;
+			for (int i = 0; i < token.length(); i++) {
+				if (!Character.isDigit(token.charAt(i))) {
+					digits = false;
+					break;
+				}
+			}
+			if (digits) {
+				try {
+					out.add(Long.parseLong(token));
+				} catch (NumberFormatException e) {
+					out.add(0L);
+				}
+			} else {
+				boolean found = false;
+				for (String part : token.split("\\D+")) {
+					if (part.isEmpty()) continue;
+					try {
+						out.add(Long.parseLong(part));
+					} catch (NumberFormatException e) {
+						out.add(0L);
+					}
+					found = true;
+				}
+				if (!found) out.add(0L);
+			}
+		}
+		if (out.isEmpty()) out.add(0L);
+		return out;
+	}
+
+	private static int compareVersionKeys(List<Long> a, List<Long> b) {
+		int count = Math.min(a.size(), b.size());
+		for (int i = 0; i < count; i++) {
+			int result = Long.compare(a.get(i), b.get(i));
+			if (result != 0) return result;
+		}
+		return Integer.compare(a.size(), b.size());
+	}
+
+	public static Comparator<ServerRecord> comparator(List<SortKey> keys) {
+		Comparator<ServerRecord> comparator = null;
+		for (int i = keys.size() - 1; i >= 0; i--) {
+			SortKey key = keys.get(i);
+			Comparator<ServerRecord> current = key.sort().comparator;
+			if (key.descending()) {
+				current = current.reversed();
+			}
+			comparator = comparator == null ? current : comparator.thenComparing(current);
+		}
+		if (comparator == null) {
+			comparator = Comparator.comparingLong(
+				(ServerRecord r) -> minuteKey(r.lastSeenEpochSeconds())).reversed();
+		}
+		return comparator;
 	}
 
 	@FunctionalInterface
@@ -338,20 +468,29 @@ public final class ServerDatabase {
 	}
 
 	public enum Sort implements Labeled {
-		LAST_SEEN("Last seen",
-			Comparator.comparingDouble(ServerRecord::lastSeenEpochSeconds)),
-		FIRST_SEEN("First seen",
-			Comparator.comparingDouble(ServerRecord::firstSeenEpochSeconds)),
+		IP_PORT("IP / port",
+			Comparator.comparing(r -> ipKey(r.address()))),
+		MOTD("MOTD",
+			Comparator.comparing(r -> r.motd().toLowerCase(Locale.ROOT))),
 		PLAYERS("Players",
 			Comparator.comparingInt(ServerRecord::playersOnline)),
-		MAX_PLAYERS("Max players",
-			Comparator.comparingInt(ServerRecord::maxPlayers)),
-		TIMES_SEEN("Times seen",
-			Comparator.comparingInt(ServerRecord::timesSeen)),
 		VERSION("Version",
-			Comparator.comparingInt(ServerRecord::protocol)),
-		ADDRESS("Address",
-			Comparator.comparing(ServerRecord::address, String.CASE_INSENSITIVE_ORDER));
+			Comparator.comparing(ServerRecord::version,
+				(a, b) -> compareVersionKeys(versionKey(a), versionKey(b)))),
+		CRACKED("Cracked",
+			Comparator.comparing(r -> r.cracked() ? "1" : "0")),
+		WHITELIST("Whitelist",
+			Comparator.comparing(r -> r.whitelist().toLowerCase(Locale.ROOT))),
+		ONLINE_NAMES("Online names",
+			Comparator.comparing(r -> r.playersNowText().toLowerCase(Locale.ROOT))),
+		SEEN_NAMES("Seen names",
+			Comparator.comparing(r -> r.playersEverText().toLowerCase(Locale.ROOT))),
+		FIRST_SEEN("First seen",
+			Comparator.comparingLong(r -> minuteKey(r.firstSeenEpochSeconds()))),
+		LAST_SEEN("Last seen",
+			Comparator.comparingLong(r -> minuteKey(r.lastSeenEpochSeconds()))),
+		TIMES_SEEN("Times seen",
+			Comparator.comparingInt(ServerRecord::timesSeen));
 
 		private final String label;
 		private final Comparator<ServerRecord> comparator;
@@ -440,18 +579,8 @@ public final class ServerDatabase {
 		}
 	}
 
-	public record Query(String search, Sort sort, boolean descending, PlayersFilter players, AuthFilter auth, WhitelistFilter whitelist) {
-		public static final Query DEFAULT = new Query("", Sort.PLAYERS, true, PlayersFilter.ANY, AuthFilter.ANY, WhitelistFilter.ANY);
-
-		/** Java-side comparator used to re-sort an already filtered result. */
-		public Comparator<ServerRecord> comparator() {
-			Comparator<ServerRecord> comparator = this.sort.comparator;
-			if (this.descending) {
-				comparator = comparator.reversed();
-			}
-			return comparator.thenComparing(
-				Comparator.comparingDouble(ServerRecord::lastSeenEpochSeconds).reversed());
-		}
+	public record Query(String search, PlayersFilter players, AuthFilter auth, WhitelistFilter whitelist) {
+		public static final Query DEFAULT = new Query("", PlayersFilter.ANY, AuthFilter.ANY, WhitelistFilter.ANY);
 
 		List<String> searchTerms() {
 			String trimmed = this.search.strip();
@@ -459,27 +588,19 @@ public final class ServerDatabase {
 		}
 
 		public Query withSearch(String search) {
-			return new Query(search, this.sort, this.descending, this.players, this.auth, this.whitelist);
-		}
-
-		public Query withSort(Sort sort) {
-			return new Query(this.search, sort, this.descending, this.players, this.auth, this.whitelist);
-		}
-
-		public Query withDescending(boolean descending) {
-			return new Query(this.search, this.sort, descending, this.players, this.auth, this.whitelist);
+			return new Query(search, this.players, this.auth, this.whitelist);
 		}
 
 		public Query withPlayers(PlayersFilter players) {
-			return new Query(this.search, this.sort, this.descending, players, this.auth, this.whitelist);
+			return new Query(this.search, players, this.auth, this.whitelist);
 		}
 
 		public Query withAuth(AuthFilter auth) {
-			return new Query(this.search, this.sort, this.descending, this.players, auth, this.whitelist);
+			return new Query(this.search, this.players, auth, this.whitelist);
 		}
 
 		public Query withWhitelist(WhitelistFilter whitelist) {
-			return new Query(this.search, this.sort, this.descending, this.players, this.auth, whitelist);
+			return new Query(this.search, this.players, this.auth, whitelist);
 		}
 	}
 

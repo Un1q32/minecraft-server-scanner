@@ -20,7 +20,8 @@ public record ServerRecord(
 	double firstSeenEpochSeconds,
 	double lastSeenEpochSeconds,
 	int timesSeen,
-	String playersNowJson
+	String playersNowJson,
+	String playersEverJson
 ) {
 	static ServerRecord fromRow(ResultSet rs) throws SQLException {
 		return new ServerRecord(
@@ -35,7 +36,8 @@ public record ServerRecord(
 			rs.getDouble("first_seen"),
 			rs.getDouble("last_seen"),
 			rs.getInt("times_seen"),
-			nullToEmpty(rs.getString("players_now"))
+			nullToEmpty(rs.getString("players_now")),
+			nullToEmpty(rs.getString("players_ever"))
 		);
 	}
 
@@ -55,6 +57,18 @@ public record ServerRecord(
 
 	public List<String> playersNow() {
 		return parsePlayerNames(this.playersNowJson);
+	}
+
+	public List<String> playersEver() {
+		return parsePlayerNames(this.playersEverJson);
+	}
+
+	public String playersNowText() {
+		return String.join(", ", playersNow());
+	}
+
+	public String playersEverText() {
+		return String.join(", ", playersEver());
 	}
 
 	static List<String> parsePlayerNames(@Nullable String json) {

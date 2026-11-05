@@ -43,7 +43,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private static final int FOOTER_HEIGHT = 108;
 	private static final int FOOTER_BUTTON_WIDTH = 90;
 	private static final int ACTION_BUTTON_WIDTH = 120;
-	private static final int SORT_BUTTON_WIDTH = 130;
+	private static final int SORT_BUTTON_WIDTH = 170;
 	private static final int GAP = 4;
 	private static final int SEARCH_DEBOUNCE_TICKS = 5;
 	private static final long NOTICE_DURATION_MILLIS = 3000;
@@ -52,6 +52,8 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 	private final Screen parent;
 	private Query query;
+	private final List<ServerDatabase.SortKey> sortKeys = new ArrayList<>(
+		List.of(new ServerDatabase.SortKey(ServerDatabase.Sort.LAST_SEEN, true)));
 	private @Nullable QueryResult result;
 	private int ticksUntilSearch = -1;
 	private boolean loading;
@@ -68,6 +70,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private Button copyButton;
 	private Button historyButton;
 	private Button redownloadButton;
+	private Button directionButton;
 	private Button rescanButton;
 	private Button whitelistButton;
 	private Button syncButton;
@@ -97,12 +100,11 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.searchBox.setResponder(search -> this.ticksUntilSearch = SEARCH_DEBOUNCE_TICKS);
 		this.addRenderableWidget(this.searchBox);
 
-		this.addRenderableWidget(new Dropdown<>(sortX, SEARCH_ROW_Y, SORT_BUTTON_WIDTH, ROW_HEIGHT, "Sort", ServerDatabase.Sort.values(), this.query.sort(),
-			sort -> this.setQuery(this.query.withSort(sort))));
-		this.addRenderableWidget(Button.builder(directionArrow(this.query.descending()), button -> {
-			this.setQuery(this.query.withDescending(!this.query.descending()));
-			button.setMessage(directionArrow(this.query.descending()));
-		}).bounds(directionX, SEARCH_ROW_Y, ROW_HEIGHT, ROW_HEIGHT).build());
+		this.addRenderableWidget(new Dropdown<>(sortX, SEARCH_ROW_Y, SORT_BUTTON_WIDTH, ROW_HEIGHT, "Sort", ServerDatabase.Sort.values(), this.primarySort(),
+			this::toggleSort));
+		this.directionButton = this.addRenderableWidget(Button.builder(
+			directionArrow(this.primaryDescending()), button -> this.toggleDirection())
+			.bounds(directionX, SEARCH_ROW_Y, ROW_HEIGHT, ROW_HEIGHT).build());
 
 		int filterWidth = (right - MARGIN - 2 * GAP) / 3;
 		this.addRenderableWidget(new Dropdown<>(MARGIN, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Players", ServerDatabase.PlayersFilter.values(), this.query.players(),
@@ -199,31 +201,83 @@ public class ServerBrowserScreen extends DropdownScreen {
 		if (newQuery.equals(this.query)) {
 			return;
 		}
-
-		boolean sortOnly = this.query.withSort(newQuery.sort())
-			.withDescending(newQuery.descending()).equals(newQuery);
 		this.query = newQuery;
 		rememberedQuery = newQuery;
 		if (!this.loading && ServerDatabase.isLoaded()) {
-			if (sortOnly && this.result != null) {
-				// The SQL result is already filtered; re-sort it in Java
-				// instead of re-querying SQLite and rebuilding every row.
-				this.result.rows().sort(this.query.comparator());
-				this.list.updateRows(this.result.rows());
-			} else {
-				this.runQuery();
+			this.runQuery();
+		}
+	}
+
+	private void toggleSort(ServerDatabase.Sort sort) {
+		int index = -1;
+		for (int i = 0; i < this.sortKeys.size(); i++) {
+			if (this.sortKeys.get(i).sort() == sort) {
+				index = i;
+				break;
 			}
+		}
+		boolean descending = false;
+		if (index >= 0) {
+			descending = !this.sortKeys.get(index).descending();
+			this.sortKeys.remove(index);
+		}
+		this.sortKeys.add(new ServerDatabase.SortKey(sort, descending));
+		this.sortChanged();
+	}
+
+	private void toggleDirection() {
+		if (this.sortKeys.isEmpty()) {
+			this.sortKeys.add(new ServerDatabase.SortKey(
+				ServerDatabase.Sort.LAST_SEEN, false));
+		} else {
+			ServerDatabase.SortKey primary = this.sortKeys.remove(this.sortKeys.size() - 1);
+			this.sortKeys.add(new ServerDatabase.SortKey(primary.sort(),
+				!primary.descending()));
+		}
+		this.sortChanged();
+	}
+
+	private void sortChanged() {
+		this.updateDirectionButton();
+		if (this.loading || !ServerDatabase.isLoaded()) {
+			return;
+		}
+		if (this.result != null) {
+			this.result.rows().sort(ServerDatabase.comparator(this.sortKeys));
+			this.list.updateRows(this.result.rows());
+		} else {
+			this.runQuery();
+		}
+	}
+
+	private ServerDatabase.Sort primarySort() {
+		return this.sortKeys.isEmpty() ? ServerDatabase.Sort.LAST_SEEN
+			: this.sortKeys.get(this.sortKeys.size() - 1).sort();
+	}
+
+	private boolean primaryDescending() {
+		return this.sortKeys.isEmpty()
+			|| this.sortKeys.get(this.sortKeys.size() - 1).descending();
+	}
+
+	private void updateDirectionButton() {
+		if (this.directionButton != null) {
+			this.directionButton.setMessage(directionArrow(this.primaryDescending()));
 		}
 	}
 
 	private void runQuery() {
-		ServerDatabase.query(this.query).whenComplete((queryResult, throwable) -> this.minecraft.execute(() -> {
+		List<ServerDatabase.SortKey> requestedSort = List.copyOf(this.sortKeys);
+		ServerDatabase.query(this.query, requestedSort).whenComplete((queryResult, throwable) -> this.minecraft.execute(() -> {
 			if (throwable != null) {
 				McdbBrowserClient.LOGGER.error("Server list query failed", throwable);
 				this.error = "Query failed: " + describe(throwable);
 			} else if (queryResult != null) {
 				this.error = null;
 				this.result = queryResult;
+				if (!requestedSort.equals(this.sortKeys)) {
+					queryResult.rows().sort(ServerDatabase.comparator(this.sortKeys));
+				}
 				this.list.setRows(queryResult.rows());
 			}
 		}));

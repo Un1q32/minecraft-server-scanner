@@ -51,6 +51,10 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 	public void onPress(InputWithModifiers input) {
 		this.open = true;
 		this.highlighted = this.values.indexOf(this.value);
+		Minecraft minecraft = Minecraft.getInstance();
+		if (minecraft != null && minecraft.gui.screen() instanceof DropdownScreen screen) {
+			screen.markOpen(this);
+		}
 	}
 
 	@Override
@@ -139,10 +143,10 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 	}
 
 	private void select(T newValue) {
-		if (newValue != this.value) {
-			this.value = newValue;
-			this.updateMessage();
-			this.onChange.accept(newValue);
-		}
+		// Always notify: the sort dropdown uses a repeated click on the same
+		// column to toggle its direction, exactly like a table header.
+		this.value = newValue;
+		this.updateMessage();
+		this.onChange.accept(newValue);
 	}
 }
