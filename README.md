@@ -617,7 +617,10 @@ Existing local and server databases are converted once on startup, then
 Both local and shared databases have two history tables:
 `server_history` (one row per sighting) and `player_history` (one row per
 sampled player per sighting). The viewer JSON is capped at 5000 sighting
-points and 20000 player events while storage keeps every row.
+points and 20000 player events while storage keeps every row. Upload indexes
+are partial (`WHERE synced=0`), so they shrink back to almost nothing after a
+sync; obsolete full-history indexes are dropped at startup and the database
+is vacuumed when the freed space exceeds 10%.
 
 History is synced incrementally as well: local rows carry a `synced` flag,
 and `/api/history/sync` uploads unsynced sightings/player events and pages

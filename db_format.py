@@ -65,14 +65,24 @@ HISTORY_TABLES = (
 )
 
 HISTORY_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_player_history_ip_time"
-    " ON player_history(ip_port, seen_at ASC)",
+    # The User Log needs the latest server per player.
     "CREATE INDEX IF NOT EXISTS idx_player_history_name_time"
     " ON player_history(player_name, seen_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_server_history_synced"
-    " ON server_history(synced, seen_at ASC)",
-    "CREATE INDEX IF NOT EXISTS idx_player_history_synced"
-    " ON player_history(synced, seen_at ASC)",
+    # Only unsynced rows need upload indexes.  After a sync these are
+    # nearly empty instead of indexing the entire history.
+    "CREATE INDEX IF NOT EXISTS idx_server_history_unsynced"
+    " ON server_history(seen_at ASC) WHERE synced=0",
+    "CREATE INDEX IF NOT EXISTS idx_player_history_unsynced"
+    " ON player_history(seen_at ASC) WHERE synced=0",
+)
+
+# Older format-3 builds created these full-table indexes.  They are either
+# redundant with the primary key, replaced by a partial index, or no longer
+# needed for graph queries.
+OLD_HISTORY_INDEXES = (
+    "idx_player_history_ip_time",
+    "idx_server_history_synced",
+    "idx_player_history_synced",
 )
 
 
@@ -82,15 +92,38 @@ def init_history_schema(con: sqlite3.Connection):
         con.execute(statement)
     # Format 3 originally shipped without the sync flag.  Existing rows
     # become unsynced so the next sync uploads the local history once.
-    # The synced indexes must be created after this ALTER.
+    # The upload indexes must be created after this ALTER.
     for table in ("server_history", "player_history"):
         columns = {str(row[1]) for row in
                    con.execute(f"PRAGMA table_info({table})")}
         if "synced" not in columns:
             con.execute(f"ALTER TABLE {table}"
                         " ADD COLUMN synced INTEGER DEFAULT 0")
+    # Drop the old, much larger indexes.  This is a no-op after the first
+    # startup; the pages are reclaimed by vacuum_if_bloated().
+    for name in OLD_HISTORY_INDEXES:
+        con.execute(f"DROP INDEX IF EXISTS {name}")
+    # A format-2 migration left old duplicate seq/version index names on
+    # server_state.
+    con.execute("DROP INDEX IF EXISTS idx_servers_seq")
+    if object_type(con, STATE_TABLE) == "table":
+        con.execute("DROP INDEX IF EXISTS idx_servers_version")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_server_state_version"
+                    " ON server_state(version)")
     for statement in HISTORY_INDEXES:
         con.execute(statement)
+
+
+def vacuum_if_bloated(con: sqlite3.Connection):
+    """VACUUM once when index migrations free a significant part of the DB."""
+    try:
+        con.commit()
+        page_count = int(con.execute("PRAGMA page_count").fetchone()[0] or 0)
+        free = int(con.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+        if page_count and free > max(64, page_count // 10):
+            con.execute("VACUUM")
+    except Exception:
+        pass
 
 
 def object_type(con: sqlite3.Connection, name: str):
@@ -540,4 +573,5 @@ def ensure_format(con: sqlite3.Connection) -> int:
         ensure_view(con)
         con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
         con.commit()
+        vacuum_if_bloated(con)
     return detect_format(con)
