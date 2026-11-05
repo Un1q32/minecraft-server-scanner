@@ -54,6 +54,8 @@ public final class ServerDatabase {
 		"(SELECT MIN(seen_at) FROM server_history h WHERE h.ip_port = s.ip_port) AS first_seen",
 		"(SELECT MAX(seen_at) FROM server_history h WHERE h.ip_port = s.ip_port) AS last_seen",
 		"times_seen",
+		"port",
+		"substr(last_source, 1, 300) AS last_source",
 		"substr(players_now, 1, 16384) AS players_now",
 		"substr(players_ever, 1, 65536) AS players_ever"
 	);
@@ -72,7 +74,6 @@ public final class ServerDatabase {
 		new SchemaObject("index", "idx_server_history_players_time", "server_history", "CREATE INDEX idx_server_history_players_time ON server_history(seen_at DESC) WHERE players IS NOT NULL"),
 		new SchemaObject("view", "servers", "servers", "CREATE VIEW servers AS SELECT s.*, (SELECT MIN(seen_at) FROM server_history h  WHERE h.ip_port=s.ip_port) AS first_seen, (SELECT MAX(seen_at) FROM server_history h  WHERE h.ip_port=s.ip_port) AS last_seen FROM server_state s")
 	);
-	private static final String SEARCH_CONDITION = "(ip_port LIKE ?%1$d ESCAPE '\\' OR motd LIKE ?%1$d ESCAPE '\\' OR version LIKE ?%1$d ESCAPE '\\' OR players_ever LIKE ?%1$d ESCAPE '\\')";
 
 	private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(runnable -> {
 		Thread thread = new Thread(runnable, "MCDB Worker");
@@ -288,20 +289,22 @@ public final class ServerDatabase {
 			throw new IllegalStateException("Server list not loaded");
 		}
 
-		List<String> searchPatterns = query.searchTerms().stream().map(ServerDatabase::containsPattern).toList();
+		SearchQuery.Result search = SearchQuery.compile(query.search());
 		StringJoiner where = new StringJoiner(" AND ", " WHERE ", "").setEmptyValue("");
-		for (int i = 1; i <= searchPatterns.size(); i++) {
-			where.add(SEARCH_CONDITION.formatted(i));
+		if (!search.where().isEmpty()) {
+			where.add(search.where().substring("WHERE ".length()));
 		}
 		Stream.of(query.players(), query.auth(), query.whitelist())
 			.map(Filter::condition)
 			.filter(Objects::nonNull)
 			.forEach(where::add);
 
-		String sql = "SELECT " + COLUMNS + SERVERS_FROM + where;
+		// Wrap the projected columns so search can also reference the derived
+		// first_seen/last_seen aliases (WHERE cannot see SELECT aliases).
+		String sql = "SELECT * FROM (" + "SELECT " + COLUMNS + SERVERS_FROM + ") q" + where;
 		List<ServerRecord> rows = new ArrayList<>();
 		try (PreparedStatement statement = connection.prepareStatement(sql)) {
-			bind(statement, searchPatterns);
+			bind(statement, search.params());
 			try (ResultSet rs = statement.executeQuery()) {
 				while (rs.next()) {
 					rows.add(ServerRecord.fromRow(rs));
@@ -315,14 +318,14 @@ public final class ServerDatabase {
 		return new QueryResult(rows);
 	}
 
-	private static String containsPattern(String term) {
-		String escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
-		return "%" + escaped + "%";
-	}
-
-	private static void bind(PreparedStatement statement, List<String> values) throws SQLException {
+	private static void bind(PreparedStatement statement, List<Object> values) throws SQLException {
 		for (int i = 0; i < values.size(); i++) {
-			statement.setString(i + 1, values.get(i));
+			Object value = values.get(i);
+			if (value instanceof Number number) {
+				statement.setLong(i + 1, number.longValue());
+			} else {
+				statement.setString(i + 1, String.valueOf(value));
+			}
 		}
 	}
 
@@ -581,11 +584,6 @@ public final class ServerDatabase {
 
 	public record Query(String search, PlayersFilter players, AuthFilter auth, WhitelistFilter whitelist) {
 		public static final Query DEFAULT = new Query("", PlayersFilter.ANY, AuthFilter.ANY, WhitelistFilter.ANY);
-
-		List<String> searchTerms() {
-			String trimmed = this.search.strip();
-			return trimmed.isEmpty() ? List.of() : List.of(trimmed.split("\\s+"));
-		}
 
 		public Query withSearch(String search) {
 			return new Query(search, this.players, this.auth, this.whitelist);
