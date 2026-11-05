@@ -1016,6 +1016,39 @@ std::string history_text(const std::string &ip) {
         sqlite3_finalize(stmt);
     }
 
+    if (first) {
+        // Older databases have no history tables yet.  They still know
+        // first/last seen, so show those two sightings instead of claiming
+        // the server was never seen.  Counts are unknown.
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql =
+            "SELECT first_seen, last_seen FROM servers WHERE ip_port=? LIMIT 1";
+        if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ip.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                double first_seen = sqlite3_column_double(stmt, 0);
+                double last_seen = sqlite3_column_double(stmt, 1);
+                auto add_point = [&](double t) {
+                    if (t <= 0.0) {
+                        return;
+                    }
+                    if (!first) {
+                        out += ',';
+                    }
+                    first = false;
+                    out += "{\"t\":";
+                    out += number_json(t);
+                    out += ",\"p\":null,\"m\":null}";
+                };
+                add_point(first_seen);
+                if (last_seen > first_seen) {
+                    add_point(last_seen);
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
     out += "],\"players\":[";
     std::map<std::string, std::vector<double>> players;
     if (g_db && table_exists("player_history")) {

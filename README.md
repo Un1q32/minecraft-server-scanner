@@ -121,9 +121,11 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
   players online, max players), and every sampled player name is stored in
   `player_history` (timestamp, name). This is what the viewers graph.
   Existing databases are seeded with their `first_seen`/`last_seen` points
-  once; player counts are unknown (`NULL`) for those older points. History
-  is local-only: normal sync and `--download-db` keep the local history for
-  servers that still exist, but history is not uploaded to the shared DB.
+  once; player counts are unknown (`NULL`) for those older points. Until
+  that backfill runs, the viewers fall back to the same first/last-seen
+  points, so every known server still has a graph. History is local-only:
+  normal sync and `--download-db` keep the local history for servers that
+  still exist, but history is not uploaded to the shared DB.
 - The Servers tab browses that history (search, rescan, copy, export, add to
   Saved/Ignore/Monitor, delete). Search also matches player names, so you
   can find every server a player has been seen on.

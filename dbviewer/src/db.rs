@@ -480,6 +480,31 @@ pub fn history_json(servers_path: &str, ip: &str) -> String {
                 points = rows.flatten().collect();
             }
         }
+        if points.is_empty() {
+            // Older databases have no history tables yet.  They still know
+            // first/last seen, so show those two sightings instead of
+            // claiming the server was never seen.  Counts are unknown.
+            if let Ok((first_seen, last_seen)) = con.query_row(
+                "SELECT first_seen, last_seen FROM servers WHERE ip_port=? \
+                 LIMIT 1",
+                [ip],
+                |r| {
+                    Ok((r.get::<_, f64>(0).unwrap_or(0.0),
+                        r.get::<_, f64>(1).unwrap_or(0.0)))
+                },
+            ) {
+                if first_seen > 0.0 {
+                    points.push(serde_json::json!({
+                        "t": first_seen, "p": null, "m": null,
+                    }));
+                }
+                if last_seen > first_seen {
+                    points.push(serde_json::json!({
+                        "t": last_seen, "p": null, "m": null,
+                    }));
+                }
+            }
+        }
         if let Ok(mut stmt) = con.prepare(
             "SELECT player_name, seen_at FROM (\
                SELECT player_name, seen_at FROM player_history \
@@ -689,7 +714,28 @@ mod tests {
         assert_eq!(json["players"][0]["times"].as_array().unwrap().len(), 2);
         assert_eq!(json["players"][1]["name"], "bob");
 
-        // Databases without the history tables still return valid JSON.
+        // Databases without history tables fall back to first/last seen.
+        let legacy = dir.join("legacy.db");
+        let con = Connection::open(&legacy).unwrap();
+        con.execute(
+            "CREATE TABLE servers (ip_port TEXT, first_seen REAL, last_seen REAL)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO servers VALUES ('1.2.3.4:25565', 100.0, 200.0)",
+            [],
+        )
+        .unwrap();
+        drop(con);
+        let json: serde_json::Value =
+            serde_json::from_str(&history_json(legacy.to_str().unwrap(), "1.2.3.4:25565"))
+                .unwrap();
+        assert_eq!(json["points"].as_array().unwrap().len(), 2);
+        assert_eq!(json["points"][0]["t"], 100.0);
+        assert_eq!(json["points"][0]["p"], serde_json::Value::Null);
+
+        // A database without the tables and without the server stays empty.
         let empty = dir.join("empty.db");
         Connection::open(&empty)
             .unwrap()
