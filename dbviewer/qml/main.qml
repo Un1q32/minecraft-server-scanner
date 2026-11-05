@@ -44,6 +44,7 @@ ApplicationWindow {
     property real chartViewStart: 0
     property real chartViewEnd: 0
     property bool chartZoomed: false
+    readonly property int defaultHistoryWindow: 48 * 3600
     readonly property var chartColors: [
         "#6fa8dc", "#93c47d", "#e6b85c", "#e07b8f", "#b4a7d6",
         "#76a5af", "#f0a35e", "#c3d36c", "#d98cc4", "#8fb8e8"
@@ -163,7 +164,7 @@ ApplicationWindow {
             data.players = []
         historyData = data
         historyLoaded = true
-        resetChartView()
+        resetChartViewToDefault()
     }
 
     function clearHistory() {
@@ -234,6 +235,29 @@ ApplicationWindow {
 
     function chartFullRange() {
         return historyRange(historyData.points || [], historyData.players || [])
+    }
+
+    function chartDefaultRange() {
+        var full = chartFullRange()
+        if (!full[0] && !full[1])
+            return full
+        var start = full[1] - defaultHistoryWindow
+        if (start < full[0])
+            start = full[0]
+        return [start, full[1]]
+    }
+
+    /// Initial view is the most recent 48 hours of data (or less if the
+    /// server has not been around that long).
+    function resetChartViewToDefault() {
+        var full = chartFullRange()
+        var view = chartDefaultRange()
+        chartViewStart = view[0]
+        chartViewEnd = view[1]
+        chartZoomed = view[0] > full[0] + 0.001 ||
+                      view[1] < full[1] - 0.001
+        serverChart.requestPaint()
+        playerChart.requestPaint()
     }
 
     function chartViewRange() {
@@ -1302,7 +1326,7 @@ ApplicationWindow {
                         }
 
                         SquareButton {
-                            text: "Reset zoom"
+                            text: "Show all"
                             flat: true
                             visible: window.historyLoaded && window.chartZoomed
                             onClicked: window.resetChartView()

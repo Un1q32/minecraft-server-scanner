@@ -17,6 +17,7 @@ const COLUMNS = [
 const COLUMN_KEYS = COLUMNS.map((column) => column.key);
 const ROW_HEIGHT = 22;
 const SEARCH_DELAY = 300;
+const DEFAULT_HISTORY_WINDOW = 48 * 3600;
 
 const HELP = `Select a row to see its full record.
 
@@ -261,6 +262,23 @@ function historyRange(points, players) {
 function fullChartRange() {
   return historyRange((historyData && historyData.points) || [],
                       (historyData && historyData.players) || []);
+}
+
+function defaultChartRange() {
+  const full = fullChartRange();
+  if (!full[0] && !full[1]) {
+    return full;
+  }
+  return [Math.max(full[0], full[1] - DEFAULT_HISTORY_WINDOW), full[1]];
+}
+
+function resetChartViewToDefault() {
+  const full = fullChartRange();
+  const view = defaultChartRange();
+  chartViewStart = view[0];
+  chartViewEnd = view[1];
+  chartZoomed = view[0] > full[0] + 0.001 || view[1] < full[1] - 0.001;
+  renderHistory();
 }
 
 function currentChartRange() {
@@ -690,12 +708,8 @@ function showHistory(row) {
   if (!Array.isArray(historyData.players)) {
     historyData.players = [];
   }
-  const full = fullChartRange();
-  chartViewStart = full[0];
-  chartViewEnd = full[1];
-  chartZoomed = false;
   chartDrag = null;
-  renderHistory();
+  resetChartViewToDefault();
 }
 
 function hideTip() {
@@ -1233,12 +1247,12 @@ async function boot() {
     setStatus("Starting WebAssembly…");
     if (typeof createCore !== "function") {
       // The script tag failed or was blocked; try once more explicitly.
-      await loadScript("core.js?v=6-retry");
+      await loadScript("core.js?v=7-retry");
     }
     if (typeof createCore !== "function") {
       let detail = "";
       try {
-        const probe = await fetch(assetUrl("core.js?v=6-probe"), { cache: "no-store" });
+        const probe = await fetch(assetUrl("core.js?v=7-probe"), { cache: "no-store" });
         const body = await probe.text();
         detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
       } catch (probeError) {

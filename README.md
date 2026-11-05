@@ -431,9 +431,9 @@ ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN and TIMES SEEN (the Python
 tab also has a NOTES count column). Selecting a row draws its sighting
 history above the detail text: a player-count line with a tick for every
 time the server was seen, then one row per player showing when that player
-was sampled online. Scroll the graph to zoom the time window, drag to pan,
-and double-click (or **Reset zoom**) to return to the full range. Points are
-local 12-hour time; storage stays UTC epoch.
+was sampled online. The initial window is the most recent 48 hours of data.
+Scroll the graph to zoom, drag to pan, and double-click (or **Show all**) to
+see the full range. Points are local 12-hour time; storage stays UTC epoch.
 The detail pane also shows the server's
 notes from the sibling `notes.db`, and the **Notes** button opens a dialog
 to add or delete them. Added/deleted notes are written to `notes.db` with
@@ -523,9 +523,9 @@ changes written by a scanner running elsewhere. The 11 server columns,
 numeric version/IP sorting, stacked sort keys, search language, detail pane
 and Copy IP(s) all match the Rust viewer's table. Selecting a row also draws
 the same sighting and player-activity charts as the Rust viewer (hover a
-point for its local time). Use the mouse wheel to zoom, drag to pan, and
-double-click or **Reset zoom** to restore the full range. Notes are
-intentionally not served here.
+point for its local time). The initial window is the most recent 48 hours
+of data; use the mouse wheel to zoom, drag to pan, and double-click or
+**Show all** to see the full range. Notes are intentionally not served here.
 
 The page loads the database into `webui/static/core.wasm`, a small
 Emscripten/SQLite build, so filtering, sorting and formatting run in the
