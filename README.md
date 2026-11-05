@@ -496,9 +496,10 @@ and no shared-DB sync. It refreshes MOTD, version, player counts/samples and
 `last_seen`, and the table reloads and re-applies the active sort when it
 finishes. The job log follows the same 10-second / non-zero-exit rule as
 **Sync DB**. Status pings run with 256 workers by default; set
-`MC_STATUS_WORKERS` to tune that. Status pings connect to IPv4 literals
-without DNS, enable `TCP_NODELAY`, send the handshake in one write, and parse
-the response from one buffered read. Results are written to SQLite in
+`MC_STATUS_WORKERS` to tune that; `MC_STATUS_TIMEOUT` sets the per-connection
+timeout (default 3 seconds). Status pings connect to IPv4 literals without
+DNS, enable `TCP_NODELAY`, send the handshake in one write, and parse the
+response from one buffered read. Results are written to SQLite in
 batches and the User Log tab refresh is coalesced to at most every two
 seconds, so large rescans spend their time on the network instead of one
 commit per server.

@@ -169,6 +169,11 @@ try:
     STATUS_WORKERS = max(1, int(os.environ.get("MC_STATUS_WORKERS", "256")))
 except Exception:
     STATUS_WORKERS = 256
+try:
+    STATUS_TIMEOUT = max(
+        0.2, float(os.environ.get("MC_STATUS_TIMEOUT", str(TIMEOUT))))
+except Exception:
+    STATUS_TIMEOUT = TIMEOUT
 USER_LOG_REFRESH_INTERVAL = 2.0
 SERVERS_DAT_PATH = os.path.expandvars(r"%APPDATA%\.minecraft\servers.dat")
 BACKUP_PATH = SERVERS_DAT_PATH + ".bak"
@@ -4125,8 +4130,9 @@ def ping_server(entry, proxy=None, persist=True):
         return None
     try:
         host, port = split_host_port(entry)
-        with open_connection(host, port, proxy=proxy, timeout=TIMEOUT) as sock:
-            sock.settimeout(TIMEOUT)
+        with open_connection(host, port, proxy=proxy,
+                             timeout=STATUS_TIMEOUT) as sock:
+            sock.settimeout(STATUS_TIMEOUT)
 
             handshake = (
                 varint_encode(0x00) +
