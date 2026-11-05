@@ -49,7 +49,7 @@ JSON replies are zstd- or gzip-compressed when the request advertises them
 (zstd uses Python 3.14+ `compression.zstd`, else the `zstd` CLI when present;
 gzip is the fallback).
 
-* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "notes": M, "format": 2, "now": T}``
+* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "notes": M, "format": 3, "now": T}``
 * ``GET  /api/db``                   -> consistent compact SQLite snapshot
   (the whole database file, optionally zstd/gzip-compressed); the client
   derives row count/seq/format by opening it.  Used by
@@ -63,7 +63,7 @@ gzip is the fallback).
 
   Send ``"leave": true`` for an immediate clean-shutdown unregister.
 
-* ``POST /api/sync`` ``{"servers": [...], "since": <ts>, "format": 2}``
+* ``POST /api/sync`` ``{"servers": [...], "since": <ts>, "format": 3}``
   merges the upload, then returns rows with ``last_seen > since``. A
   missing ``format`` means a format-1 client; rows are converted to that
   client's schema and the reply reports ``"format": 2``::
@@ -74,6 +74,17 @@ gzip is the fallback).
   ``GET``, ``?since_seq=N``): every insert/change bumps the row's ``seq``,
   so paging ``seq > since_seq`` can never miss rows that arrived with old
   ``last_seen`` timestamps. Replies carry ``"has_seq": true``.
+
+* ``POST /api/history/sync``
+  ``{"history": [...], "players": [...], "history_since": N, "player_since": N}``
+  merges uploaded sightings/player events and returns new shared rows with
+  rowid cursors, so each client can page through the complete history::
+
+      {"history": [...], "players": [...],
+       "history_seq": N, "player_seq": N, "has_history": true}
+
+  A missing endpoint on older servers is treated as "history unsupported";
+  clients keep their rows unsynced for a later server upgrade.
 
 * ``GET  /api/notes/db``             -> consistent SQLite snapshot of the
   separate notes database (same auth/compression as ``/api/db``).
@@ -142,6 +153,8 @@ IP_PORT_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$")
 MAX_BODY_BYTES = 25 * 1024 * 1024
 MAX_SERVERS_PER_REQUEST = 20000
 MAX_SERVERS_PER_RESPONSE = 50000
+MAX_HISTORY_PER_REQUEST = 50000
+MAX_HISTORY_PER_RESPONSE = 50000
 SQLITE_MAX_INT = 2 ** 63 - 1     # larger ints overflow the sqlite3 binding
 MAX_TIMESTAMP = 1e18             # far beyond any real epoch, still finite
 TIMESTAMP_SKEW = 300
@@ -524,6 +537,70 @@ def _merge_player_lists(old, new):
         return None
 
 
+def _valid_ip_port(value):
+    ip_port = str(value or "").strip()
+    if not IP_PORT_RE.match(ip_port):
+        return None
+    try:
+        host, raw_port = ip_port.rsplit(":", 1)
+        ipaddress.ip_address(host)
+        port = int(raw_port)
+        if not 0 < port < 65536:
+            return None
+    except Exception:
+        return None
+    return ip_port
+
+
+def _history_count(value):
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, min(int(value), 1000000))
+    except Exception:
+        return None
+
+
+def sanitize_history_row(raw, now=None):
+    """Validate one uploaded sighting. Returns dict or None."""
+    if not isinstance(raw, dict):
+        return None
+    ip_port = _valid_ip_port(raw.get("ip_port"))
+    if not ip_port:
+        return None
+    try:
+        seen_at = float(raw.get("seen_at", 0) or 0)
+    except Exception:
+        return None
+    now = now or _utcnow()
+    if seen_at <= 0 or seen_at > now + 86400:
+        return None
+    return {
+        "ip_port": ip_port,
+        "seen_at": seen_at,
+        "players_online": _history_count(raw.get("players_online")),
+        "max_players": _history_count(raw.get("max_players")),
+    }
+
+
+def sanitize_player_event(raw, now=None):
+    """Validate one uploaded player sighting. Returns dict or None."""
+    if not isinstance(raw, dict):
+        return None
+    ip_port = _valid_ip_port(raw.get("ip_port"))
+    name = _clean_player_name(raw.get("player_name")).strip()
+    if not ip_port or not name:
+        return None
+    try:
+        seen_at = float(raw.get("seen_at", 0) or 0)
+    except Exception:
+        return None
+    now = now or _utcnow()
+    if seen_at <= 0 or seen_at > now + 86400:
+        return None
+    return {"ip_port": ip_port, "player_name": name, "seen_at": seen_at}
+
+
 def sanitize_row(raw):
     """Validate + normalize one incoming row. Returns dict or None."""
     if not isinstance(raw, dict):
@@ -627,8 +704,7 @@ def merge_row(con, row):
             row["first_seen"] or row["last_seen"] or fallback_now,
             row["last_seen"] or row["first_seen"] or fallback_now,
             row["players_online"], row["max_players"],
-            db_format.name_list(row["players_now"]),
-            db_format.name_list(row["players_ever"]))
+            db_format.name_list(row["players_now"]), (), synced=1)
         return True
     (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
      o_first, o_last, o_times, o_src, o_now, o_ever) = old
@@ -704,8 +780,7 @@ def merge_row(con, row):
     db_format.insert_range(
         con, row["ip_port"], row["first_seen"], row["last_seen"],
         row["players_online"], row["max_players"],
-        db_format.name_list(row["players_now"]),
-        db_format.name_list(row["players_ever"]))
+        db_format.name_list(row["players_now"]), (), synced=1)
     return True
 
 
@@ -1107,7 +1182,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/sync", "/api/continuous", "/api/notes/sync"):
+        if parsed.path not in ("/api/sync", "/api/continuous",
+                               "/api/notes/sync", "/api/history/sync"):
             self._send_json(404, {"error": "not found"})
             return
         body = self._read_body()
@@ -1203,14 +1279,99 @@ class Handler(BaseHTTPRequestHandler):
                                   "merged": merged, "total": total,
                                   "has_seq": True})
             return
+        if parsed.path == "/api/history/sync":
+            history_in = payload.get("history", [])
+            players_in = payload.get("players", [])
+            if (not isinstance(history_in, list)
+                    or len(history_in) > MAX_HISTORY_PER_REQUEST):
+                self._send_json(400, {"error": "bad 'history' list"})
+                return
+            if (not isinstance(players_in, list)
+                    or len(players_in) > MAX_HISTORY_PER_REQUEST):
+                self._send_json(400, {"error": "bad 'players' list"})
+                return
+            history_since = _clamp_seq(
+                payload.get("history_since", 0) or 0) or 0
+            player_since = _clamp_seq(
+                payload.get("player_since", 0) or 0) or 0
+            try:
+                limit = int(payload.get("limit", MAX_HISTORY_PER_RESPONSE)
+                            or MAX_HISTORY_PER_RESPONSE)
+            except Exception:
+                limit = MAX_HISTORY_PER_RESPONSE
+            limit = max(1, min(limit, MAX_HISTORY_PER_RESPONSE))
+            now = _utcnow()
+            merged_history = merged_players = 0
+            with _db_lock:
+                con = db_connect(self.server.db_path)
+                try:
+                    for raw_row in history_in:
+                        row = sanitize_history_row(raw_row, now)
+                        if row is None:
+                            continue
+                        cur = con.execute(
+                            "INSERT OR IGNORE INTO server_history"
+                            " (ip_port, seen_at, players_online, max_players,"
+                            " synced) VALUES (?, ?, ?, ?, 1)",
+                            (row["ip_port"], row["seen_at"],
+                             row["players_online"], row["max_players"]))
+                        if cur.rowcount:
+                            merged_history += 1
+                    for raw_row in players_in:
+                        row = sanitize_player_event(raw_row, now)
+                        if row is None:
+                            continue
+                        cur = con.execute(
+                            "INSERT OR IGNORE INTO player_history"
+                            " (ip_port, player_name, seen_at, synced)"
+                            " VALUES (?, ?, ?, 1)",
+                            (row["ip_port"], row["player_name"],
+                             row["seen_at"]))
+                        if cur.rowcount:
+                            merged_players += 1
+                    con.commit()
+                    con.row_factory = sqlite3.Row
+                    cur = con.execute(
+                        "SELECT rowid AS seq, ip_port, seen_at,"
+                        " players_online, max_players"
+                        " FROM server_history WHERE rowid > ?"
+                        " ORDER BY rowid ASC LIMIT ?",
+                        (history_since, limit))
+                    history_out = [dict(r) for r in cur.fetchall()]
+                    cur = con.execute(
+                        "SELECT rowid AS seq, ip_port, player_name, seen_at"
+                        " FROM player_history WHERE rowid > ?"
+                        " ORDER BY rowid ASC LIMIT ?",
+                        (player_since, limit))
+                    players_out = [dict(r) for r in cur.fetchall()]
+                    history_seq = max(
+                        [history_since] +
+                        [int(r.get("seq", 0) or 0) for r in history_out])
+                    player_seq = max(
+                        [player_since] +
+                        [int(r.get("seq", 0) or 0) for r in players_out])
+                finally:
+                    con.close()
+            self._send_json(200, {
+                "history": history_out,
+                "players": players_out,
+                "history_seq": history_seq,
+                "player_seq": player_seq,
+                "merged_history": merged_history,
+                "merged_players": merged_players,
+                "has_history": True,
+                "now": _utcnow(),
+            })
+            return
         # A missing format means a legacy client (format 1); new clients
         # send 2. Rows are converted at this boundary either way.
         try:
             client_format = int(payload.get("format", 1) or 1)
         except Exception:
             client_format = 1
-        if client_format not in (1, 2):
-            client_format = 1
+        # Format 2 and 3 share the row wire shape; anything unknown is a
+        # legacy caller and gets the format-1 compatibility payload.
+        client_format = 2 if client_format >= 2 else 1
         incoming = payload.get("servers", [])
         if not isinstance(incoming, list) or len(incoming) > MAX_SERVERS_PER_REQUEST:
             self._send_json(400, {"error": "bad 'servers' list"})

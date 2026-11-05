@@ -1164,6 +1164,9 @@ def _ensure_server_db():
 NETDB_CONFIG_FILE = "netdb.json"
 NETDB_TIMEOUT = 30
 NETDB_MAX_UPLOAD = 20000
+NETDB_MAX_HISTORY_UPLOAD = 20000
+NETDB_MAX_PLAYER_UPLOAD = 50000
+NETDB_HISTORY_PAGE = 50000
 # Matches dbserver.py's MAX_SERVERS_PER_RESPONSE: one /api/sync reply carries
 # at most this many rows, so big first-sync downloads page through it.
 NETDB_PAGE_SIZE = 50000
@@ -1213,17 +1216,28 @@ def netdb_load_config():
         last_notes_seq = int(data.get("last_notes_seq", 0) or 0)
     except Exception:
         last_notes_seq = 0
+    try:
+        last_history_seq = int(data.get("last_history_seq", 0) or 0)
+    except Exception:
+        last_history_seq = 0
+    try:
+        last_player_seq = int(data.get("last_player_seq", 0) or 0)
+    except Exception:
+        last_player_seq = 0
     return {
         "url": str(data.get("url", "") or "").strip().rstrip("/"),
         "token": str(data.get("token", "") or "").strip(),
         "last_sync": float(data.get("last_sync", 0) or 0),
         "last_seq": max(0, last_seq),
         "last_notes_seq": max(0, last_notes_seq),
+        "last_history_seq": max(0, last_history_seq),
+        "last_player_seq": max(0, last_player_seq),
     }
 
 
 def netdb_save_config(url=None, token=None, last_sync=None, last_seq=None,
-                      last_notes_seq=None):
+                      last_notes_seq=None, last_history_seq=None,
+                      last_player_seq=None):
     """Update netdb.json; omitted fields keep their current values."""
     cfg = netdb_load_config()
     if url is not None:
@@ -1236,6 +1250,10 @@ def netdb_save_config(url=None, token=None, last_sync=None, last_seq=None,
         cfg["last_seq"] = int(last_seq or 0)
     if last_notes_seq is not None:
         cfg["last_notes_seq"] = int(last_notes_seq or 0)
+    if last_history_seq is not None:
+        cfg["last_history_seq"] = int(last_history_seq or 0)
+    if last_player_seq is not None:
+        cfg["last_player_seq"] = int(last_player_seq or 0)
     try:
         with open(NETDB_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
@@ -1386,6 +1404,182 @@ def netdb_mark_synced(ip_ports, watermark):
             con.close()
 
 
+def netdb_collect_history_dirty(history_limit=NETDB_MAX_HISTORY_UPLOAD,
+                                player_limit=NETDB_MAX_PLAYER_UPLOAD):
+    """Local history rows that have not been uploaded to the shared DB."""
+    _ensure_server_db()
+    import sqlite3
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            history = [dict(r) for r in con.execute(
+                "SELECT ip_port, seen_at, players_online, max_players"
+                " FROM server_history WHERE synced=0"
+                " ORDER BY seen_at ASC, ip_port ASC LIMIT ?",
+                (max(1, int(history_limit)),))]
+            players = [dict(r) for r in con.execute(
+                "SELECT ip_port, player_name, seen_at"
+                " FROM player_history WHERE synced=0"
+                " ORDER BY seen_at ASC, ip_port ASC LIMIT ?",
+                (max(1, int(player_limit)),))]
+            return history, players
+        finally:
+            con.close()
+
+
+def netdb_mark_history_synced(history_rows, player_rows):
+    """Mark successfully uploaded history rows so they are not sent again."""
+    if not history_rows and not player_rows:
+        return
+    _ensure_server_db()
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            if history_rows:
+                con.executemany(
+                    "UPDATE server_history SET synced=1"
+                    " WHERE ip_port=? AND seen_at=?",
+                    [(r["ip_port"], r["seen_at"]) for r in history_rows])
+            if player_rows:
+                con.executemany(
+                    "UPDATE player_history SET synced=1"
+                    " WHERE ip_port=? AND player_name=? AND seen_at=?",
+                    [(r["ip_port"], r["player_name"], r["seen_at"])
+                     for r in player_rows])
+            con.commit()
+        finally:
+            con.close()
+
+
+def netdb_merge_history(history_rows, player_rows):
+    """Store downloaded history as already-synced local rows."""
+    if not history_rows and not player_rows:
+        return 0, 0
+    _ensure_server_db()
+    history_values = []
+    for raw in history_rows:
+        if not isinstance(raw, dict):
+            continue
+        ip_port = strict_ip_port(raw.get("ip_port"))
+        if not ip_port:
+            continue
+        try:
+            seen_at = float(raw.get("seen_at", 0) or 0)
+        except Exception:
+            continue
+        if seen_at <= 0:
+            continue
+        try:
+            online = raw.get("players_online")
+            online = None if online in (None, "") else max(0, int(online))
+            maximum = raw.get("max_players")
+            maximum = None if maximum in (None, "") else max(0, int(maximum))
+        except Exception:
+            online = maximum = None
+        history_values.append((ip_port, seen_at, online, maximum))
+    player_values = []
+    for raw in player_rows:
+        if not isinstance(raw, dict):
+            continue
+        ip_port = strict_ip_port(raw.get("ip_port"))
+        name = str(raw.get("player_name", "") or "").strip()
+        if not ip_port or not name:
+            continue
+        try:
+            seen_at = float(raw.get("seen_at", 0) or 0)
+        except Exception:
+            continue
+        if seen_at > 0:
+            player_values.append((ip_port, name[:32], seen_at))
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            if history_values:
+                con.executemany(
+                    "INSERT OR IGNORE INTO server_history"
+                    " (ip_port, seen_at, players_online, max_players, synced)"
+                    " VALUES (?, ?, ?, ?, 1)", history_values)
+            if player_values:
+                con.executemany(
+                    "INSERT OR IGNORE INTO player_history"
+                    " (ip_port, player_name, seen_at, synced)"
+                    " VALUES (?, ?, ?, 1)", player_values)
+            con.commit()
+        finally:
+            con.close()
+    return len(history_values), len(player_values)
+
+
+def netdb_sync_history(url, token, timeout=None):
+    """Upload unsynced local history and page in new shared history.
+
+    Uses rowid cursors on the server, so this is incremental.  Old servers
+    without /api/history/sync simply return unsupported and keep local rows
+    unsynced for a later server upgrade.
+    """
+    url = (url or "").strip().rstrip("/")
+    token = (token or "").strip()
+    if not url or not token:
+        raise ConnectionError("enter the shared-DB URL and token first")
+    cfg = netdb_load_config()
+    history_since = cfg.get("last_history_seq", 0) or 0
+    player_since = cfg.get("last_player_seq", 0) or 0
+    summary = {
+        "history_uploaded": 0,
+        "history_downloaded": 0,
+        "player_events_uploaded": 0,
+        "player_events_downloaded": 0,
+        "history_unsupported": False,
+    }
+    try:
+        for _ in range(NETDB_MAX_ROUNDS):
+            history_up, players_up = netdb_collect_history_dirty()
+            payload = {
+                "history": history_up,
+                "players": players_up,
+                "history_since": history_since,
+                "player_since": player_since,
+                "limit": NETDB_HISTORY_PAGE,
+                "format": db_format.CURRENT_FORMAT,
+            }
+            resp = _netdb_request(url + "/api/history/sync", token,
+                                  method="POST", payload=payload,
+                                  timeout=timeout)
+            if not isinstance(resp, dict) or not resp.get("has_history"):
+                summary["history_unsupported"] = True
+                break
+            netdb_mark_history_synced(history_up, players_up)
+            history_down = [r for r in (resp.get("history") or [])
+                            if isinstance(r, dict)]
+            players_down = [r for r in (resp.get("players") or [])
+                            if isinstance(r, dict)]
+            netdb_merge_history(history_down, players_down)
+            try:
+                history_since = max(history_since,
+                                    int(resp.get("history_seq", 0) or 0))
+            except Exception:
+                pass
+            try:
+                player_since = max(player_since,
+                                   int(resp.get("player_seq", 0) or 0))
+            except Exception:
+                pass
+            netdb_save_config(last_history_seq=history_since,
+                              last_player_seq=player_since)
+            summary["history_uploaded"] += len(history_up)
+            summary["player_events_uploaded"] += len(players_up)
+            summary["history_downloaded"] += len(history_down)
+            summary["player_events_downloaded"] += len(players_down)
+            if (not history_up and not players_up
+                    and len(history_down) < NETDB_HISTORY_PAGE
+                    and len(players_down) < NETDB_HISTORY_PAGE):
+                break
+    except NetdbEndpointUnsupported:
+        summary["history_unsupported"] = True
+    return summary
+
+
 def netdb_merge_remote(servers, upload_watermark=None):
     """Merge downloaded rows into the local DB. Returns (inserted, updated).
 
@@ -1460,7 +1654,7 @@ def netdb_merge_remote(servers, upload_watermark=None):
                          _encode_player_list(r_ever)))
                     db_format.insert_range(
                         con, ip_port, r_first, r_last, r_online, r_maximum,
-                        r_now, r_ever)
+                        r_now, (), synced=1)
                     if cur.rowcount:
                         inserted += 1
                     else:
@@ -1541,7 +1735,7 @@ def netdb_merge_remote(servers, upload_watermark=None):
                      _encode_player_list(ever_names), ip_port))
                 db_format.insert_range(
                     con, ip_port, r_first, r_last, r_online, r_maximum,
-                    r_now, r_ever)
+                    r_now, (), synced=1)
                 updated += 1
             con.commit()
         finally:
@@ -1688,9 +1882,16 @@ def _merge_previous_history(con):
                 " WHERE type='table' AND name=?", (table,)).fetchone()
             if not found:
                 continue
+            try:
+                prev_cols = {str(row[1]) for row in con.execute(
+                    f"PRAGMA previous.table_info({table})")}
+            except Exception:
+                prev_cols = set()
+            source = columns + (", synced" if "synced" in prev_cols
+                                else ", 0")
             con.execute(
-                f"INSERT OR IGNORE INTO {table} ({columns})"
-                f" SELECT {columns} FROM previous.{table}"
+                f"INSERT OR IGNORE INTO main.{table} ({columns}, synced)"
+                f" SELECT {source} FROM previous.{table}"
                 " WHERE ip_port IN (SELECT ip_port FROM main.servers)")
     finally:
         try:
@@ -1706,6 +1907,9 @@ def _prepare_downloaded_db(path):
     try:
         con.row_factory = sqlite3.Row
         db_format.ensure_format(con)
+        # Everything in a downloaded DB already came from the shared server.
+        con.execute("UPDATE server_history SET synced=1")
+        con.execute("UPDATE player_history SET synced=1")
         base = db_format.base_table(con)
         cols = {str(r[1]) for r in con.execute(f"PRAGMA table_info({base})")}
         if not cols:
@@ -1976,7 +2180,8 @@ def netdb_replace_all(rows):
                      _encode_player_list(ever_names)),
                 )
                 db_format.insert_range(con, ip_port, first_seen, last_seen,
-                                       online, maximum, now_names, ever_names)
+                                       online, maximum, now_names, (),
+                                       synced=1)
                 inserted += 1
             con.commit()
         except Exception:
@@ -2142,6 +2347,10 @@ def netdb_sync_once(url, token, timeout=None):
                "inserted": inserted, "updated": updated,
                "total_remote": total_remote,
                "now": now}
+    try:
+        summary.update(netdb_sync_history(url, token, timeout=timeout))
+    except Exception as exc:
+        summary["history_error"] = str(exc)
     try:
         summary.update(netdb_notes_sync_once(url, token, timeout=timeout))
     except Exception as exc:

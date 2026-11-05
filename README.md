@@ -188,9 +188,11 @@ Each sync uploads the servers this client has seen since its last sync and
 downloads everything other clients added, merging first-seen (oldest wins)
 and last-seen/MOTD/players/version (newest wins) on both sides. Player lists
 merge too: currently-online follows the newer sighting, ever-seen is the
-union of both sides. A cracked verdict only changes when a client runs an
-explicit cracked or whitelist login probe; ordinary re-sights never
-overwrite it.
+union of both sides. Per-sighting history and player samples are uploaded
+separately, so the shared DB and every client's graph eventually include all
+sightings from every node, not just the aggregate endpoints. A cracked
+verdict only changes when a client runs an explicit cracked or whitelist
+login probe; ordinary re-sights never overwrite it.
 
 Full downloads use `GET /api/db`: the server makes a consistent compact
 snapshot with `VACUUM INTO` and streams the SQLite file itself, compressed
@@ -600,13 +602,18 @@ Existing local and server databases are converted once on startup, then
 Both local and shared databases have two history tables:
 `server_history` (one row per sighting) and `player_history` (one row per
 sampled player per sighting). The viewer JSON is capped at 5000 sighting
-points and 20000 player events while storage keeps every row. Sync sends
-first/last endpoints rather than every sighting; the shared DB merges those
-endpoints into its own history.
+points and 20000 player events while storage keeps every row.
 
-Sync clients send `"format": 2` in `/api/sync`; a missing field means a
+History is synced incrementally as well: local rows carry a `synced` flag,
+and `/api/history/sync` uploads unsynced sightings/player events and pages
+new shared rows back using rowid cursors stored in `netdb.json`
+(`last_history_seq`, `last_player_seq`). The server row sync still sends
+first/last endpoints, so older clients keep working; newer clients fill in
+the full per-sighting history.
+
+Sync clients send `"format": 3` in `/api/sync`; a missing field means a
 format-1 client. The server converts rows at the sync boundary, so old
-clients can still sync against a format-2 server and new clients can sync
+clients can still sync against a format-3 server and new clients can sync
 against an old server. The conversion is per row and does not require a
 full-table pass.
 

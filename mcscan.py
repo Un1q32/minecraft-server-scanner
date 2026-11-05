@@ -191,10 +191,14 @@ def cmd_sync():
           f"inserted={summary.get('inserted', 0)} "
           f"updated={summary.get('updated', 0)} "
           f"total_remote={summary.get('total_remote', 0)} "
+          f"history_uploaded={summary.get('history_uploaded', 0)} "
+          f"history_downloaded={summary.get('history_downloaded', 0)} "
           f"notes_uploaded={summary.get('notes_uploaded', 0)} "
           f"notes_downloaded={summary.get('notes_downloaded', 0)} "
           f"notes_inserted={summary.get('notes_inserted', 0)} "
           f"notes_updated={summary.get('notes_updated', 0)}")
+    if summary.get("history_unsupported"):
+        print("history sync not supported by this server; local history kept.")
     if summary.get("notes_unsupported"):
         print("notes sync not supported by this server; skipped.")
     if summary.get("notes_error"):
@@ -703,7 +707,9 @@ def cmd_scan(args):
                   f"uploaded={summary.get('uploaded', 0)} "
                   f"downloaded={summary.get('downloaded', 0)} "
                   f"inserted={summary.get('inserted', 0)} "
-                  f"updated={summary.get('updated', 0)}")
+                  f"updated={summary.get('updated', 0)} "
+                  f"history_uploaded={summary.get('history_uploaded', 0)} "
+                  f"history_downloaded={summary.get('history_downloaded', 0)}")
         except Exception as exc:
             print(f"sync failed (results are kept locally): {exc}")
     else:

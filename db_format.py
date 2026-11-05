@@ -52,16 +52,22 @@ HISTORY_SCHEMA = (
     " seen_at REAL NOT NULL,"
     " players_online INTEGER,"
     " max_players INTEGER,"
+    " synced INTEGER DEFAULT 0,"
     " PRIMARY KEY (ip_port, seen_at)"
     ")",
     "CREATE TABLE IF NOT EXISTS player_history ("
     " ip_port TEXT NOT NULL,"
     " player_name TEXT NOT NULL,"
     " seen_at REAL NOT NULL,"
+    " synced INTEGER DEFAULT 0,"
     " PRIMARY KEY (ip_port, player_name, seen_at)"
     ")",
     "CREATE INDEX IF NOT EXISTS idx_player_history_ip_time"
     " ON player_history(ip_port, seen_at ASC)",
+    "CREATE INDEX IF NOT EXISTS idx_server_history_synced"
+    " ON server_history(synced, seen_at ASC)",
+    "CREATE INDEX IF NOT EXISTS idx_player_history_synced"
+    " ON player_history(synced, seen_at ASC)",
 )
 
 
@@ -69,6 +75,14 @@ def init_history_schema(con: sqlite3.Connection):
     """Create the per-sighting tables used by the viewer graphs."""
     for statement in HISTORY_SCHEMA:
         con.execute(statement)
+    # Format 3 originally shipped without the sync flag.  Existing rows
+    # become unsynced so the next sync uploads the local history once.
+    for table in ("server_history", "player_history"):
+        columns = {str(row[1]) for row in
+                   con.execute(f"PRAGMA table_info({table})")}
+        if "synced" not in columns:
+            con.execute(f"ALTER TABLE {table}"
+                        " ADD COLUMN synced INTEGER DEFAULT 0")
 
 
 def object_type(con: sqlite3.Connection, name: str):
@@ -157,19 +171,20 @@ def _name_list(value) -> list[str]:
 
 
 def _insert_history(con, ip_port, seen_at, players_online, max_players,
-                    names=()):
+                    names=(), synced=0):
     if not ip_port or seen_at <= 0:
         return
     con.execute(
         "INSERT OR IGNORE INTO server_history"
-        " (ip_port, seen_at, players_online, max_players)"
-        " VALUES (?, ?, ?, ?)",
-        (ip_port, seen_at, players_online, max_players))
-    rows = [(ip_port, name, seen_at) for name in names]
+        " (ip_port, seen_at, players_online, max_players, synced)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (ip_port, seen_at, players_online, max_players, synced))
+    rows = [(ip_port, name, seen_at, synced) for name in names]
     if rows:
         con.executemany(
             "INSERT OR IGNORE INTO player_history"
-            " (ip_port, player_name, seen_at) VALUES (?, ?, ?)", rows)
+            " (ip_port, player_name, seen_at, synced) VALUES (?, ?, ?, ?)",
+            rows)
 
 
 def name_list(value) -> list[str]:
@@ -178,13 +193,14 @@ def name_list(value) -> list[str]:
 
 
 def insert_history(con, ip_port, seen_at, players_online=None,
-                   max_players=None, names=()):
+                   max_players=None, names=(), synced=0):
     """Insert one sighting (and its player samples) with duplicate safety."""
-    _insert_history(con, ip_port, seen_at, players_online, max_players, names)
+    _insert_history(con, ip_port, seen_at, players_online, max_players, names,
+                    synced)
 
 
 def insert_range(con, ip_port, first_seen, last_seen, players_online,
-                 max_players, now_names=(), ever_names=()):
+                 max_players, now_names=(), ever_names=(), synced=0):
     """Insert the two endpoints of an aggregated first/last-seen record.
 
     Used by sync and by the format migration: the current roster/count
@@ -202,14 +218,17 @@ def insert_range(con, ip_port, first_seen, last_seen, players_online,
         last_seen = first_seen
     if abs(last_seen - first_seen) < 1e-9:
         _insert_history(con, ip_port, first_seen, players_online,
-                        max_players, ever_names)
-        _insert_history(con, ip_port, first_seen, None, None, now_names)
+                        max_players, ever_names, synced)
+        _insert_history(con, ip_port, first_seen, None, None, now_names,
+                        synced)
     else:
-        _insert_history(con, ip_port, first_seen, None, None, ever_names)
+        _insert_history(con, ip_port, first_seen, None, None, ever_names,
+                        synced)
         _insert_history(con, ip_port, last_seen, players_online,
-                        max_players, now_names)
+                        max_players, now_names, synced)
         if not ever_names:
-            _insert_history(con, ip_port, last_seen, None, None, now_names)
+            _insert_history(con, ip_port, last_seen, None, None, now_names,
+                            synced)
 
 
 def _populate_history_from_columns(con: sqlite3.Connection):
