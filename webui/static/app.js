@@ -57,6 +57,7 @@ const serverChart = document.getElementById("serverChart");
 const playerChart = document.getElementById("playerChart");
 const historyEmpty = document.getElementById("historyEmpty");
 const historyTip = document.getElementById("historyTip");
+const resetZoomBtn = document.getElementById("resetZoomBtn");
 
 const CHART_COLORS = [
   "#6fa8dc", "#93c47d", "#e6b85c", "#e07b8f", "#b4a7d6",
@@ -77,6 +78,11 @@ let historyData = null;
 let serverGeom = null;
 let playerGeom = null;
 let lastHistoryWidth = 0;
+let chartViewStart = 0;
+let chartViewEnd = 0;
+let chartZoomed = false;
+let chartDrag = null;
+let chartRenderPending = false;
 
 // ------------------------------------------------------------------ helpers
 
@@ -190,6 +196,11 @@ function hideHistory() {
   serverGeom = null;
   playerGeom = null;
   historyData = null;
+  chartViewStart = 0;
+  chartViewEnd = 0;
+  chartZoomed = false;
+  chartDrag = null;
+  resetZoomBtn.hidden = true;
 }
 
 function chartTime(epoch) {
@@ -247,60 +258,109 @@ function historyRange(points, players) {
   return [lo, hi];
 }
 
-function historyTimes(points) {
-  return points.map((point) => Number(point.t) || 0);
+function fullChartRange() {
+  return historyRange((historyData && historyData.points) || [],
+                      (historyData && historyData.players) || []);
 }
 
-function uniqueHistoryTimes(points, players) {
-  const seen = new Map();
-  const out = [];
-  const add = (value) => {
-    const t = Number(value) || 0;
-    if (t <= 0 || seen.has(t)) {
-      return;
-    }
-    seen.set(t, true);
-    out.push(t);
-  };
-  for (const point of points) {
-    add(point.t);
+function currentChartRange() {
+  const full = fullChartRange();
+  let start = chartViewStart;
+  let end = chartViewEnd;
+  if (!start || !end || end <= start) {
+    return full;
   }
-  for (const player of players) {
-    for (const value of player.times || []) {
-      add(value);
-    }
+  if (start < full[0]) {
+    start = full[0];
   }
-  out.sort((a, b) => a - b);
-  return out;
+  if (end > full[1]) {
+    end = full[1];
+  }
+  if (end <= start) {
+    return full;
+  }
+  return [start, end];
 }
 
-// Time-proportional x positions with a small minimum gap, so quick rescans
-// remain distinct instead of collapsing into a single pixel.
-function chartPositions(times, left, pw, t0, t1) {
-  const out = [];
-  const n = times.length;
-  if (!n) {
-    return out;
+function scheduleChartRender() {
+  if (chartRenderPending) {
+    return;
   }
-  const span = Math.max(1, t1 - t0);
-  const minGap = Math.min(4, pw / Math.max(1, n - 1));
-  let prev = -1e12;
-  for (const value of times) {
-    let x = left + (((Number(value) || t0) - t0) / span) * pw;
-    if (x < prev + minGap) {
-      x = prev + minGap;
+  chartRenderPending = true;
+  requestAnimationFrame(() => {
+    chartRenderPending = false;
+    renderHistory();
+  });
+}
+
+function setChartView(start, end) {
+  const full = fullChartRange();
+  if (!full[0] && !full[1]) {
+    return;
+  }
+  let span = Math.max(0.001, end - start);
+  const fullSpan = Math.max(0.001, full[1] - full[0]);
+  if (span >= fullSpan * 0.999) {
+    chartViewStart = full[0];
+    chartViewEnd = full[1];
+    chartZoomed = false;
+  } else {
+    if (start < full[0]) {
+      start = full[0];
+      end = start + span;
     }
-    out.push(x);
-    prev = x;
-  }
-  const last = out[n - 1];
-  if (last > left + pw) {
-    const scale = pw / Math.max(1, last - left);
-    for (let i = 0; i < n; i += 1) {
-      out[i] = left + (out[i] - left) * scale;
+    if (end > full[1]) {
+      end = full[1];
+      start = end - span;
     }
+    if (start < full[0]) {
+      start = full[0];
+      end = start + span;
+    }
+    chartViewStart = start;
+    chartViewEnd = end;
+    chartZoomed = true;
   }
-  return out;
+  scheduleChartRender();
+}
+
+function resetChartView() {
+  const full = fullChartRange();
+  chartViewStart = full[0];
+  chartViewEnd = full[1];
+  chartZoomed = false;
+  renderHistory();
+}
+
+function zoomChartAt(deltaY, x, width, left, right) {
+  const full = fullChartRange();
+  if ((!full[0] && !full[1]) || !deltaY) {
+    return;
+  }
+  const view = currentChartRange();
+  const plot = Math.max(1, width - left - right);
+  const fraction = Math.max(0, Math.min(1, (x - left) / plot));
+  const span = Math.max(0.001, view[1] - view[0]);
+  const fullSpan = Math.max(0.001, full[1] - full[0]);
+  const steps = Math.max(0.1, Math.min(4, Math.abs(deltaY) / 120));
+  const factor = deltaY < 0 ? Math.pow(0.5, steps) : Math.pow(2.0, steps);
+  const minSpan = Math.min(fullSpan, 0.5);
+  let newSpan = span * factor;
+  newSpan = Math.max(minSpan, Math.min(fullSpan, newSpan));
+  const anchor = view[0] + fraction * span;
+  const newStart = anchor - fraction * newSpan;
+  setChartView(newStart, newStart + newSpan);
+}
+
+function panChartPixels(dx, width, left, right) {
+  if (!chartZoomed) {
+    return;
+  }
+  const view = currentChartRange();
+  const span = Math.max(0.001, view[1] - view[0]);
+  const plot = Math.max(1, width - left - right);
+  const delta = (-dx / plot) * span;
+  setChartView(view[0] + delta, view[1] + delta);
 }
 
 function chartSetup(canvas, height) {
@@ -353,11 +413,37 @@ function drawServerChart(points) {
   const bottom = 22;
   const pw = Math.max(1, w - left - right);
   const ph = Math.max(1, h - top - bottom);
-  const [t0, t1] = historyRange(points, []);
+  const [t0, t1] = currentChartRange();
   const span = Math.max(1, t1 - t0);
-  const xs = chartPositions(historyTimes(points), left, pw, t0, t1);
-  const peak = peakPlayers(points);
-  const counted = points.filter((p) => p.p !== null && p.p !== undefined).length;
+  const globalPeak = peakPlayers(points);
+  let peak = 1;
+  let counted = 0;
+  let visible = 0;
+  for (const point of points) {
+    const t = Number(point.t) || 0;
+    if (t < t0 || t > t1) {
+      continue;
+    }
+    visible += 1;
+    if (point.p !== null && point.p !== undefined) {
+      peak = Math.max(peak, Number(point.p) || 0);
+      counted += 1;
+    }
+  }
+  if (!counted) {
+    for (const point of points) {
+      const t = Number(point.t) || 0;
+      if (t < t0 || t > t1) {
+        continue;
+      }
+      if (point.m !== null && point.m !== undefined) {
+        peak = Math.max(peak, Number(point.m) || 0);
+      }
+    }
+  }
+  if (!counted) {
+    peak = Math.max(peak, globalPeak);
+  }
   const mid = "rgba(128,128,128,0.4)";
 
   ctx.font = "11px ui-monospace, monospace";
@@ -378,12 +464,18 @@ function drawServerChart(points) {
   }
   ctx.globalAlpha = 1;
 
+  const xAt = (point) => left + (((Number(point.t) || t0) - t0) / span) * pw;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(left, top, pw, ph + 8);
+  ctx.clip();
+
   let drawing = false;
   ctx.strokeStyle = CHART_COLORS[0];
   ctx.lineWidth = 1.5;
   ctx.beginPath();
-  for (let index = 0; index < points.length; index += 1) {
-    const point = points[index];
+  for (const point of points) {
     if (point.p === null || point.p === undefined) {
       if (drawing) {
         ctx.stroke();
@@ -392,7 +484,7 @@ function drawServerChart(points) {
       }
       continue;
     }
-    const x = xs[index];
+    const x = xAt(point);
     const y = top + ph - Math.min(1, (Number(point.p) || 0) / peak) * ph;
     if (!drawing) {
       ctx.moveTo(x, y);
@@ -405,14 +497,14 @@ function drawServerChart(points) {
     ctx.stroke();
   }
 
+  // Every sighting is a dot and a tick.  Drawing all of them matters when
+  // zoomed in: the whole point is to see the dense rescans.
   ctx.fillStyle = CHART_COLORS[0];
-  const step = Math.max(1, Math.floor(points.length / 600));
-  for (let i = 0; i < points.length; i += step) {
-    const point = points[i];
+  for (const point of points) {
     if (point.p === null || point.p === undefined) {
       continue;
     }
-    const x = xs[i];
+    const x = xAt(point);
     const y = top + ph - Math.min(1, (Number(point.p) || 0) / peak) * ph;
     ctx.beginPath();
     ctx.arc(x, y, 1.6, 0, Math.PI * 2);
@@ -423,15 +515,15 @@ function drawServerChart(points) {
   ctx.strokeStyle = "#7aa6cc";
   ctx.globalAlpha = 0.8;
   ctx.lineWidth = 1;
-  const tickStep = Math.max(1, Math.floor(points.length / 800));
-  for (let i = 0; i < points.length; i += tickStep) {
-    const x = xs[i];
+  for (const point of points) {
+    const x = xAt(point);
     ctx.beginPath();
     ctx.moveTo(x + 0.5, top + ph + 2);
     ctx.lineTo(x + 0.5, top + ph + 6);
     ctx.stroke();
   }
   ctx.globalAlpha = 1;
+  ctx.restore();
 
   ctx.fillStyle = text;
   ctx.globalAlpha = 0.7;
@@ -440,7 +532,14 @@ function drawServerChart(points) {
   ctx.textAlign = "right";
   ctx.fillText(chartTime(t1), left + pw, h - 9);
   ctx.globalAlpha = 1;
-  if (!counted) {
+  if (!visible) {
+    ctx.fillStyle = text;
+    ctx.globalAlpha = 0.6;
+    ctx.textAlign = "center";
+    ctx.fillText("No sightings in this zoom window",
+                 left + pw / 2, top + ph / 2);
+    ctx.globalAlpha = 1;
+  } else if (!counted) {
     ctx.fillStyle = text;
     ctx.globalAlpha = 0.6;
     ctx.textAlign = "center";
@@ -449,7 +548,7 @@ function drawServerChart(points) {
     ctx.globalAlpha = 1;
   }
 
-  serverGeom = { left, top, pw, ph, t0, span, points, xs };
+  serverGeom = { left, top, pw, ph, t0, span, points };
 }
 
 function drawPlayerChart(players) {
@@ -468,15 +567,8 @@ function drawPlayerChart(players) {
   const top = 6;
   const rowHeight = 13;
   const pw = Math.max(1, w - left - right);
-  const points = (historyData && historyData.points) || [];
-  const [t0, t1] = historyRange(points, players);
+  const [t0, t1] = currentChartRange();
   const span = Math.max(1, t1 - t0);
-  const uniqueTimes = uniqueHistoryTimes(points, players);
-  const xs = chartPositions(uniqueTimes, left, pw, t0, t1);
-  const xByTime = new Map();
-  for (let i = 0; i < uniqueTimes.length; i += 1) {
-    xByTime.set(uniqueTimes[i], xs[i]);
-  }
   const mid = "rgba(128,128,128,0.35)";
   const rows = [];
 
@@ -504,21 +596,21 @@ function drawPlayerChart(players) {
     ctx.globalAlpha = 1;
 
     const times = (player.times || []).map(Number);
-    const eventXs = times.map((t) => {
-      const known = xByTime.get(t);
-      if (known !== undefined) {
-        return known;
-      }
-      return left + (((t || t0) - t0) / span) * pw;
-    });
+    const eventXs = times.map(
+      (t) => left + (((t || t0) - t0) / span) * pw,
+    );
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(left, top, pw, h - top - 8);
+    ctx.clip();
     ctx.fillStyle = color;
-    const eventStep = Math.max(1, Math.floor(times.length / 400));
-    for (let k = 0; k < times.length; k += eventStep) {
+    for (let k = 0; k < times.length; k += 1) {
       const x = eventXs[k];
       ctx.beginPath();
       ctx.arc(x, centerY, 1.7, 0, Math.PI * 2);
       ctx.fill();
     }
+    ctx.restore();
     rows.push({ player, centerY, times, xs: eventXs });
   }
 
@@ -539,6 +631,7 @@ function renderHistory() {
   }
   const points = historyData.points || [];
   const players = historyData.players || [];
+  resetZoomBtn.hidden = !chartZoomed;
   if (!points.length && !players.length) {
     historyEl.hidden = false;
     serverTitle.hidden = true;
@@ -558,7 +651,8 @@ function renderHistory() {
     serverTitle.hidden = false;
     serverChart.hidden = false;
     const peak = peakPlayers(points);
-    serverTitle.textContent = `SIGHTINGS ${points.length} • PEAK ${peak}`;
+    serverTitle.textContent = `SIGHTINGS ${points.length} • PEAK ${peak}` +
+                              (chartZoomed ? " • ZOOMED" : "");
     drawServerChart(points);
   } else {
     serverTitle.hidden = true;
@@ -569,7 +663,8 @@ function renderHistory() {
   if (players.length) {
     playerTitle.hidden = false;
     playerChart.hidden = false;
-    playerTitle.textContent = `PLAYER ACTIVITY • ${players.length} SEEN`;
+    playerTitle.textContent = `PLAYER ACTIVITY • ${players.length} SEEN` +
+                              (chartZoomed ? " • ZOOMED" : "");
     drawPlayerChart(players);
   } else {
     playerTitle.hidden = true;
@@ -595,6 +690,11 @@ function showHistory(row) {
   if (!Array.isArray(historyData.players)) {
     historyData.players = [];
   }
+  const full = fullChartRange();
+  chartViewStart = full[0];
+  chartViewEnd = full[1];
+  chartZoomed = false;
+  chartDrag = null;
   renderHistory();
 }
 
@@ -612,6 +712,10 @@ function showTip(text, clientX, clientY) {
 }
 
 serverChart.addEventListener("mousemove", (event) => {
+  if (chartDrag) {
+    hideTip();
+    return;
+  }
   if (!serverGeom || !serverGeom.points.length) {
     hideTip();
     return;
@@ -623,12 +727,13 @@ serverChart.addEventListener("mousemove", (event) => {
     hideTip();
     return;
   }
+  const target = geom.t0 + ((x - geom.left) / geom.pw) * geom.span;
   let best = null;
   let bestDistance = Infinity;
-  for (let i = 0; i < geom.points.length; i += 1) {
-    const distance = Math.abs(geom.xs[i] - x);
+  for (const point of geom.points) {
+    const distance = Math.abs((Number(point.t) || 0) - target);
     if (distance < bestDistance) {
-      best = geom.points[i];
+      best = point;
       bestDistance = distance;
     }
   }
@@ -643,6 +748,10 @@ serverChart.addEventListener("mousemove", (event) => {
 });
 
 playerChart.addEventListener("mousemove", (event) => {
+  if (chartDrag) {
+    hideTip();
+    return;
+  }
   if (!playerGeom || !playerGeom.rows.length) {
     hideTip();
     return;
@@ -661,21 +770,88 @@ playerChart.addEventListener("mousemove", (event) => {
     hideTip();
     return;
   }
-  let bestIndex = 0;
-  let bestDistance = Infinity;
-  for (let i = 0; i < row.xs.length; i += 1) {
-    const distance = Math.abs(row.xs[i] - x);
-    if (distance < bestDistance) {
-      bestIndex = i;
-      bestDistance = distance;
+  const target = playerGeom.t0 + ((x - playerGeom.left) / playerGeom.pw) *
+                 playerGeom.span;
+  let best = row.times[0];
+  for (const time of row.times) {
+    if (Math.abs(time - target) < Math.abs(best - target)) {
+      best = time;
     }
   }
-  showTip(`${row.player.name} — ${chartTime(row.times[bestIndex])}`,
+  showTip(`${row.player.name} — ${chartTime(best)}`,
           event.clientX, event.clientY);
 });
 
 serverChart.addEventListener("mouseleave", hideTip);
 playerChart.addEventListener("mouseleave", hideTip);
+
+function beginChartDrag(event, canvas, left, right) {
+  if (event.pointerType === "mouse" && event.button !== 0) {
+    return;
+  }
+  chartDrag = {
+    pointerId: event.pointerId,
+    lastX: event.clientX,
+    canvas,
+    left,
+    right,
+  };
+  try {
+    canvas.setPointerCapture(event.pointerId);
+  } catch (error) {
+    // Pointer capture is best-effort.
+  }
+  hideTip();
+  event.preventDefault();
+}
+
+function moveChartDrag(event) {
+  if (!chartDrag || event.pointerId !== chartDrag.pointerId) {
+    return;
+  }
+  const dx = event.clientX - chartDrag.lastX;
+  chartDrag.lastX = event.clientX;
+  if (Math.abs(dx) >= 0.5) {
+    panChartPixels(dx, chartDrag.canvas.clientWidth,
+                   chartDrag.left, chartDrag.right);
+  }
+  event.preventDefault();
+}
+
+function endChartDrag(event) {
+  if (!chartDrag || event.pointerId !== chartDrag.pointerId) {
+    return;
+  }
+  try {
+    chartDrag.canvas.releasePointerCapture(event.pointerId);
+  } catch (error) {
+    // Already released.
+  }
+  chartDrag = null;
+}
+
+function attachChartControls(canvas, left, right) {
+  canvas.addEventListener("pointerdown", (event) => {
+    beginChartDrag(event, canvas, left, right);
+  });
+  canvas.addEventListener("pointermove", moveChartDrag);
+  canvas.addEventListener("pointerup", endChartDrag);
+  canvas.addEventListener("pointercancel", endChartDrag);
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    zoomChartAt(event.deltaY, event.clientX - rect.left,
+                canvas.clientWidth, left, right);
+  }, { passive: false });
+  canvas.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    resetChartView();
+  });
+}
+
+attachChartControls(serverChart, 40, 8);
+attachChartControls(playerChart, 92, 8);
+resetZoomBtn.addEventListener("click", resetChartView);
 
 new ResizeObserver((entries) => {
   const width = Math.round(entries[0].contentRect.width);
@@ -1057,12 +1233,12 @@ async function boot() {
     setStatus("Starting WebAssembly…");
     if (typeof createCore !== "function") {
       // The script tag failed or was blocked; try once more explicitly.
-      await loadScript("core.js?v=5-retry");
+      await loadScript("core.js?v=6-retry");
     }
     if (typeof createCore !== "function") {
       let detail = "";
       try {
-        const probe = await fetch(assetUrl("core.js?v=5-probe"), { cache: "no-store" });
+        const probe = await fetch(assetUrl("core.js?v=6-probe"), { cache: "no-store" });
         const body = await probe.text();
         detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
       } catch (probeError) {

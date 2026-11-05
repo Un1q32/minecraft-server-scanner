@@ -227,12 +227,40 @@ body.resizing * {
   border-bottom: 1px solid var(--border);
 }
 
+.historyTools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.chartHelp {
+  flex: 1 1 auto;
+  font-size: 10px;
+  opacity: 0.45;
+}
+
+.historyTools button {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  font-size: 10px;
+}
+
 .chartTitle {
   margin: 0 0 4px;
   font-size: 10px;
   font-weight: bold;
   letter-spacing: 1px;
   opacity: 0.65;
+}
+
+.historyChart {
+  cursor: grab;
+  touch-action: none;
+}
+
+.historyChart:active {
+  cursor: grabbing;
 }
 
 .chartTitle + .historyChart {

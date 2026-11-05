@@ -41,6 +41,9 @@ ApplicationWindow {
     // canvases below parse it once per selection and repaint on resize.
     property bool historyLoaded: false
     property var historyData: ({ points: [], players: [] })
+    property real chartViewStart: 0
+    property real chartViewEnd: 0
+    property bool chartZoomed: false
     readonly property var chartColors: [
         "#6fa8dc", "#93c47d", "#e6b85c", "#e07b8f", "#b4a7d6",
         "#76a5af", "#f0a35e", "#c3d36c", "#d98cc4", "#8fb8e8"
@@ -160,13 +163,15 @@ ApplicationWindow {
             data.players = []
         historyData = data
         historyLoaded = true
-        serverChart.requestPaint()
-        playerChart.requestPaint()
+        resetChartView()
     }
 
     function clearHistory() {
         historyLoaded = false
         historyData = ({ points: [], players: [] })
+        chartViewStart = 0
+        chartViewEnd = 0
+        chartZoomed = false
         serverChart.requestPaint()
         playerChart.requestPaint()
     }
@@ -227,58 +232,92 @@ ApplicationWindow {
         return [lo, hi]
     }
 
-    function historyTimes(points) {
-        var out = []
-        for (var i = 0; i < points.length; ++i)
-            out.push(Number(points[i].t) || 0)
-        return out
+    function chartFullRange() {
+        return historyRange(historyData.points || [], historyData.players || [])
     }
 
-    function uniqueHistoryTimes(points, players) {
-        var seen = ({})
-        var out = []
-        function add(value) {
-            var t = Number(value) || 0
-            if (t <= 0 || seen[String(t)])
-                return
-            seen[String(t)] = true
-            out.push(t)
-        }
-        for (var i = 0; i < points.length; ++i)
-            add(points[i].t)
-        for (var p = 0; p < players.length; ++p) {
-            var times = players[p].times || []
-            for (var k = 0; k < times.length; ++k)
-                add(times[k])
-        }
-        out.sort(function (a, b) { return a - b })
-        return out
+    function chartViewRange() {
+        var full = chartFullRange()
+        var start = chartViewStart
+        var end = chartViewEnd
+        if (!start || !end || end <= start)
+            return full
+        if (start < full[0])
+            start = full[0]
+        if (end > full[1])
+            end = full[1]
+        if (end <= start)
+            return full
+        return [start, end]
     }
 
-    /// Time-proportional x positions, but with a small minimum gap so
-    /// frequent rescans do not collapse into one pixel.
-    function chartPositions(times, left, pw, t0, t1) {
-        var out = []
-        var n = times.length
-        if (!n)
-            return out
-        var span = Math.max(1, t1 - t0)
-        var minGap = Math.min(4, pw / Math.max(1, n - 1))
-        var prev = -1e12
-        for (var i = 0; i < n; ++i) {
-            var x = left + ((Number(times[i]) || t0) - t0) / span * pw
-            if (x < prev + minGap)
-                x = prev + minGap
-            out.push(x)
-            prev = x
+    function setChartView(start, end) {
+        var full = chartFullRange()
+        if (!full[0] && !full[1])
+            return
+        var span = Math.max(0.001, end - start)
+        var fullSpan = Math.max(0.001, full[1] - full[0])
+        if (span >= fullSpan * 0.999) {
+            chartViewStart = full[0]
+            chartViewEnd = full[1]
+            chartZoomed = false
+        } else {
+            if (start < full[0]) {
+                start = full[0]
+                end = start + span
+            }
+            if (end > full[1]) {
+                end = full[1]
+                start = end - span
+            }
+            if (start < full[0]) {
+                start = full[0]
+                end = start + span
+            }
+            chartViewStart = start
+            chartViewEnd = end
+            chartZoomed = true
         }
-        var last = out[n - 1]
-        if (last > left + pw) {
-            var scale = pw / Math.max(1, last - left)
-            for (var j = 0; j < n; ++j)
-                out[j] = left + (out[j] - left) * scale
-        }
-        return out
+        serverChart.requestPaint()
+        playerChart.requestPaint()
+    }
+
+    function resetChartView() {
+        var full = chartFullRange()
+        chartViewStart = full[0]
+        chartViewEnd = full[1]
+        chartZoomed = false
+        serverChart.requestPaint()
+        playerChart.requestPaint()
+    }
+
+    function zoomChartAt(deltaY, x, width, left, right) {
+        var full = chartFullRange()
+        if ((!full[0] && !full[1]) || !deltaY)
+            return
+        var view = chartViewRange()
+        var plot = Math.max(1, width - left - right)
+        var fraction = Math.max(0, Math.min(1, (x - left) / plot))
+        var span = Math.max(0.001, view[1] - view[0])
+        var fullSpan = Math.max(0.001, full[1] - full[0])
+        var steps = Math.max(0.1, Math.min(4, Math.abs(deltaY) / 120))
+        var factor = deltaY < 0 ? Math.pow(0.5, steps) : Math.pow(2.0, steps)
+        var minSpan = Math.min(fullSpan, 0.5)
+        var newSpan = span * factor
+        newSpan = Math.max(minSpan, Math.min(fullSpan, newSpan))
+        var anchor = view[0] + fraction * span
+        var newStart = anchor - fraction * newSpan
+        setChartView(newStart, newStart + newSpan)
+    }
+
+    function panChartPixels(dx, width, left, right) {
+        if (!chartZoomed)
+            return
+        var view = chartViewRange()
+        var span = Math.max(0.001, view[1] - view[0])
+        var plot = Math.max(1, width - left - right)
+        var delta = -dx / plot * span
+        setChartView(view[0] + delta, view[1] + delta)
     }
 
     function paintServerChart() {
@@ -312,13 +351,33 @@ ApplicationWindow {
         var bottom = 22
         var pw = Math.max(1, w - left - right)
         var ph = Math.max(1, h - top - bottom)
-        var range = historyRange(points, [])
-        var t0 = range[0]
-        var t1 = range[1]
-        var xs = chartPositions(historyTimes(points), left, pw, t0, t1)
+        var range = chartFullRange()
+        var view = chartViewRange()
+        var t0 = view[0]
+        var t1 = view[1]
+        var span = Math.max(1, t1 - t0)
+        var globalPeak = 1
+        var globalCounted = 0
+        for (var gi = 0; gi < points.length; ++gi) {
+            if (points[gi].p !== null && points[gi].p !== undefined) {
+                globalPeak = Math.max(globalPeak, Number(points[gi].p) || 0)
+                globalCounted += 1
+            }
+        }
+        if (!globalCounted) {
+            for (var gm = 0; gm < points.length; ++gm) {
+                if (points[gm].m !== null && points[gm].m !== undefined)
+                    globalPeak = Math.max(globalPeak, Number(points[gm].m) || 0)
+            }
+        }
         var peak = 1
         var counted = 0
+        var visible = 0
         for (var i = 0; i < points.length; ++i) {
+            var at = Number(points[i].t) || 0
+            if (at < t0 || at > t1)
+                continue
+            visible += 1
             var value = points[i].p
             if (value !== null && value !== undefined) {
                 peak = Math.max(peak, Number(value) || 0)
@@ -326,13 +385,17 @@ ApplicationWindow {
             }
         }
         if (!counted) {
-            // Backfilled rows have no observed count; use capacity for scale.
             for (var c = 0; c < points.length; ++c) {
+                var mt = Number(points[c].t) || 0
+                if (mt < t0 || mt > t1)
+                    continue
                 var maximum = points[c].m
                 if (maximum !== null && maximum !== undefined)
                     peak = Math.max(peak, Number(maximum) || 0)
             }
         }
+        if (!counted)
+            peak = Math.max(peak, globalPeak)
 
         ctx.font = "11px " + window.mono
         ctx.textBaseline = "middle"
@@ -354,6 +417,12 @@ ApplicationWindow {
         }
         ctx.globalAlpha = 1
 
+        // Keep the plot contents inside the viewport while panning.
+        ctx.save()
+        ctx.beginPath()
+        ctx.rect(left, top, pw, ph + 8)
+        ctx.clip()
+
         // Player count over time; older/backfilled rows have no count.
         var drawing = false
         ctx.strokeStyle = chartColors[0]
@@ -369,7 +438,7 @@ ApplicationWindow {
                 }
                 continue
             }
-            var x = xs[p]
+            var x = left + ((Number(points[p].t) || t0) - t0) / span * pw
             var py = top + ph - Math.min(1, (Number(v) || 0) / peak) * ph
             if (!drawing) {
                 ctx.moveTo(x, py)
@@ -381,14 +450,14 @@ ApplicationWindow {
         if (drawing)
             ctx.stroke()
 
-        // Dots keep isolated sightings visible after decimation-free lines.
+        // Every sighting is a dot and a tick.  Drawing all of them matters
+        // when zoomed in: the whole point is to see the dense rescans.
         ctx.fillStyle = chartColors[0]
-        var step = Math.max(1, Math.floor(points.length / 600))
-        for (var d = 0; d < points.length; d += step) {
+        for (var d = 0; d < points.length; ++d) {
             var dv = points[d].p
             if (dv === null || dv === undefined)
                 continue
-            var dx = xs[d]
+            var dx = left + ((Number(points[d].t) || t0) - t0) / span * pw
             var dy = top + ph - Math.min(1, (Number(dv) || 0) / peak) * ph
             ctx.beginPath()
             ctx.arc(dx, dy, 1.6, 0, Math.PI * 2)
@@ -399,28 +468,36 @@ ApplicationWindow {
         ctx.strokeStyle = cssColor(pal.highlight)
         ctx.globalAlpha = 0.8
         ctx.lineWidth = 1
-        var tickStep = Math.max(1, Math.floor(points.length / 800))
-        for (var s = 0; s < points.length; s += tickStep) {
-            var tx = xs[s]
+        for (var ts = 0; ts < points.length; ++ts) {
+            var tx = left + ((Number(points[ts].t) || t0) - t0) / span * pw
             ctx.beginPath()
             ctx.moveTo(tx + 0.5, top + ph + 2)
             ctx.lineTo(tx + 0.5, top + ph + 6)
             ctx.stroke()
         }
         ctx.globalAlpha = 1
+        ctx.restore()
 
         // Labels.
         ctx.fillStyle = cssColor(pal.text)
         ctx.globalAlpha = 0.85
         ctx.textAlign = "left"
-        ctx.fillText("SIGHTINGS " + points.length + "  •  PEAK " + peak, left, 10)
+        ctx.fillText("SIGHTINGS " + points.length + "  •  PEAK " + globalPeak +
+                     (chartZoomed ? "  •  ZOOMED" : ""), left, 10)
         ctx.globalAlpha = 0.65
         ctx.textAlign = "left"
         ctx.fillText(chartTime(t0), left, h - 9)
         ctx.textAlign = "right"
         ctx.fillText(chartTime(t1), left + pw, h - 9)
         ctx.globalAlpha = 1
-        if (!counted) {
+        if (!visible) {
+            ctx.fillStyle = cssColor(pal.text)
+            ctx.globalAlpha = 0.6
+            ctx.textAlign = "center"
+            ctx.fillText("No sightings in this zoom window",
+                         left + pw / 2, top + ph / 2)
+            ctx.globalAlpha = 1
+        } else if (!counted) {
             ctx.fillStyle = cssColor(pal.text)
             ctx.globalAlpha = 0.6
             ctx.textAlign = "center"
@@ -470,16 +547,10 @@ ApplicationWindow {
             shown = Math.max(1, shown - 1)
         var rowHeight = (h - top - bottom) / Math.max(1, shown + (overflow > 0 ? 1 : 0))
         var pw = Math.max(1, w - left - right)
-        var points = historyData.points || []
-        var range = historyRange(points, players)
+        var range = chartViewRange()
         var t0 = range[0]
         var t1 = range[1]
         var span = Math.max(1, t1 - t0)
-        var uniqueTimes = uniqueHistoryTimes(points, players)
-        var xs = chartPositions(uniqueTimes, left, pw, t0, t1)
-        var xByTime = ({})
-        for (var u = 0; u < uniqueTimes.length; ++u)
-            xByTime[String(uniqueTimes[u])] = xs[u]
 
         ctx.font = "11px " + window.mono
         ctx.textBaseline = "middle"
@@ -509,16 +580,18 @@ ApplicationWindow {
 
             ctx.fillStyle = color
             var times = player.times || []
-            var eventStep = Math.max(1, Math.floor(times.length / 400))
-            for (var k = 0; k < times.length; k += eventStep) {
+            ctx.save()
+            ctx.beginPath()
+            ctx.rect(left, top, pw, h - top - bottom)
+            ctx.clip()
+            for (var k = 0; k < times.length; ++k) {
                 var eventTime = Number(times[k]) || 0
-                var x = xByTime[String(eventTime)]
-                if (x === undefined)
-                    x = left + ((eventTime || t0) - t0) / span * pw
+                var x = left + ((eventTime || t0) - t0) / span * pw
                 ctx.beginPath()
                 ctx.arc(x, centerY, 1.7, 0, Math.PI * 2)
                 ctx.fill()
             }
+            ctx.restore()
         }
 
         if (overflow > 0) {
@@ -534,7 +607,8 @@ ApplicationWindow {
         ctx.globalAlpha = 0.85
         ctx.textAlign = "left"
         ctx.fillText("PLAYER ACTIVITY  •  " + players.length + " SEEN  •  " +
-                     chartTime(t0) + " – " + chartTime(t1), 6, 9)
+                     chartTime(t0) + " – " + chartTime(t1) +
+                     (chartZoomed ? "  •  ZOOMED" : ""), 6, 9)
         ctx.globalAlpha = 1
     }
 
@@ -1216,12 +1290,22 @@ ApplicationWindow {
 
                         Text {
                             Layout.fillWidth: true
-                            text: "DETAIL"
+                            text: window.historyLoaded
+                                  ? "DETAIL · WHEEL ZOOM · DRAG PAN"
+                                  : "DETAIL"
                             color: pal.windowText
                             opacity: 0.6
                             font.pixelSize: 11
                             font.bold: true
                             font.letterSpacing: 1
+                            elide: Text.ElideRight
+                        }
+
+                        SquareButton {
+                            text: "Reset zoom"
+                            flat: true
+                            visible: window.historyLoaded && window.chartZoomed
+                            onClicked: window.resetChartView()
                         }
 
                         SquareButton {
@@ -1262,6 +1346,31 @@ ApplicationWindow {
                         onPaint: window.paintServerChart()
                         onWidthChanged: requestPaint()
                         onHeightChanged: requestPaint()
+
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.LeftButton
+                            hoverEnabled: true
+                            cursorShape: pressed
+                                         ? Qt.ClosedHandCursor
+                                         : Qt.OpenHandCursor
+                            property real lastX: 0
+
+                            onPressed: lastX = mouseX
+                            onPositionChanged: {
+                                if (!pressed)
+                                    return
+                                var dx = mouseX - lastX
+                                lastX = mouseX
+                                window.panChartPixels(dx, parent.width, 40, 8)
+                            }
+                            onWheel: function (wheel) {
+                                window.zoomChartAt(wheel.angleDelta.y,
+                                                   wheel.x, parent.width, 40, 8)
+                                wheel.accepted = true
+                            }
+                            onDoubleClicked: window.resetChartView()
+                        }
                     }
 
                     Canvas {
@@ -1273,6 +1382,31 @@ ApplicationWindow {
                         onPaint: window.paintPlayerChart()
                         onWidthChanged: requestPaint()
                         onHeightChanged: requestPaint()
+
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.LeftButton
+                            hoverEnabled: true
+                            cursorShape: pressed
+                                         ? Qt.ClosedHandCursor
+                                         : Qt.OpenHandCursor
+                            property real lastX: 0
+
+                            onPressed: lastX = mouseX
+                            onPositionChanged: {
+                                if (!pressed)
+                                    return
+                                var dx = mouseX - lastX
+                                lastX = mouseX
+                                window.panChartPixels(dx, parent.width, 92, 8)
+                            }
+                            onWheel: function (wheel) {
+                                window.zoomChartAt(wheel.angleDelta.y,
+                                                   wheel.x, parent.width, 92, 8)
+                                wheel.accepted = true
+                            }
+                            onDoubleClicked: window.resetChartView()
+                        }
                     }
 
                     ScrollView {
