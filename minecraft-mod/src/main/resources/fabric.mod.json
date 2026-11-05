@@ -1,0 +1,21 @@
+{
+	"schemaVersion": 1,
+	"id": "mcdbbrowser",
+	"version": "${version}",
+	"name": "MCDB Server Browser",
+	"description": "Adds a button to the multiplayer menu that browses the server list from mcdb.uniq.gay.",
+	"authors": ["VC"],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["com.mcdbbrowser.McdbBrowserClient"],
+		"modmenu": ["com.mcdbbrowser.ModMenuIntegration"]
+	},
+	"mixins": ["mcdbbrowser.mixins.json"],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": ["~26.2", "~26.3"],
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

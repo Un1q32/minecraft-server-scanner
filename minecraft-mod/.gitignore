@@ -1,0 +1,39 @@
+# Gradle
+.gradle/
+build/
+out/
+bin/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Fabric Loom / Minecraft run directory (worlds, logs, options, mods)
+run/
+remappedSrc/
+.fabric/
+
+# Java artifacts
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+.vscode/
+*.launch
+
+# Logs, crash reports, JVM dumps
+logs/
+crash-reports/
+*.log
+hs_err_pid*
+*.hprof
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,50 @@
+package com.mcdbbrowser;
+
+import java.util.List;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.AbstractWidget;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.screens.PauseScreen;
+import net.minecraft.client.multiplayer.ServerData;
+import net.minecraft.client.multiplayer.resolver.ServerAddress;
+import net.minecraft.network.chat.Component;
+
+final class PauseMenuButtons {
+	private static final int MARGIN = 5;
+	private static final int WIDTH = 110;
+	private static final int HEIGHT = 20;
+	private static final int SPACING = 24;
+
+	private PauseMenuButtons() {
+	}
+
+	static void addTo(PauseScreen screen, Minecraft minecraft, List<AbstractWidget> widgets) {
+		ServerData server = minecraft.getCurrentServer();
+		if (!screen.showsPauseMenu() || server == null || minecraft.isLocalServer()) {
+			return;
+		}
+
+		widgets.add(Button.builder(Component.literal("Copy IP"), button -> {
+			minecraft.keyboardHandler.setClipboard(server.ip);
+			button.setMessage(Component.literal("Copied!"));
+		}).bounds(MARGIN, MARGIN, WIDTH, HEIGHT).build());
+
+		boolean saved = SavedServers.contains(minecraft, server.ip);
+		Button addButton = Button.builder(Component.literal(saved ? "In Server List" : "Add to Server List"), button -> {
+			SavedServers.add(minecraft, server.name, server.ip);
+			button.setMessage(Component.literal("In Server List"));
+			button.active = false;
+		}).bounds(MARGIN, MARGIN + SPACING, WIDTH, HEIGHT).build();
+		addButton.active = !saved;
+		widgets.add(addButton);
+
+		widgets.add(Button.builder(Component.literal("Find in Server DB"),
+			button -> minecraft.gui.setScreen(new ServerBrowserScreen(screen, ServerDatabase.Query.DEFAULT.withSearch(server.ip))))
+			.bounds(MARGIN, MARGIN + 2 * SPACING, WIDTH, HEIGHT).build());
+
+		ServerAddress address = ServerAddress.parseString(server.ip);
+		widgets.add(Button.builder(Component.literal("Player History"),
+			button -> minecraft.gui.setScreen(new PlayerHistoryScreen(screen, address.getHost() + ":" + address.getPort())))
+			.bounds(MARGIN, MARGIN + 3 * SPACING, WIDTH, HEIGHT).build());
+	}
+}
