@@ -35,6 +35,12 @@ processResources {
 	filesMatching("fabric.mod.json") {
 		expand "version": version
 	}
+
+	// The mod runs the scanner headlessly from these bundled sources.
+	from(project.file("..")) {
+		include "scanner.py", "mcscan.py", "db_format.py"
+		into "python"
+	}
 }
 
 tasks.withType(JavaCompile).configureEach {

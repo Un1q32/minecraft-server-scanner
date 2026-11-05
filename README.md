@@ -726,19 +726,21 @@ folded into the roster blob on the matching sighting.
 
 A Fabric client mod adds a **Server DB** button to the multiplayer screen and
 browses the downloaded `servers.db` in-game. The browser footer also has
-**Rescan**, **Recheck Whitelist**, and **Sync DB** buttons. They run the local
-Python scanner checkout:
+**Rescan**, **Recheck Whitelist**, and **Sync DB** buttons. The Python
+scanner sources are bundled inside the mod jar and extracted to
+`<game>/mcdbbrowser/scanner/` on first use; only a Python 3 interpreter is
+required on the machine.
 
 - Rescan: `mcscan.py --rescan <ip:port>` then `mcscan.py --sync`
 - Recheck Whitelist: `mcscan.py --recheck-whitelist <ip:port>` then
   `mcscan.py --sync`
 - Sync DB: `mcscan.py --sync`
 
-After a successful command the mod reloads the shared database. The scanner
-directory (the folder containing `mcscan.py`) and Python command are set in
-the mod's Settings screen; leaving the directory blank tries the working
-directory and the game directory's parents. The scanner's own `netdb.json`
-supplies the shared-DB URL and token.
+After a successful command the mod reloads the shared database. Settings
+contains the Python command and a **Shared DB Credentials** menu for the URL
+and token; those are written to the extracted scanner's `netdb.json`, so no
+command-line setup is needed. For advanced setups a scanner directory can
+still be set in `config/mcdbbrowser.json`, but it is not required.
 
 Build it with:
 

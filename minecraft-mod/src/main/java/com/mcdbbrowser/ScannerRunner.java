@@ -15,13 +15,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import net.fabricmc.loader.api.FabricLoader;
 import org.jspecify.annotations.Nullable;
 
 /**
- * Runs the local mcscan.py commands used by the Rescan, Recheck Whitelist and
- * Sync DB buttons. The scanner keeps its own servers.db and netdb.json, so the
- * mod only needs the path to the checkout (or a nearby auto-detected one).
+ * Runs the bundled mcscan.py commands used by the Rescan, Recheck Whitelist
+ * and Sync DB buttons. The scanner keeps its own servers.db and netdb.json in
+ * the extracted mcdbbrowser/scanner directory.
  */
 final class ScannerRunner {
 	private static final int SCAN_TIMEOUT_SECONDS = 180;
@@ -163,31 +162,17 @@ final class ScannerRunner {
 	}
 
 	private static @Nullable Path scannerDirectory() {
+		try {
+			return BundledScanner.ensureExtracted();
+		} catch (IOException e) {
+			McdbBrowserClient.LOGGER.warn("Could not extract the bundled scanner", e);
+		}
+		// Advanced escape hatch: a real checkout can still be configured in
+		// the JSON config, though normal users never need it.
 		String configured = McdbConfig.get().scannerDir();
 		if (configured != null && !configured.isBlank()) {
 			Path path = Path.of(configured).toAbsolutePath().normalize();
 			return Files.isRegularFile(path.resolve("mcscan.py")) ? path : null;
-		}
-
-		List<Path> starts = new ArrayList<>();
-		starts.add(Path.of("").toAbsolutePath());
-		try {
-			starts.add(FabricLoader.getInstance().getGameDir().toAbsolutePath());
-		} catch (RuntimeException e) {
-			// Fabric is always present, but never let a lookup break the UI.
-		}
-		for (Path start : starts) {
-			Path current = start;
-			for (int depth = 0; current != null && depth < 6; depth++) {
-				if (Files.isRegularFile(current.resolve("mcscan.py"))) {
-					return current;
-				}
-				Path sibling = current.resolveSibling("minecraft-server-scanner");
-				if (Files.isRegularFile(sibling.resolve("mcscan.py"))) {
-					return sibling;
-				}
-				current = current.getParent();
-			}
 		}
 		return null;
 	}

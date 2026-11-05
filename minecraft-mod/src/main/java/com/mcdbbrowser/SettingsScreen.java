@@ -17,7 +17,6 @@ public class SettingsScreen extends DropdownScreen {
 
 	private final Screen parent;
 	private McdbConfig config = McdbConfig.get();
-	private EditBox scannerDirBox;
 	private EditBox pythonBox;
 
 	public SettingsScreen(Screen parent) {
@@ -37,27 +36,24 @@ public class SettingsScreen extends DropdownScreen {
 		this.addRenderableWidget(new OffsetSlider(x, y + 2 * ROW_SPACING, "Vertical offset", this.config.buttonOffsetY(),
 			offset -> this.config = this.config.withButtonOffsetY(offset)));
 
-		this.scannerDirBox = new EditBox(this.font, x, y + 3 * ROW_SPACING, WIDGET_WIDTH, ROW_HEIGHT,
-			Component.literal("Scanner directory"));
-		this.scannerDirBox.setMaxLength(512);
-		this.scannerDirBox.setHint(Component.literal("Scanner directory (contains mcscan.py)"));
-		this.scannerDirBox.setValue(this.config.scannerDir());
-		this.addRenderableWidget(this.scannerDirBox);
-
-		this.pythonBox = new EditBox(this.font, x, y + 4 * ROW_SPACING, WIDGET_WIDTH, ROW_HEIGHT,
+		this.pythonBox = new EditBox(this.font, x, y + 3 * ROW_SPACING, WIDGET_WIDTH, ROW_HEIGHT,
 			Component.literal("Python command"));
 		this.pythonBox.setMaxLength(128);
 		this.pythonBox.setHint(Component.literal("Python command (python3)"));
 		this.pythonBox.setValue(this.config.pythonCommand());
 		this.addRenderableWidget(this.pythonBox);
 
+		this.addRenderableWidget(Button.builder(Component.literal("Shared DB Credentials"), button ->
+			this.minecraft.gui.setScreen(new DatabaseSettingsScreen(this)))
+			.bounds(x, y + 4 * ROW_SPACING, WIDGET_WIDTH, ROW_HEIGHT).build());
+
 		int halfWidth = (WIDGET_WIDTH - 4) / 2;
 		this.addRenderableWidget(Button.builder(Component.literal("Reset"), button -> {
 			this.config = McdbConfig.DEFAULT;
 			this.rebuildWidgets();
-		}).bounds(x, y + 6 * ROW_SPACING, halfWidth, ROW_HEIGHT).build());
+		}).bounds(x, y + 5 * ROW_SPACING, halfWidth, ROW_HEIGHT).build());
 		this.addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, button -> this.onClose())
-			.bounds(x + WIDGET_WIDTH - halfWidth, y + 6 * ROW_SPACING, halfWidth, ROW_HEIGHT).build());
+			.bounds(x + WIDGET_WIDTH - halfWidth, y + 5 * ROW_SPACING, halfWidth, ROW_HEIGHT).build());
 	}
 
 	private int formTop() {
@@ -69,16 +65,14 @@ public class SettingsScreen extends DropdownScreen {
 		graphics.centeredText(this.font, this.title, this.width / 2, 15, 0xFFFFFFFF);
 		graphics.centeredText(this.font, "Where the Server DB button appears on the multiplayer screen",
 			this.width / 2, Math.max(30, this.formTop() - 30), 0xFFA0A0A0);
-		graphics.centeredText(this.font, "Rescan / whitelist / sync buttons run mcscan.py from the scanner directory",
+		graphics.centeredText(this.font, "Rescan, whitelist and sync use the scanner bundled in the mod",
 			this.width / 2, Math.max(42, this.formTop() - 18), 0xFFA0A0A0);
 	}
 
 	@Override
 	public void onClose() {
-		if (this.scannerDirBox != null) {
-			this.config = this.config
-				.withScannerDir(this.scannerDirBox.getValue())
-				.withPythonCommand(this.pythonBox.getValue());
+		if (this.pythonBox != null) {
+			this.config = this.config.withPythonCommand(this.pythonBox.getValue());
 		}
 		McdbConfig.set(this.config);
 		this.minecraft.gui.setScreen(this.parent);
