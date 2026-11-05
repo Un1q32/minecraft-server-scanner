@@ -200,10 +200,19 @@ public class ServerBrowserScreen extends DropdownScreen {
 			return;
 		}
 
+		boolean sortOnly = this.query.withSort(newQuery.sort())
+			.withDescending(newQuery.descending()).equals(newQuery);
 		this.query = newQuery;
 		rememberedQuery = newQuery;
 		if (!this.loading && ServerDatabase.isLoaded()) {
-			this.runQuery();
+			if (sortOnly && this.result != null) {
+				// The SQL result is already filtered; re-sort it in Java
+				// instead of re-querying SQLite and rebuilding every row.
+				this.result.rows().sort(this.query.comparator());
+				this.list.updateRows(this.result.rows());
+			} else {
+				this.runQuery();
+			}
 		}
 	}
 
@@ -439,8 +448,23 @@ public class ServerBrowserScreen extends DropdownScreen {
 		}
 
 		void setRows(List<ServerRecord> servers) {
-			this.replaceEntries(servers.stream().map(Entry::new).toList());
+			if (this.children().size() == servers.size()) {
+				this.updateRows(servers);
+			} else {
+				this.replaceEntries(servers.stream().map(Entry::new).toList());
+			}
 			this.setScrollAmount(0);
+		}
+
+		/** Reorder existing row objects to match a new list, preserving scroll. */
+		void updateRows(List<ServerRecord> servers) {
+			List<Entry> entries = this.children();
+			int count = Math.min(entries.size(), servers.size());
+			for (int i = 0; i < count; i++) {
+				entries.get(i).setServer(servers.get(i));
+			}
+			this.hoveredEntry = null;
+			this.setSelected(null);
 		}
 
 		@Override
@@ -539,7 +563,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		class Entry extends ObjectSelectionList.Entry<Entry> {
 			private static final Component SEPARATOR = Component.literal(" • ").withStyle(ChatFormatting.DARK_GRAY);
 
-			final ServerRecord server;
+			ServerRecord server;
 			// Built on first draw, since most rows are never scrolled into view
 			private @Nullable String playerCount;
 			private @Nullable Component motd;
@@ -551,6 +575,17 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 			Entry(ServerRecord server) {
 				this.server = server;
+			}
+
+			void setServer(ServerRecord server) {
+				this.server = server;
+				this.playerCount = null;
+				this.motd = null;
+				this.motdLine = null;
+				this.motdLineWidth = -1;
+				this.details = null;
+				this.playersTooltip = null;
+				this.detailsTooltip = null;
 			}
 
 			private void buildText(Font font) {

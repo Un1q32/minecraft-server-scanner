@@ -18,6 +18,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -295,8 +296,7 @@ public final class ServerDatabase {
 			.filter(Objects::nonNull)
 			.forEach(where::add);
 
-		String direction = query.descending() ? " DESC" : " ASC";
-		String sql = "SELECT " + COLUMNS + SERVERS_FROM + where + " ORDER BY " + query.sort().column + direction + ", last_seen DESC";
+		String sql = "SELECT " + COLUMNS + SERVERS_FROM + where;
 		List<ServerRecord> rows = new ArrayList<>();
 		try (PreparedStatement statement = connection.prepareStatement(sql)) {
 			bind(statement, searchPatterns);
@@ -306,6 +306,9 @@ public final class ServerDatabase {
 				}
 			}
 		}
+		// SQLite is already native, but letting it compute derived columns and
+		// then sorting Java records keeps sort changes entirely in memory.
+		rows.sort(query.comparator());
 
 		return new QueryResult(rows);
 	}
@@ -335,20 +338,27 @@ public final class ServerDatabase {
 	}
 
 	public enum Sort implements Labeled {
-		LAST_SEEN("Last seen", "last_seen"),
-		FIRST_SEEN("First seen", "first_seen"),
-		PLAYERS("Players", "players_online"),
-		MAX_PLAYERS("Max players", "max_players"),
-		TIMES_SEEN("Times seen", "times_seen"),
-		VERSION("Version", "protocol"),
-		ADDRESS("Address", "ip_port");
+		LAST_SEEN("Last seen",
+			Comparator.comparingDouble(ServerRecord::lastSeenEpochSeconds)),
+		FIRST_SEEN("First seen",
+			Comparator.comparingDouble(ServerRecord::firstSeenEpochSeconds)),
+		PLAYERS("Players",
+			Comparator.comparingInt(ServerRecord::playersOnline)),
+		MAX_PLAYERS("Max players",
+			Comparator.comparingInt(ServerRecord::maxPlayers)),
+		TIMES_SEEN("Times seen",
+			Comparator.comparingInt(ServerRecord::timesSeen)),
+		VERSION("Version",
+			Comparator.comparingInt(ServerRecord::protocol)),
+		ADDRESS("Address",
+			Comparator.comparing(ServerRecord::address, String.CASE_INSENSITIVE_ORDER));
 
 		private final String label;
-		private final String column;
+		private final Comparator<ServerRecord> comparator;
 
-		Sort(String label, String column) {
+		Sort(String label, Comparator<ServerRecord> comparator) {
 			this.label = label;
-			this.column = column;
+			this.comparator = comparator;
 		}
 
 		@Override
@@ -432,6 +442,16 @@ public final class ServerDatabase {
 
 	public record Query(String search, Sort sort, boolean descending, PlayersFilter players, AuthFilter auth, WhitelistFilter whitelist) {
 		public static final Query DEFAULT = new Query("", Sort.PLAYERS, true, PlayersFilter.ANY, AuthFilter.ANY, WhitelistFilter.ANY);
+
+		/** Java-side comparator used to re-sort an already filtered result. */
+		public Comparator<ServerRecord> comparator() {
+			Comparator<ServerRecord> comparator = this.sort.comparator;
+			if (this.descending) {
+				comparator = comparator.reversed();
+			}
+			return comparator.thenComparing(
+				Comparator.comparingDouble(ServerRecord::lastSeenEpochSeconds).reversed());
+		}
 
 		List<String> searchTerms() {
 			String trimmed = this.search.strip();
