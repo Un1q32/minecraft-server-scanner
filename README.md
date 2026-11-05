@@ -722,6 +722,31 @@ against an old server. The conversion is per row and does not require a
 full-table pass. Old clients that upload separate player events have them
 folded into the roster blob on the matching sighting.
 
+## Minecraft mod (`minecraft-mod`)
+
+A Fabric client mod adds a **Server DB** button to the multiplayer screen and
+browses the downloaded `servers.db` in-game. The browser footer also has
+**Rescan**, **Recheck Whitelist**, and **Sync DB** buttons. They run the local
+Python scanner checkout:
+
+- Rescan: `mcscan.py --rescan <ip:port>` then `mcscan.py --sync`
+- Recheck Whitelist: `mcscan.py --recheck-whitelist <ip:port>` then
+  `mcscan.py --sync`
+- Sync DB: `mcscan.py --sync`
+
+After a successful command the mod reloads the shared database. The scanner
+directory (the folder containing `mcscan.py`) and Python command are set in
+the mod's Settings screen; leaving the directory blank tries the working
+directory and the game directory's parents. The scanner's own `netdb.json`
+supplies the shared-DB URL and token.
+
+Build it with:
+
+    cd minecraft-mod
+    ./gradlew build
+
+The mod jar is written to `minecraft-mod/build/libs/`.
+
 ## Text format
 
 The standard exported server line is:

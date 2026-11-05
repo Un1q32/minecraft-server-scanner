@@ -4,7 +4,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.function.Supplier;
 import com.mcdbbrowser.ServerDatabase.Query;
 import com.mcdbbrowser.ServerDatabase.QueryResult;
 import net.minecraft.ChatFormatting;
@@ -13,6 +15,7 @@ import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.ObjectSelectionList;
+import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
@@ -36,8 +39,9 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private static final int SEARCH_ROW_Y = 22;
 	private static final int FILTER_ROW_Y = 46;
 	private static final int LIST_TOP = 70;
-	private static final int FOOTER_HEIGHT = 84;
+	private static final int FOOTER_HEIGHT = 108;
 	private static final int FOOTER_BUTTON_WIDTH = 90;
+	private static final int ACTION_BUTTON_WIDTH = 120;
 	private static final int SORT_BUTTON_WIDTH = 130;
 	private static final int GAP = 4;
 	private static final int SEARCH_DEBOUNCE_TICKS = 5;
@@ -63,6 +67,11 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private Button copyButton;
 	private Button historyButton;
 	private Button redownloadButton;
+	private Button rescanButton;
+	private Button whitelistButton;
+	private Button syncButton;
+	private boolean scannerBusy;
+	private volatile @Nullable String scannerStatus;
 
 	public ServerBrowserScreen(Screen parent) {
 		this(parent, rememberedQuery);
@@ -108,12 +117,23 @@ public class ServerBrowserScreen extends DropdownScreen {
 		}
 
 		int step = FOOTER_BUTTON_WIDTH + GAP;
-		int serverRowY = this.height - 52;
+		int serverRowY = this.height - 76;
 		int serverRowX = this.footerRowX(4);
 		this.joinButton = this.addRenderableWidget(this.footerButton(Component.translatable("selectServer.select"), serverRowX, serverRowY, this::joinSelected));
 		this.addButton = this.addRenderableWidget(this.footerButton(Component.literal("Add to List"), serverRowX + step, serverRowY, this::addSelectedToServerList));
 		this.copyButton = this.addRenderableWidget(this.footerButton(Component.literal("Copy IP"), serverRowX + 2 * step, serverRowY, this::copySelected));
 		this.historyButton = this.addRenderableWidget(this.footerButton(Component.literal("Player History"), serverRowX + 3 * step, serverRowY, this::openSelectedHistory));
+
+		int actionRowY = this.height - 52;
+		int actionRowX = this.footerRowX(3, ACTION_BUTTON_WIDTH);
+		this.rescanButton = this.addRenderableWidget(this.actionButton("Rescan",
+			"Run mcscan.py --rescan for the selected server, then sync", actionRowX, actionRowY, this::rescanSelected));
+		this.whitelistButton = this.addRenderableWidget(this.actionButton("Recheck Whitelist",
+			"Run mcscan.py --recheck-whitelist for the selected server, then sync",
+			actionRowX + ACTION_BUTTON_WIDTH + GAP, actionRowY, this::recheckWhitelistSelected));
+		this.syncButton = this.addRenderableWidget(this.actionButton("Sync DB",
+			"Run mcscan.py --sync, then reload the server list",
+			actionRowX + 2 * (ACTION_BUTTON_WIDTH + GAP), actionRowY, this::syncDatabase));
 
 		int screenRowY = this.height - 28;
 		int screenRowX = this.footerRowX(4);
@@ -133,11 +153,22 @@ public class ServerBrowserScreen extends DropdownScreen {
 	}
 
 	private int footerRowX(int buttonCount) {
-		return (this.width - (buttonCount * FOOTER_BUTTON_WIDTH + (buttonCount - 1) * GAP)) / 2;
+		return this.footerRowX(buttonCount, FOOTER_BUTTON_WIDTH);
+	}
+
+	private int footerRowX(int buttonCount, int buttonWidth) {
+		return (this.width - (buttonCount * buttonWidth + (buttonCount - 1) * GAP)) / 2;
 	}
 
 	private Button footerButton(Component label, int x, int y, Runnable action) {
 		return Button.builder(label, button -> action.run()).bounds(x, y, FOOTER_BUTTON_WIDTH, ROW_HEIGHT).build();
+	}
+
+	private Button actionButton(String label, String tooltip, int x, int y, Runnable action) {
+		return Button.builder(Component.literal(label), button -> action.run())
+			.bounds(x, y, ACTION_BUTTON_WIDTH, ROW_HEIGHT)
+			.tooltip(Tooltip.create(Component.literal(tooltip)))
+			.build();
 	}
 
 	private static Component directionArrow(boolean descending) {
@@ -203,11 +234,15 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 	private void updateButtonStates() {
 		boolean hasSelection = this.list.getSelected() != null;
+		boolean idle = !this.loading && !this.scannerBusy;
 		this.joinButton.active = hasSelection && this.canJoin();
 		this.addButton.active = hasSelection;
 		this.copyButton.active = hasSelection;
 		this.historyButton.active = hasSelection;
-		this.redownloadButton.active = !this.loading;
+		this.rescanButton.active = idle && hasSelection;
+		this.whitelistButton.active = idle && hasSelection;
+		this.syncButton.active = idle;
+		this.redownloadButton.active = idle;
 	}
 
 	private @Nullable ServerRecord selectedServer() {
@@ -263,6 +298,59 @@ public class ServerBrowserScreen extends DropdownScreen {
 		}
 	}
 
+	private void rescanSelected() {
+		ServerRecord server = this.selectedServer();
+		if (server != null) {
+			this.runScannerAction("Rescanning " + server.address() + "…",
+				() -> ScannerRunner.rescan(server.address(), this::setScannerStatus));
+		}
+	}
+
+	private void recheckWhitelistSelected() {
+		ServerRecord server = this.selectedServer();
+		if (server != null) {
+			this.runScannerAction("Checking whitelist for " + server.address() + "…",
+				() -> ScannerRunner.recheckWhitelist(server.address(), this::setScannerStatus));
+		}
+	}
+
+	private void syncDatabase() {
+		this.runScannerAction("Syncing shared DB…",
+			() -> ScannerRunner.sync(this::setScannerStatus));
+	}
+
+	private void runScannerAction(String status, Supplier<CompletableFuture<ScannerRunner.Result>> action) {
+		if (this.scannerBusy) {
+			return;
+		}
+		this.scannerBusy = true;
+		this.scannerStatus = status;
+		this.error = null;
+		this.notice = null;
+		this.updateButtonStates();
+		action.get().whenComplete((result, throwable) -> this.minecraft.execute(() -> {
+			this.scannerBusy = false;
+			this.scannerStatus = null;
+			if (throwable != null) {
+				this.error = "Scanner failed: " + describe(throwable);
+			} else if (result == null || !result.ok()) {
+				this.error = result == null ? "Scanner failed" : result.message();
+			} else {
+				this.showNotice(result.message());
+				// mcscan.py --sync has updated the shared DB; pull the result.
+				this.load(true);
+			}
+			this.updateButtonStates();
+		}));
+	}
+
+	private void setScannerStatus(String line) {
+		String text = line == null ? "" : line.strip();
+		if (!text.isEmpty()) {
+			this.scannerStatus = text.length() > 110 ? text.substring(0, 110) : text;
+		}
+	}
+
 	private void showNotice(String text) {
 		this.notice = text;
 		this.noticeExpiresAt = System.currentTimeMillis() + NOTICE_DURATION_MILLIS;
@@ -284,6 +372,9 @@ public class ServerBrowserScreen extends DropdownScreen {
 		int statusY = this.height - FOOTER_HEIGHT + 8;
 		if (this.loading) {
 			graphics.centeredText(this.font, this.downloadStatus(), this.width / 2, statusY, GRAY);
+		} else if (this.scannerBusy) {
+			graphics.centeredText(this.font, this.scannerStatus == null ? "Working…" : this.scannerStatus,
+				this.width / 2, statusY, GRAY);
 		} else if (this.error != null) {
 			graphics.centeredText(this.font, this.error, this.width / 2, statusY, RED);
 		} else if (this.notice != null && System.currentTimeMillis() < this.noticeExpiresAt) {

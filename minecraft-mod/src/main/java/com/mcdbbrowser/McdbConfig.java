@@ -5,15 +5,17 @@ import java.io.Reader;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.util.Mth;
 
-public record McdbConfig(ButtonCorner buttonCorner, int buttonOffsetX, int buttonOffsetY) {
+public record McdbConfig(ButtonCorner buttonCorner, int buttonOffsetX, int buttonOffsetY,
+                         String scannerDir, String pythonCommand) {
 	public static final int MAX_OFFSET = 300;
-	public static final McdbConfig DEFAULT = new McdbConfig(ButtonCorner.TOP_RIGHT, 5, 6);
+	public static final McdbConfig DEFAULT = new McdbConfig(ButtonCorner.TOP_RIGHT, 5, 6, "", defaultPython());
 
 	private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("mcdbbrowser.json");
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -24,6 +26,14 @@ public record McdbConfig(ButtonCorner buttonCorner, int buttonOffsetX, int butto
 		buttonCorner = buttonCorner == null ? DEFAULT.buttonCorner : buttonCorner;
 		buttonOffsetX = Mth.clamp(buttonOffsetX, 0, MAX_OFFSET);
 		buttonOffsetY = Mth.clamp(buttonOffsetY, 0, MAX_OFFSET);
+		scannerDir = scannerDir == null ? "" : scannerDir.strip();
+		pythonCommand = pythonCommand == null || pythonCommand.isBlank()
+			? defaultPython() : pythonCommand.strip();
+	}
+
+	private static String defaultPython() {
+		return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")
+			? "python" : "python3";
 	}
 
 	public static McdbConfig get() {
@@ -55,15 +65,28 @@ public record McdbConfig(ButtonCorner buttonCorner, int buttonOffsetX, int butto
 	}
 
 	public McdbConfig withButtonCorner(ButtonCorner corner) {
-		return new McdbConfig(corner, this.buttonOffsetX, this.buttonOffsetY);
+		return new McdbConfig(corner, this.buttonOffsetX, this.buttonOffsetY,
+			this.scannerDir, this.pythonCommand);
 	}
 
 	public McdbConfig withButtonOffsetX(int offsetX) {
-		return new McdbConfig(this.buttonCorner, offsetX, this.buttonOffsetY);
+		return new McdbConfig(this.buttonCorner, offsetX, this.buttonOffsetY,
+			this.scannerDir, this.pythonCommand);
 	}
 
 	public McdbConfig withButtonOffsetY(int offsetY) {
-		return new McdbConfig(this.buttonCorner, this.buttonOffsetX, offsetY);
+		return new McdbConfig(this.buttonCorner, this.buttonOffsetX, offsetY,
+			this.scannerDir, this.pythonCommand);
+	}
+
+	public McdbConfig withScannerDir(String scannerDir) {
+		return new McdbConfig(this.buttonCorner, this.buttonOffsetX,
+			this.buttonOffsetY, scannerDir, this.pythonCommand);
+	}
+
+	public McdbConfig withPythonCommand(String pythonCommand) {
+		return new McdbConfig(this.buttonCorner, this.buttonOffsetX,
+			this.buttonOffsetY, this.scannerDir, pythonCommand);
 	}
 
 	public int buttonX(int screenWidth, int buttonWidth) {
