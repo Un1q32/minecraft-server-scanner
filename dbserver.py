@@ -317,7 +317,24 @@ def _add_column_if_missing(con, column, ddl):
     return False
 
 
+def cleanup_stale_snapshots(db_path):
+    """Remove snapshot temps left by a previous killed/crashed process."""
+    directory = os.path.dirname(os.path.abspath(db_path)) or "."
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(".mc-netdb-"):
+            continue
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
 def init_db(db_path):
+    cleanup_stale_snapshots(db_path)
     con = db_connect(db_path)
     try:
         # Creates the v3 state table/history, or migrates an older DB.
@@ -363,6 +380,7 @@ def notes_db_connect(db_path):
 
 
 def init_notes_db(db_path):
+    cleanup_stale_snapshots(db_path)
     con = notes_db_connect(db_path)
     try:
         con.execute(NOTES_SCHEMA)
@@ -1088,6 +1106,7 @@ class Handler(BaseHTTPRequestHandler):
                     os.chmod(tmp, 0o600)
                 except OSError:
                     pass
+            db_size = os.path.getsize(tmp)
             payload = tmp
             encoding = _pick_encoding(self.headers.get("Accept-Encoding"))
             if encoding:
@@ -1106,6 +1125,13 @@ class Handler(BaseHTTPRequestHandler):
                                                compresslevel=6, mtime=0) as gz:
                                 shutil.copyfileobj(fin, gz, length=1024 * 1024)
                     payload = gz_tmp
+                    # The compressed copy is what we send; drop the
+                    # uncompressed temp immediately.
+                    try:
+                        os.unlink(tmp)
+                        tmp = None
+                    except OSError:
+                        pass
                 except Exception:
                     if gz_tmp:
                         try:
@@ -1115,24 +1141,32 @@ class Handler(BaseHTTPRequestHandler):
                         gz_tmp = None
                     payload = tmp
                     encoding = None
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(os.path.getsize(payload)))
-            self.send_header("Content-Disposition",
-                             f'attachment; filename="{filename}"')
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-History-Seq", str(history_seq))
-            self.send_header("X-Player-Seq", str(player_seq))
+            payload_size = os.path.getsize(payload)
+            payload_file = open(payload, "rb")
             try:
-                self.send_header("X-DB-Size", str(os.path.getsize(tmp)))
-            except OSError:
-                pass
-            if encoding:
-                self.send_header("Content-Encoding", encoding)
-                self.send_header("Vary", "Accept-Encoding")
-            self.end_headers()
-            with open(payload, "rb") as f:
-                shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
+                try:
+                    # On Unix the file stays readable while open; unlinking it
+                    # now means killed/crashed sends cannot leave 200+ MB
+                    # snapshot files behind.
+                    os.unlink(payload)
+                except OSError:
+                    pass
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(payload_size))
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-History-Seq", str(history_seq))
+                self.send_header("X-Player-Seq", str(player_seq))
+                self.send_header("X-DB-Size", str(db_size))
+                if encoding:
+                    self.send_header("Content-Encoding", encoding)
+                    self.send_header("Vary", "Accept-Encoding")
+                self.end_headers()
+                shutil.copyfileobj(payload_file, self.wfile, length=1024 * 1024)
+            finally:
+                payload_file.close()
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
