@@ -1219,16 +1219,39 @@ def _ensure_server_db():
 # server also accepts plain Bearer for curl debugging. Run dbserver.py on
 # a port-forwarded box; see its docstring for details.
 
+def _total_memory_bytes():
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii",
+                  errors="ignore") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    try:
+        return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return 0
+
+
+_TOTAL_MEMORY = _total_memory_bytes()
+NETDB_LOW_MEMORY = (
+    str(os.environ.get("MC_SYNC_LOW_MEMORY", "")).strip().lower()
+    in ("1", "true", "yes")
+) or (0 < _TOTAL_MEMORY < 2 * 1024 ** 3)
 NETDB_CONFIG_FILE = "netdb.json"
 NETDB_TIMEOUT = 30
 NETDB_SERVER_COMPRESSED_REQUESTS = False
-NETDB_MAX_UPLOAD = 20000
-NETDB_MAX_HISTORY_UPLOAD = 50000
-NETDB_MAX_PLAYER_UPLOAD = 100000
-NETDB_HISTORY_PAGE = 100000
+# One response/page is held in memory as JSON.  Keep it much smaller on
+# low-RAM nodes (Raspberry Pi 3 etc.) so the process is not OOM-killed.
+NETDB_MAX_UPLOAD = 2000 if NETDB_LOW_MEMORY else 20000
+NETDB_MAX_HISTORY_UPLOAD = 5000 if NETDB_LOW_MEMORY else 50000
+NETDB_MAX_PLAYER_UPLOAD = 10000 if NETDB_LOW_MEMORY else 100000
+NETDB_HISTORY_PAGE = 5000 if NETDB_LOW_MEMORY else 100000
+NETDB_SERVER_PAGE = 5000 if NETDB_LOW_MEMORY else 50000
 # Matches dbserver.py's MAX_SERVERS_PER_RESPONSE: one /api/sync reply carries
 # at most this many rows, so big first-sync downloads page through it.
-NETDB_PAGE_SIZE = 50000
+NETDB_PAGE_SIZE = NETDB_SERVER_PAGE
 NETDB_MAX_ROUNDS = 500
 NETDB_DOWNLOAD_TIMEOUT = 120
 _ZSTD_CLI = shutil.which("zstd")
@@ -1884,6 +1907,7 @@ def netdb_download_all(url, token, timeout=None):
         resp = _netdb_request(
             url + "/api/sync", token, method="POST",
             payload={"servers": [], "since": 0, "since_seq": cursor_seq,
+                     "limit": NETDB_SERVER_PAGE,
                      "format": db_format.CURRENT_FORMAT},
             timeout=timeout)
         if not isinstance(resp, dict) or not resp.get("has_seq"):
@@ -2142,24 +2166,79 @@ def _netdb_download_db(url, token, endpoint, target_file, prepare,
             compressed = encoding in ("gzip", "zstd")
             with open(tmp, "wb") as f:
                 if compressed:
-                    # Buffer the wire bytes so the decoder can verify its
-                    # checksum before writing anything.
-                    buf = bytearray()
-                    while True:
-                        chunk = resp.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        buf.extend(chunk)
-                        done += len(chunk)
-                        if progress is not None:
+                    # Decompress incrementally.  Buffering the whole snapshot
+                    # (and its decompressed copy) OOMs 1 GB Raspberry Pis.
+                    if encoding == "gzip":
+                        dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                        while True:
+                            chunk = resp.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            out = dec.decompress(chunk)
+                            if out:
+                                f.write(out)
+                            done += len(chunk)
+                            if progress is not None:
+                                try:
+                                    progress(done, total)
+                                except Exception:
+                                    pass
+                        tail = dec.flush()
+                        if tail:
+                            f.write(tail)
+                        if not dec.eof:
+                            raise ConnectionError(
+                                "compressed database download was truncated")
+                    elif _zstd is not None:
+                        dec = _zstd.ZstdDecompressor()
+                        while True:
+                            chunk = resp.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            out = dec.decompress(chunk)
+                            if out:
+                                f.write(out)
+                            done += len(chunk)
+                            if progress is not None:
+                                try:
+                                    progress(done, total)
+                                except Exception:
+                                    pass
+                        if not dec.eof:
+                            raise ConnectionError(
+                                "compressed database download was truncated")
+                    elif _ZSTD_CLI:
+                        proc = subprocess.Popen(
+                            [_ZSTD_CLI, "-d", "-q", "-c"],
+                            stdin=subprocess.PIPE, stdout=f,
+                            stderr=subprocess.PIPE)
+                        try:
+                            while True:
+                                chunk = resp.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                proc.stdin.write(chunk)
+                                done += len(chunk)
+                                if progress is not None:
+                                    try:
+                                        progress(done, total)
+                                    except Exception:
+                                        pass
+                            proc.stdin.close()
+                            stderr = proc.stderr.read()
+                            code = proc.wait()
+                        finally:
                             try:
-                                progress(done, total)
+                                proc.stdin.close()
                             except Exception:
                                 pass
-                    if encoding == "zstd":
-                        f.write(_zstd_decompress(buf))
+                        if code != 0:
+                            raise ConnectionError(
+                                "zstd database decompression failed: "
+                                + stderr.decode("utf-8", errors="replace")[:200])
                     else:
-                        f.write(gzip.decompress(buf))
+                        raise ConnectionError(
+                            "server sent zstd but no zstd decoder is available")
                 else:
                     while True:
                         chunk = resp.read(1024 * 1024)
@@ -2354,6 +2433,7 @@ def netdb_sync_once(url, token, timeout=None, history_download=True):
             wire_rows = [db_format.row_for_format(r, server_format)
                          for r in servers]
         payload = {"servers": wire_rows, "since": cursor,
+                   "limit": NETDB_SERVER_PAGE,
                    "format": db_format.CURRENT_FORMAT}
         if cursor_seq is not None:
             payload["since_seq"] = cursor_seq

@@ -345,6 +345,10 @@ def init_db(db_path):
                 pass
         db_format.ensure_view(con, recreate=added)
         con.commit()
+        # Server DBs live on a fast host; reclaim pages freed by index
+        # migration there.  Do not do this in the shared helper: scanner
+        # nodes (Raspberry Pi/SD cards) would stall at sync startup.
+        db_format.vacuum_if_bloated(con)
     finally:
         con.close()
 
@@ -1436,6 +1440,12 @@ class Handler(BaseHTTPRequestHandler):
         raw_seq = payload.get("since_seq", None)
         since_seq = None if raw_seq is None else _clamp_seq(raw_seq)
         since = _clamp_ts(payload.get("since", 0) or 0)
+        try:
+            page_limit = int(payload.get("limit", MAX_SERVERS_PER_RESPONSE)
+                             or MAX_SERVERS_PER_RESPONSE)
+        except Exception:
+            page_limit = MAX_SERVERS_PER_RESPONSE
+        page_limit = max(1, min(page_limit, MAX_SERVERS_PER_RESPONSE))
         merged = 0
         with _db_lock:
             con = db_connect(self.server.db_path)
@@ -1455,12 +1465,12 @@ class Handler(BaseHTTPRequestHandler):
                     cur = con.execute(
                         "SELECT * FROM servers WHERE seq > ?"
                         " ORDER BY seq ASC LIMIT ?",
-                        (since_seq, MAX_SERVERS_PER_RESPONSE))
+                        (since_seq, page_limit))
                 else:
                     cur = con.execute(
                         "SELECT * FROM servers WHERE last_seen > ?"
                         " ORDER BY last_seen ASC LIMIT ?",
-                        (since, MAX_SERVERS_PER_RESPONSE))
+                        (since, page_limit))
                 deltas = [db_format.row_for_format(dict(r), client_format)
                           for r in cur.fetchall()]
                 total = con.execute("SELECT COUNT(*) FROM servers").fetchone()[0]

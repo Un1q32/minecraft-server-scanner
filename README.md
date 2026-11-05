@@ -193,9 +193,11 @@ union of both sides. Per-sighting history and player samples are uploaded
 separately, so the shared DB and every client's graph eventually include all
 sightings from every node, not just the aggregate endpoints. Large sync
 uploads are gzip-compressed when the server advertises support; older
-servers keep the uncompressed path. A cracked verdict only changes when a
-client runs an explicit cracked or whitelist login probe; ordinary
-re-sights never overwrite it.
+servers keep the uncompressed path. Nodes with less than 2 GB RAM
+automatically use much smaller sync pages/batches so a Raspberry Pi is not
+OOM-killed; set `MC_SYNC_LOW_MEMORY=1` to force that mode. A cracked verdict
+only changes when a client runs an explicit cracked or whitelist login
+probe; ordinary re-sights never overwrite it.
 
 Full downloads use `GET /api/db`: the server makes a consistent compact
 snapshot with `VACUUM INTO` and streams the SQLite file itself, compressed
@@ -261,6 +263,7 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
     python mcscan.py --init-db URL TOKEN    # save shared-DB creds to netdb.json
     python mcscan.py --sync                  # sync shared DB (auto-full-download if local DB is missing)
     python mcscan.py --download-db           # replace local servers + notes DBs from the shared DB
+    python mcscan.py --vacuum-db             # compact the local servers.db after index migrations
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
@@ -619,8 +622,9 @@ Both local and shared databases have two history tables:
 sampled player per sighting). The viewer JSON is capped at 5000 sighting
 points and 20000 player events while storage keeps every row. Upload indexes
 are partial (`WHERE synced=0`), so they shrink back to almost nothing after a
-sync; obsolete full-history indexes are dropped at startup and the database
-is vacuumed when the freed space exceeds 10%.
+sync; obsolete full-history indexes are dropped at startup. The shared server
+vacuums automatically when the freed space exceeds 10%; scanner nodes can run
+`mcscan.py --vacuum-db` when convenient.
 
 History is synced incrementally as well: local rows carry a `synced` flag,
 and `/api/history/sync` uploads unsynced sightings/player events and pages

@@ -8,6 +8,7 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
 
   mcscan.py --sync                  sync shared DB (creds from netdb.json)
   mcscan.py --download-db           replace local DB with the latest shared DB
+  mcscan.py --vacuum-db             compact the local servers.db
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --recheck-whitelist IP:PORT ...
                                     probe whitelist status for those servers
@@ -162,6 +163,30 @@ def cmd_download_db(include_notes=True):
                        else scanner.netdb_load_config().get("last_notes_seq", 0))
     print(f"download complete: {count} server(s), {notes_count} note(s), "
           f"last_seq={max_seq}, notes_seq={shown_notes_seq}", flush=True)
+    return 0
+
+
+def cmd_vacuum_db():
+    """Compact the local servers.db (useful after index migrations)."""
+    scanner.init_server_db()
+    path = os.path.abspath(scanner.SERVERS_DB_FILE)
+    try:
+        before = os.path.getsize(path)
+    except OSError:
+        before = 0
+    print(f"vacuuming {path} ({before / (1024 * 1024):.1f} MB)...",
+          flush=True)
+    con = scanner._server_db_connect()
+    try:
+        con.execute("VACUUM")
+    finally:
+        con.close()
+    try:
+        after = os.path.getsize(path)
+    except OSError:
+        after = 0
+    print(f"database compacted: {before / (1024 * 1024):.1f} MB -> "
+          f"{after / (1024 * 1024):.1f} MB", flush=True)
     return 0
 
 
@@ -776,6 +801,11 @@ def main(argv=None):
         help="replace the local servers.db and notes.db with the full latest "
              "shared DBs and update netdb.json's seq watermarks")
     parser.add_argument(
+        "--vacuum-db", action="store_true",
+        help="compact the local servers.db (can take a while on SD cards; "
+             "run it when not scanning/syncing)")
+
+    parser.add_argument(
         "--scan", nargs="+", metavar="TARGET", dest="targets",
         help="scan targets (same syntax as the GUI box): IPs, CIDRs, "
              "ranges (a-b), ASNs, hostnames")
@@ -856,7 +886,7 @@ def main(argv=None):
     if not args.sync and args.targets is None and not args.export \
             and args.init_db is None and not args.continuous \
             and args.recheck_whitelist is None and args.rescan is None \
-            and not args.download_db:
+            and not args.download_db and not args.vacuum_db:
         parser.print_help()
         return 2
     install_signal_handlers()
@@ -874,6 +904,8 @@ def main(argv=None):
             rc = cmd_init_db(*args.init_db) or rc
         if args.download_db:
             rc = cmd_download_db() or rc
+        if args.vacuum_db:
+            rc = cmd_vacuum_db() or rc
         if args.sync:
             rc = cmd_sync() or rc
         if args.recheck_whitelist is not None:

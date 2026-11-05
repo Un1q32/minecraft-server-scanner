@@ -573,5 +573,4 @@ def ensure_format(con: sqlite3.Connection) -> int:
         ensure_view(con)
         con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
         con.commit()
-        vacuum_if_bloated(con)
     return detect_format(con)
