@@ -6,6 +6,7 @@ try:
 except ImportError:
     # Optional dependency: everything except Shodan search works without it.
     shodan = None
+import atexit
 import codecs
 import bisect
 import gzip
@@ -163,6 +164,13 @@ MAX_NOTES_PER_SYNC = 2000
 TIMEOUT = 3
 PROTOCOL_VERSION = 772
 MAX_WORKERS = 100
+# Status rescans are I/O bound; a larger pool keeps more handshakes in
+# flight. Database and user-log writes are batched in scan_servers_gui().
+try:
+    STATUS_WORKERS = max(1, int(os.environ.get("MC_STATUS_WORKERS", "256")))
+except Exception:
+    STATUS_WORKERS = 256
+USER_LOG_SAVE_INTERVAL = 2.0
 SERVERS_DAT_PATH = os.path.expandvars(r"%APPDATA%\.minecraft\servers.dat")
 BACKUP_PATH = SERVERS_DAT_PATH + ".bak"
 
@@ -628,15 +636,17 @@ def init_server_db():
             con.close()
 
 
-def record_server_result(result, source="scan"):
-    """Upsert one successful ping_server() result into the history DB."""
-    _ensure_server_db()
+def _record_server_result_locked(con, result, source, now):
+    """Apply one result using an already-open connection and DB lock.
+
+    Shared by the single-result and batched paths.  Returns True when a row
+    was written.
+    """
     if not isinstance(result, dict) or not result.get("ip"):
-        return
+        return False
     ip_port = strict_ip_port(result.get("ip"))
     if not ip_port:
-        return
-    now = time.time()
+        return False
     try:
         host, port = split_host_port(ip_port)
     except Exception:
@@ -646,7 +656,7 @@ def record_server_result(result, source="scan"):
     # DB). Scanning/displaying them still works; only storage skips.
     try:
         if _is_bogon_ip(host):
-            return
+            return False
     except Exception:
         pass
     motd = sanitize_motd(result.get("motd", ""))[:MAX_MOTD_CHARS]
@@ -674,69 +684,110 @@ def record_server_result(result, source="scan"):
     # a previous full ping established — only full pings refresh it.
     sample_names = _sample_names(result.get("players_sample"))
     has_sample = source != "minescan"
+    cur = con.execute(
+        "SELECT times_seen, cracked, whitelist, last_source,"
+        " players_now, players_ever FROM server_state"
+        " WHERE ip_port=?", (ip_port,))
+    row = cur.fetchone()
+    if row is None:
+        con.execute(
+            "INSERT INTO server_state (ip_port, host, port, motd,"
+            " players_online, max_players, version, protocol, cracked,"
+            " needs_sync, times_seen, last_source, players_now,"
+            " players_ever)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
+            (ip_port, None, port, motd, online, maximum, version,
+             protocol, cracked, source,
+             _encode_player_list(sample_names if has_sample else []),
+             _encode_player_list(sample_names)),
+        )
+    else:
+        (times_seen, old_cracked, old_whitelist,
+         old_source, old_now, old_ever) = row
+        try:
+            times_seen = int(times_seen or 0) + 1
+        except Exception:
+            times_seen = 1
+        # A plain status ping never changes an existing cracked
+        # verdict (including the unset/NULL state).  Only the explicit
+        # cracked checker, a whitelist probe, or a transient reconnect
+        # kick (which unsets it) may do that.
+        keep_cracked = old_cracked
+        if (db_format.source_is_cracked_verdict(old_source)
+                and not db_format.source_is_cracked_verdict(source)):
+            source = old_source
+        now_json = (_encode_player_list(sample_names) if has_sample
+                    else old_now)
+        ever_json = _encode_player_list(
+            _merge_player_lists(old_ever, sample_names))
+        con.execute(
+            "UPDATE server_state SET host=?, port=?, motd=?,"
+            " players_online=?, max_players=?, version=?,"
+            " protocol=COALESCE(?, protocol), cracked=?, needs_sync=1,"
+            " times_seen=?, last_source=?, players_now=?, players_ever=?"
+            " WHERE ip_port=?",
+            (None, port, motd, online, maximum, version, protocol,
+             keep_cracked, times_seen, source, now_json, ever_json,
+             ip_port),
+        )
+    con.execute(
+        "INSERT OR IGNORE INTO server_history"
+        " (ip_port, seen_at, players_online, max_players)"
+        " VALUES (?, ?, ?, ?)",
+        (ip_port, now, online, maximum))
+    if sample_names:
+        con.executemany(
+            "INSERT OR IGNORE INTO player_history"
+            " (ip_port, player_name, seen_at) VALUES (?, ?, ?)",
+            [(ip_port, name, now) for name in sample_names])
+    return True
+
+
+def record_server_result(result, source="scan"):
+    """Upsert one successful ping_server() result into the history DB."""
+    _ensure_server_db()
+    now = time.time()
+    changed = False
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
-            cur = con.execute(
-                "SELECT times_seen, cracked, whitelist, last_source,"
-                " players_now, players_ever FROM server_state"
-                " WHERE ip_port=?", (ip_port,))
-            row = cur.fetchone()
-            if row is None:
-                con.execute(
-                    "INSERT INTO server_state (ip_port, host, port, motd,"
-                    " players_online, max_players, version, protocol, cracked,"
-                    " needs_sync, times_seen, last_source, players_now,"
-                    " players_ever)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
-                    (ip_port, None, port, motd, online, maximum, version,
-                     protocol, cracked, source,
-                     _encode_player_list(sample_names if has_sample else []),
-                     _encode_player_list(sample_names)),
-                )
-            else:
-                (times_seen, old_cracked, old_whitelist,
-                 old_source, old_now, old_ever) = row
+            changed = _record_server_result_locked(con, result, source, now)
+            if changed:
+                con.commit()
+        finally:
+            con.close()
+    if changed:
+        _notify_server_db_tab()
+
+
+def record_server_results(results, source="scan"):
+    """Upsert a batch of results in one transaction. Returns rows written."""
+    _ensure_server_db()
+    if not results:
+        return 0
+    recorded = 0
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            for result in results:
                 try:
-                    times_seen = int(times_seen or 0) + 1
+                    con.execute("SAVEPOINT one_server_result")
+                    if _record_server_result_locked(
+                            con, result, source, time.time()):
+                        recorded += 1
+                    con.execute("RELEASE one_server_result")
                 except Exception:
-                    times_seen = 1
-                # A plain status ping never changes an existing cracked
-                # verdict (including the unset/NULL state).  Only the explicit
-                # cracked checker, a whitelist probe, or a transient reconnect
-                # kick (which unsets it) may do that.
-                keep_cracked = old_cracked
-                if (db_format.source_is_cracked_verdict(old_source)
-                        and not db_format.source_is_cracked_verdict(source)):
-                    source = old_source
-                now_json = (_encode_player_list(sample_names) if has_sample
-                            else old_now)
-                ever_json = _encode_player_list(
-                    _merge_player_lists(old_ever, sample_names))
-                con.execute(
-                    "UPDATE server_state SET host=?, port=?, motd=?,"
-                    " players_online=?, max_players=?, version=?,"
-                    " protocol=COALESCE(?, protocol), cracked=?, needs_sync=1,"
-                    " times_seen=?, last_source=?, players_now=?, players_ever=?"
-                    " WHERE ip_port=?",
-                    (None, port, motd, online, maximum, version, protocol,
-                     keep_cracked, times_seen, source, now_json, ever_json,
-                     ip_port),
-                )
-            con.execute(
-                "INSERT OR IGNORE INTO server_history"
-                " (ip_port, seen_at, players_online, max_players)"
-                " VALUES (?, ?, ?, ?)",
-                (ip_port, now, online, maximum))
-            if sample_names:
-                con.executemany(
-                    "INSERT OR IGNORE INTO player_history"
-                    " (ip_port, player_name, seen_at) VALUES (?, ?, ?)",
-                    [(ip_port, name, now) for name in sample_names])
+                    try:
+                        con.execute("ROLLBACK TO one_server_result")
+                        con.execute("RELEASE one_server_result")
+                    except Exception:
+                        pass
             con.commit()
         finally:
             con.close()
-    _notify_server_db_tab()
+    if recorded:
+        _notify_server_db_tab()
+    return recorded
 
 
 def update_server_cracked(ip_port, cracked_label, message=""):
@@ -3250,8 +3301,31 @@ def create_proxied_connection(proxy, target_host, target_port, timeout=6):
 def open_connection(host, port, proxy=None, timeout=6):
     """Open a TCP connection to (host, port), optionally through a proxy."""
     if proxy:
-        return create_proxied_connection(proxy, host, port, timeout=timeout)
-    return socket.create_connection((host, port), timeout=timeout)
+        sock = create_proxied_connection(proxy, host, port, timeout=timeout)
+    else:
+        # Most entries are IPv4 literals. Avoid getaddrinfo()/DNS for them.
+        try:
+            addr = ipaddress.IPv4Address(host)
+        except Exception:
+            addr = None
+        if addr is None:
+            sock = socket.create_connection((host, port), timeout=timeout)
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            try:
+                sock.connect((str(addr), port))
+            except Exception:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                raise
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    return sock
 
 def test_proxy(proxy, target_host=PROXY_TEST_HOST, target_port=PROXY_TEST_PORT, timeout=6):
     try:
@@ -3993,7 +4067,7 @@ def parse_description(desc):
             return sanitize_motd(''.join([x.get('text', '') for x in desc['extra']]))
     return ''
 
-def ping_server(entry, proxy=None):
+def ping_server(entry, proxy=None, persist=True):
     if _SHUTDOWN.is_set():
         return None
     try:
@@ -4008,8 +4082,8 @@ def ping_server(entry, proxy=None):
                 struct.pack('>H', port) +
                 varint_encode(1)
             )
-            sock.send(varint_encode(len(handshake)) + handshake)
-            sock.send(varint_encode(1) + b'\x00')
+            sock.sendall(varint_encode(len(handshake)) + handshake +
+                         varint_encode(1) + b'\x00')
 
             _ = varint_decode(sock)
             _ = varint_decode(sock)
@@ -4093,10 +4167,11 @@ def ping_server(entry, proxy=None):
                 'cracked': cracked
             }
             _remember_protocol(result['ip'], result['protocol'])
-            try:
-                record_server_result(result, source="scan")
-            except Exception:
-                pass
+            if persist:
+                try:
+                    record_server_result(result, source="scan")
+                except Exception:
+                    pass
             return result
     except:
         return None
@@ -4361,8 +4436,8 @@ def get_server_status_full(host, port=25565, proxy=None):
             struct.pack(">H", port) +
             varint_encode(1)
         )
-        sock.sendall(varint_encode(len(handshake)) + handshake)
-        sock.sendall(varint_encode(1) + b"\x00")
+        sock.sendall(varint_encode(len(handshake)) + handshake +
+                     varint_encode(1) + b"\x00")
 
         _ = recv_varint(sock)
         _ = recv_varint(sock)
@@ -7368,7 +7443,10 @@ class UserLogManager:
     def __init__(self):
         self._entries = {}  # player -> {"ip": ..., "motd": ..., "last_seen": ts}
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self._tab = None
+        self._dirty = False
+        self._last_save = 0.0
         self._load_from_disk()
 
     def attach_tab(self, tab: "UserLogTab"):
@@ -7412,9 +7490,28 @@ class UserLogManager:
                 else:
                     self._entries[player]["last_seen"] = now
                 changed = True
+            if changed:
+                self._dirty = True
         if changed:
+            self._flush_due()
+
+    def _flush_due(self, force=False):
+        """Write at most once per USER_LOG_SAVE_INTERVAL during scans."""
+        now = time.time()
+        with self._save_lock:
+            with self._lock:
+                if not self._dirty:
+                    return
+                if not force and now - self._last_save < USER_LOG_SAVE_INTERVAL:
+                    return
+                self._dirty = False
+            self._last_save = now
             self._save_to_disk()
             self._notify_tab()
+
+    def flush(self):
+        """Force any pending user-log changes to disk."""
+        self._flush_due(force=True)
 
     def _notify_tab(self):
         if self._tab:
@@ -7453,12 +7550,13 @@ class UserLogManager:
         snapshot = self.snapshot()
         try:
             with open(USER_LOG_FILE, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, indent=2)
+                json.dump(snapshot, f, separators=(",", ":"))
         except Exception:
             pass
 
 
 USER_LOG_MANAGER = UserLogManager()
+atexit.register(USER_LOG_MANAGER.flush)
 
 def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
     try:
@@ -7472,8 +7570,8 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
                 struct.pack('>H', port) +
                 varint_encode(1)
             )
-            sock.send(varint_encode(len(handshake)) + handshake)
-            sock.send(varint_encode(1) + b'\x00')
+            sock.sendall(varint_encode(len(handshake)) + handshake +
+                         varint_encode(1) + b'\x00')
             _ = varint_decode(sock)
             _ = varint_decode(sock)
             json_length = varint_decode(sock)
@@ -7508,9 +7606,13 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
         if on_start:
             try: on_start(ip)
             except Exception: pass
-        return ping_server(ip)
+        # The batch loop below persists results with one transaction.
+        return ping_server(ip, persist=False)
 
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    # More in-flight handshakes, but DB/user-log writes are batched so the
+    # workers spend their time on the network instead of fsync per server.
+    workers = min(STATUS_WORKERS, max(1, total))
+    executor = ThreadPoolExecutor(max_workers=workers)
     futures = {}
     stopped = False
     try:
@@ -7526,10 +7628,21 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
             # honored promptly even while every worker is mid-handshake.
             done_set, pending = wait(pending, timeout=0.25,
                                      return_when=FIRST_COMPLETED)
+            fetched = []
             for fut in done_set:
                 r = fut.result()
                 done += 1
+                fetched.append(r)
+            completed = [r for r in fetched if r]
+            if completed:
+                try:
+                    record_server_results(completed, source="scan")
+                except Exception:
+                    pass
 
+            progress_done = done - len(fetched)
+            for r in fetched:
+                progress_done += 1
                 if r:
                     results.append(r)
                     line = format_result_line(
@@ -7543,13 +7656,14 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
                         except Exception: pass
 
                 if on_progress:
-                    try: on_progress(done, total)
+                    try: on_progress(progress_done, total)
                     except Exception: pass
     except BaseException:
         # Ctrl+C / SIGTERM / any hard error: never wait for the queue.
         stopped = True
         raise
     finally:
+        USER_LOG_MANAGER.flush()
         if stopped:
             for f in futures:
                 try: f.cancel()
@@ -9460,7 +9574,7 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                         opened_n = {"n": 0}
                         probed_n = {"n": 0}
                         scan_prog = {"pct": None, "rate": None}
-                        hs_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+                        hs_executor = ThreadPoolExecutor(max_workers=STATUS_WORKERS)
 
                         def update_stream_status():
                             if job != self._scan_job_id:
