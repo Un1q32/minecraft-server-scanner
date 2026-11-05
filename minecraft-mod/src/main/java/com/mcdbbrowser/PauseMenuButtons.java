@@ -19,6 +19,9 @@ final class PauseMenuButtons {
 	}
 
 	static void addTo(PauseScreen screen, Minecraft minecraft, List<AbstractWidget> widgets) {
+		if (alreadyPresent(widgets)) {
+			return;
+		}
 		ServerData server = minecraft.getCurrentServer();
 		if (!screen.showsPauseMenu() || server == null || minecraft.isLocalServer()) {
 			return;
@@ -46,5 +49,16 @@ final class PauseMenuButtons {
 		widgets.add(Button.builder(Component.literal("Player History"),
 			button -> minecraft.gui.setScreen(new PlayerHistoryScreen(screen, address.getHost() + ":" + address.getPort())))
 			.bounds(MARGIN, MARGIN + 3 * SPACING, WIDTH, HEIGHT).build());
+	}
+
+	/** Fabric re-fires AFTER_INIT on resize, and resize keeps the existing widgets. */
+	private static boolean alreadyPresent(List<AbstractWidget> widgets) {
+		for (AbstractWidget widget : widgets) {
+			if (widget instanceof Button button
+					&& "Find in Server DB".equals(button.getMessage().getString())) {
+				return true;
+			}
+		}
+		return false;
 	}
 }
