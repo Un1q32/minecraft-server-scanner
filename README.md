@@ -494,7 +494,10 @@ in the database's directory. This is a status ping only: no masscan sweep
 and no shared-DB sync. It refreshes MOTD, version, player counts/samples and
 `last_seen`, and the table reloads and re-applies the active sort when it
 finishes. The job log follows the same 10-second / non-zero-exit rule as
-**Sync DB**.
+**Sync DB**. Status pings run with 256 workers by default; set
+`MC_STATUS_WORKERS` to tune that. Results are written to SQLite in batches
+and the player log is flushed at most every two seconds, so large rescans
+spend their time on the network instead of one commit per server.
 
 ### Recheck whitelist
 
