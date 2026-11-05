@@ -302,7 +302,7 @@ empty, then continues with the normal incremental sync of both DBs.
 
 Runs forever and picks what to scan next from what has been paying off
 (matscan-inspired). Normal rounds run a discovery strategy; every
-`--rescan-every` rounds (default 4) the loop takes one **rescan** round
+`--rescan-every` rounds (default 2) the loop takes one **rescan** round
 instead.
 
 Normal rounds choose one strategy, weighted by history:
@@ -312,7 +312,6 @@ Normal rounds choose one strategy, weighted by history:
 | `slash0` | whole IPv4 space on the configured ports (default 25565; time-boxed, masscan's random order) |
 | `slash16a` | `/16`s around servers seen in the last 30 days |
 | `slash16b` | `/16`s with ≥ 32 known IPs (busy subnets, last 365 days) |
-| `slash20a` | `/20`s around servers seen in the last 365 days |
 | `slash24a` | `/24`s around servers seen in the last 365 days |
 | `slash24b` | the same `/24`s on 25566-25568 |
 | `slash24c` | the same `/24`s on 25560-25564 and 25569-25570 |
@@ -328,23 +327,20 @@ that answers again counts 0.1×. Scores persist in `strategies.json`
 random one, and untried strategies go first so the empty case bootstraps
 with `slash0`.
 
-Rescan rounds revisit the exact stored `ip:port` by age: a fast tier
-(every 10 minutes) for servers that currently have players online, then
-last pinged 2h-1d, 1-7d, 7-30d, 30-365d, or over a year ago. Rescans do
-not expand hosts into `/20`s; masscan's global `--rate` already paces the
-probes, and padding turned a 155k-server rescan into hundreds of millions
-of useless probes. Neighborhood discovery stays in the normal
-`slash16*`/`slash20a`/`slash24*` strategies. Because rescans now check
-only known endpoints they are cheap, so one rescan round runs every
-`--rescan-every` rounds (default 4) rather than every other round. Ports
-with only a handful of servers are pinged directly instead of starting a
-separate masscan process, and the largest port group runs first.
+Rescan rounds revisit servers by age: a fast tier (every 10 minutes) for
+servers that currently have players online, then last pinged 2h-1d, 1-7d,
+7-30d, 30-365d, or over a year ago. Older-with-25565 hosts are diluted
+into their `/20` so a rescan doesn't burst at known addresses; the
+Minecraft handshake, not the SYN sweep, dominates rescan time, so the
+extra hosts are nearly free. Ports with only a handful of servers are
+pinged directly instead of starting a separate masscan process, and the
+largest port group runs first.
 
 Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
 sweeps a random slice of the internet rather than all four billion
 addresses. `--ports` (e.g. `--ports 25565,25566,25600-25610`) sets the
-ports used by the broad `slash0`, `slash16a`, `slash16b`, `slash20a` and
-`slash24a` strategies; `slash24b`/`slash24c` keep their fixed nearby-port sets and
+ports used by the broad `slash0`, `slash16a`, `slash16b` and `slash24a`
+strategies; `slash24b`/`slash24c` keep their fixed nearby-port sets and
 the `slash32*` strategies still sweep every port on known IPs. Rescans
 always use each server's stored port. While a round runs, a status line at the bottom of the terminal
 counts servers found so far in that round — `new`, `updated` and total
@@ -364,9 +360,9 @@ finish (bounded by the ping timeout), and any queued handshake backlog is
 cancelled instead of extending the round.
 
 `--strategies slash24a,slash32b` restricts the pool, `--rescan-every N`
-sets the rescan cadence (default 4; `2` restores the old alternating
-behaviour, `1` rescans every round), `--no-rescan` skips rescan rounds
-entirely, and `--rounds N` stops after N rounds (useful for testing). The
+sets the rescan cadence (default 2, alternating normal/rescan; `1`
+rescans every round), `--no-rescan` skips rescan rounds entirely, and
+`--rounds N` stops after N rounds (useful for testing). The
 deep-port strategies need masscan and root; without them the Python
 backend skips rounds whose probe count exceeds its cap.
 

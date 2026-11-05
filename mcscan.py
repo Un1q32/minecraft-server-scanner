@@ -838,15 +838,15 @@ def main(argv=None):
     parser.add_argument(
         "--strategies", metavar="LIST", default=None,
         help="comma-separated strategies for --continuous: "
-             "slash0,slash16a,slash16b,slash20a,slash24a,slash24b,"
-             "slash24c,slash32a,slash32b,slash32c")
+             "slash0,slash16a,slash16b,slash24a,slash24b,slash24c,"
+             "slash32a,slash32b,slash32c")
     parser.add_argument(
         "--no-rescan", action="store_true",
         help="--continuous: skip rescan rounds entirely")
     parser.add_argument(
         "--rescan-every", type=int, default=None, metavar="N",
         help="--continuous: run one rescan round every N rounds "
-             "(default: 4; 2 alternates normal/rescan, 1 rescans every "
+             "(default: 2, alternating normal/rescan; 1 rescans every "
              "round)")
     parser.add_argument(
         "--shard", metavar="I/N", default=None,
@@ -877,7 +877,7 @@ def main(argv=None):
         "--ports", default="25565",
         help='ports to scan, e.g. "25565" or "25565,25566" (default: 25565); '
              'in --continuous this sets the broad-strategy ports '
-             '(slash0/slash16*/slash20a/slash24a)')
+             '(slash0/slash16*/slash24a)')
     parser.add_argument(
         "--rate", type=int, default=scanner.MASSCAN_DEFAULT_RATE,
         help="masscan packets/sec (default: %(default)s)")

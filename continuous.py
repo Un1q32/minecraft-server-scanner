@@ -7,7 +7,6 @@ Runs two round categories forever:
               time-boxed, random order)
     slash16a  /16 blocks around servers seen in the last 30 days
     slash16b  /16 blocks with >= 32 known IPs (busy subnets, last 365 days)
-    slash20a  /20 blocks around servers seen in the last 365 days
     slash24a  /24 blocks around servers seen in the last 365 days
     slash24b  ... same /24s on ports 25566-25568
     slash24c  ... same /24s on ports 25560-25564 + 25569-25570
@@ -16,9 +15,8 @@ Runs two round categories forever:
     slash32c  IPs hosting >= 8 servers on all ports 1024-65535
 * **rescan** -- servers whose last successful ping is due, by age tier
   (2h-1d, 1-7d, 7-30d, 30-365d, >365d), plus a fast tier for servers
-  that have players online right now.  Rescans are cheap enough that they
-  no longer need to take every other round; by default one rescan runs
-  every ``DEFAULT_RESCAN_EVERY`` rounds (``--rescan-every``).
+  that have players online right now.  One rescan round runs every
+  ``DEFAULT_RESCAN_EVERY`` rounds (``--rescan-every``).
 
 After each normal round the strategy is scored like matscan:
 ``(new + 5*new_on_25565 + 0.1*revived) * 3600 / (seconds + 30)`` --
@@ -62,7 +60,7 @@ import scanner
 SLEEP_SECS = 10                 # quiet gap between rounds (attribution)
 DEFAULT_SCAN_DURATION = 300     # per-round time box (matscan: 5 min)
 DEFAULT_SYNC_EVERY = 300        # shared-DB sync cadence
-DEFAULT_RESCAN_EVERY = 4        # normal rounds between rescan rounds
+DEFAULT_RESCAN_EVERY = 2        # normal rounds between rescan rounds
 RESCAN_PY_MAX = 100             # tiny port groups: ping directly, no masscan
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
@@ -79,7 +77,7 @@ SHARD_TIMEOUT = 8.0             # per-heartbeat HTTP timeout (seconds)
 NODE_ID_FILE = "continuous_node_id"
 
 STRATEGY_NAMES = (
-    "slash0", "slash16a", "slash16b", "slash20a",
+    "slash0", "slash16a", "slash16b",
     "slash24a", "slash24b", "slash24c",
     "slash32a", "slash32b", "slash32c",
 )
@@ -87,28 +85,26 @@ STRATEGY_NAMES = (
 # Rescan tiers: only servers whose last_seen falls in
 # (now - max_age, now - every) are due. require_players is matscan's
 # "rescan2" idea: servers with people on them are rechecked often.
-# Rescans ping the exact ip:port that was stored, never a padded /20.
-# Padding a 155k-server rescan into /20s turned it into >500M probes, so a
-# 300s round only reached a few hundred servers and reported almost no
-# hits.  masscan already paces SYNs globally (--rate), so exact endpoints
-# are not a "tight burst".  Neighborhood discovery stays in the normal
-# slash16/slash24 strategies, where it belongs.
+# Older-with-25565 hosts are diluted into their /20 so a rescan does not
+# burst at known addresses.  The Minecraft handshake, not the SYN sweep,
+# dominates rescan time, so the extra discovered hosts are nearly free.
 #
 # rescan-players goes first: those servers are online right now and are
 # the most valuable to refresh.
 RESCAN_TIERS = (
     {"name": "rescan-players", "every": 600, "max_age": 2 * 3600,
-     "limit": 10_000, "sort": "oldest", "require_players": True},
+     "limit": 10_000, "sort": "oldest", "require_players": True,
+     "padded": False},
     {"name": "rescan-1d", "every": 2 * 3600, "max_age": 86400,
-     "limit": 250_000, "sort": "oldest"},
+     "limit": 250_000, "sort": "oldest", "padded": True},
     {"name": "rescan-7d", "every": 86400, "max_age": 7 * 86400,
-     "limit": 250_000, "sort": "oldest"},
+     "limit": 250_000, "sort": "oldest", "padded": True},
     {"name": "rescan-30d", "every": 7 * 86400, "max_age": 30 * 86400,
-     "limit": 250_000, "sort": "random"},
+     "limit": 250_000, "sort": "random", "padded": True},
     {"name": "rescan-365d", "every": 30 * 86400, "max_age": 365 * 86400,
-     "limit": 500_000, "sort": "random"},
+     "limit": 500_000, "sort": "random", "padded": True},
     {"name": "rescan-old", "every": 365 * 86400, "max_age": 3650 * 86400,
-     "limit": 500_000, "sort": "random"},
+     "limit": 500_000, "sort": "random", "padded": True},
 )
 
 
@@ -207,12 +203,6 @@ def strat_slash16b(rows, base_ports=None):
     return (_prefixes_to_cidrs(groups, 16), _base_ports(base_ports))
 
 
-def strat_slash20a(rows, base_ports=None):
-    active = _active(rows, 365 * 86400)
-    groups = _group_by(active, 20)
-    return (_prefixes_to_cidrs(groups, 20), _base_ports(base_ports))
-
-
 def strat_slash24a(rows, base_ports=None):
     active = _active(rows, 365 * 86400)
     groups = _group_by(active, 24)
@@ -269,7 +259,6 @@ STRATEGIES = {
     "slash0": strat_slash0,
     "slash16a": strat_slash16a,
     "slash16b": strat_slash16b,
-    "slash20a": strat_slash20a,
     "slash24a": strat_slash24a,
     "slash24b": strat_slash24b,
     "slash24c": strat_slash24c,
@@ -281,10 +270,11 @@ STRATEGIES = {
 
 # --- rescan tiers ---------------------------------------------------------
 def rescan_targets(rows, tier):
-    """Due servers for one tier -> [(ip, port), ...].
+    """Due servers for one tier -> [(spec, port), ...].
 
-    Servers keep their own exact address and port.  The caller groups them
-    by port before sweeping, so one masscan run checks each due endpoint.
+    Servers keep their own port (grouped by port before sweeping), and
+    padded tiers expand port-25565 hosts to their /20 -- matscan's trick
+    to avoid a tight burst at known addresses.
     """
     now = _now()
     every = tier["every"]
@@ -319,8 +309,16 @@ def rescan_targets(rows, tier):
     for row in picked:
         ip_port = str(row.get("ip_port", ""))
         ip = _host_of(ip_port)
-        if ip:
-            targets.append((ip, _port_of(ip_port)))
+        port = _port_of(ip_port)
+        if tier.get("padded") and port == 25565:
+            try:
+                a, b, c, _ = (int(x) for x in ip.split("."))
+            except Exception:
+                targets.append((ip, port))
+                continue
+            targets.append((f"{a}.{b}.{c & 0xF0}.0/20", port))
+        else:
+            targets.append((ip, port))
     return targets
 
 
@@ -564,8 +562,6 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 pass
 
     if use_masscan:
-        _log(f"  masscan: ~{est:,} probe(s) across {len(ranges):,} "
-             f"target spec(s)")
         pool = scanner.ThreadPoolExecutor(max_workers=scanner.STATUS_WORKERS)
         sweep_deadline = time.monotonic() + max(1, scan_duration)
         futures = set()
@@ -1117,22 +1113,6 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     if added:
                         print(f"  {tier['name']}: {added} due")
                 if targets:
-                    shard_total = 1
-                    try:
-                        if shard_state.get("value"):
-                            shard_total = max(1, int(shard_state["value"][1]))
-                    except Exception:
-                        shard_total = 1
-                    est_secs = (len(targets) / max(1, rate)
-                                / shard_total)
-                    print(f"  {len(targets)} unique due endpoint(s), "
-                          f"~{est_secs:.0f}s at {rate}pps"
-                          + (f" over {shard_total} shards"
-                             if shard_total > 1 else ""))
-                    if est_secs > scan_duration:
-                        print(f"  note: this exceeds the {scan_duration}s "
-                              f"round budget; raise --rate or "
-                              f"--scan-duration, or rescans will be cut off")
                     # Keep per-target ports: group by port for the sweep.
                     by_port = {}
                     for spec, port in targets:
@@ -1159,18 +1139,17 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                             # port, but never go past the shared deadline.
                             duration = min(
                                 max(30, scan_duration // 2), remaining)
-                            direct = len(specs) <= RESCAN_PY_MAX
-                            status.note(
-                                f"  port {port}: {len(specs)} endpoint(s)"
-                                + (" via python" if direct else ""))
-                            group_started = time.monotonic()
+                            # Tiny exact groups are cheaper to ping directly
+                            # than to start another masscan process.  Padded
+                            # /20 groups can still contain thousands of hosts,
+                            # so they always go through masscan.
+                            direct = (len(specs) <= RESCAN_PY_MAX
+                                      and _estimate_probes(specs, [port])
+                                      <= RESCAN_PY_MAX)
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note,
                                 backend="python" if direct else None)
-                            status.note(
-                                f"  port {port}: {len(batch)} result(s) in "
-                                f"{time.monotonic() - group_started:.0f}s")
                             results.extend(batch)
                             processed_ports += 1
                             if fatal:
