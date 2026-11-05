@@ -42,6 +42,7 @@ Discovery only: status pings, no logins. masscan is strongly recommended
 back to the Python handshake pool and skips rounds that are too large.
 """
 
+import concurrent.futures
 import json
 import os
 import random
@@ -548,6 +549,8 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
     if use_masscan:
         pool = scanner.ThreadPoolExecutor(max_workers=scanner.STATUS_WORKERS)
         sweep_deadline = time.monotonic() + max(1, scan_duration)
+        futures = set()
+        futures_lock = threading.Lock()
 
         def handshake(ip_port):
             if scanner.shutdown_requested():
@@ -563,7 +566,9 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 # Do not let a burst of late masscan hits grow a handshake
                 # queue that outlives the round's time box.
                 return
-            pool.submit(handshake, ip_port)
+            future = pool.submit(handshake, ip_port)
+            with futures_lock:
+                futures.add(future)
 
         def sweep(use_sudo):
             scanner.run_masscan_streaming(
@@ -587,11 +592,30 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
             # Time box hit with nothing found: normal for slash0.
             pass
         finally:
-            # Interrupted: drop queued handshakes instead of waiting for
-            # them (and for the atexit join that follows).
-            quick = scanner.shutdown_requested() or stop_event.is_set()
+            # Drain handshakes only until the round deadline.  A slash24a
+            # sweep can produce a hit backlog many times larger than the
+            # worker pool, and waiting for all of it is what made those
+            # rounds last 20 minutes.  Work already running is allowed to
+            # finish (bounded by the ping socket timeout); queued work is
+            # cancelled instead of extending the round.
+            stopped = scanner.shutdown_requested() or stop_event.is_set()
+            remaining = 0 if stopped else sweep_deadline - time.monotonic()
+            if remaining > 0:
+                with futures_lock:
+                    snapshot = list(futures)
+                try:
+                    concurrent.futures.wait(snapshot, timeout=remaining)
+                except Exception:
+                    pass
+            with futures_lock:
+                snapshot = list(futures)
+            for future in snapshot:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
             try:
-                pool.shutdown(wait=not quick, cancel_futures=quick)
+                pool.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
         return results

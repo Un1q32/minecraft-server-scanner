@@ -346,7 +346,10 @@ player history but do not download the shared activity history; run a normal
 `--sync` later if you want the full activity history on that machine.
 Each rescan round has one shared `--scan-duration` budget even when the due
 servers use many different ports, so a 40-port rescan cannot turn into
-40 separate full-length sweeps.
+40 separate full-length sweeps. Normal rounds obey the same deadline:
+masscan is stopped at `--scan-duration`, handshakes already running may
+finish (bounded by the ping timeout), and any queued handshake backlog is
+cancelled instead of extending the round.
 
 `--strategies slash24a,slash32b` restricts the pool, `--no-rescan` skips
 the rescan half, and `--rounds N` stops after N rounds (useful for
