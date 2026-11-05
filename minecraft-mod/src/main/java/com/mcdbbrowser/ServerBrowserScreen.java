@@ -558,6 +558,24 @@ public class ServerBrowserScreen extends DropdownScreen {
 		}
 
 		@Override
+		public void refreshScrollAmount() {
+			this.setScrollAmount(this.scrollOffset);
+		}
+
+		@Override
+		public int scrollBarY() {
+			// The base implementation reads AbstractScrollArea's private
+			// scrollAmount field, which this widget deliberately does not use.
+			int max = this.maxScrollAmount();
+			if (max == 0) {
+				return this.getY();
+			}
+			int travel = Math.max(0, this.getHeight() - this.scrollerHeight());
+			return Math.max(this.getY(),
+				this.getY() + (int) (this.scrollOffset * travel / max));
+		}
+
+		@Override
 		public Optional<GuiEventListener> getChildAt(double x, double y) {
 			return Optional.ofNullable(this.entryAt(x, y));
 		}

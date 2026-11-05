@@ -9,9 +9,16 @@ import net.minecraft.client.gui.components.AbstractButton;
 import net.minecraft.client.gui.narration.NarrationElementOutput;
 import net.minecraft.client.input.InputWithModifiers;
 import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.Component;
 
-/** A button showing the current value that opens a menu of all values. The menu itself is driven by {@link DropdownScreen}. */
+/**
+ * A button showing the current value that opens a small menu of all values.
+ *
+ * The menu is not a separate screen or a custom click interceptor: the screen
+ * returns an open dropdown from getChildAt(), so vanilla mouse dispatch calls
+ * this widget's mouseClicked() for clicks on either the button or the menu.
+ */
 final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 	private static final int MENU_ROW_HEIGHT = 14;
 	private static final int TEXT_INSET = 6;
@@ -20,6 +27,7 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 	private static final int HIGHLIGHT = 0x60FFFFFF;
 	private static final int WHITE = 0xFFFFFFFF;
 	private static final int SELECTED_TEXT = 0xFFFFFF55;
+	private static final int LEFT_BUTTON = 0;
 
 	private final String name;
 	private final List<T> values;
@@ -47,14 +55,14 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 		return this.open;
 	}
 
+	void close() {
+		this.open = false;
+	}
+
 	@Override
 	public void onPress(InputWithModifiers input) {
 		this.open = true;
 		this.highlighted = this.values.indexOf(this.value);
-		Minecraft minecraft = Minecraft.getInstance();
-		if (minecraft != null && minecraft.gui.screen() instanceof DropdownScreen screen) {
-			screen.markOpen(this);
-		}
 	}
 
 	@Override
@@ -80,12 +88,39 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 		return fitsBelow || this.getY() < this.menuHeight() ? below : this.getY() - this.menuHeight();
 	}
 
+	private boolean isOverMenu(double x, double y) {
+		int top = this.menuTop();
+		return x >= this.getX() && x < this.getX() + this.getWidth()
+			&& y >= top && y < top + this.menuHeight();
+	}
+
+	@Override
+	public boolean isMouseOver(double x, double y) {
+		return super.isMouseOver(x, y) || (this.open && this.isOverMenu(x, y));
+	}
+
 	private int rowAt(double x, double y) {
 		int top = this.menuTop();
-		if (x < this.getX() || x >= this.getX() + this.getWidth() || y < top || y >= top + this.menuHeight()) {
+		if (x < this.getX() || x >= this.getX() + this.getWidth()
+				|| y < top || y >= top + this.menuHeight()) {
 			return -1;
 		}
 		return (int) ((y - top) / MENU_ROW_HEIGHT);
+	}
+
+	@Override
+	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+		if (this.open) {
+			int row = this.rowAt(event.x(), event.y());
+			boolean left = event.button() == LEFT_BUTTON;
+			this.open = false;
+			if (row >= 0 && left) {
+				this.playDownSound(Minecraft.getInstance().getSoundManager());
+				this.select(this.values.get(row));
+			}
+			return true;
+		}
+		return super.mouseClicked(event, doubleClick);
 	}
 
 	void extractMenu(GuiGraphicsExtractor graphics, int mouseX, int mouseY) {
@@ -113,19 +148,10 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 				graphics.fill(left, rowTop, left + width, rowTop + MENU_ROW_HEIGHT, HIGHLIGHT);
 			}
 			String label = font.plainSubstrByWidth(rowValue.label(), width - 2 * TEXT_INSET);
-			graphics.text(font, label, left + TEXT_INSET, rowTop + 3, rowValue == this.value ? SELECTED_TEXT : WHITE);
+			graphics.text(font, label, left + TEXT_INSET, rowTop + 3,
+				rowValue == this.value ? SELECTED_TEXT : WHITE);
 		}
 		graphics.outline(left, top, width, this.menuHeight(), BORDER);
-	}
-
-	/** Any click closes the menu; only a left click on a row picks that row. */
-	void menuClicked(double x, double y, boolean leftButton) {
-		int row = this.rowAt(x, y);
-		this.open = false;
-		if (row >= 0 && leftButton) {
-			this.playDownSound(Minecraft.getInstance().getSoundManager());
-			this.select(this.values.get(row));
-		}
 	}
 
 	void menuKeyPressed(KeyEvent event) {
@@ -143,8 +169,6 @@ final class Dropdown<T extends ServerDatabase.Labeled> extends AbstractButton {
 	}
 
 	private void select(T newValue) {
-		// Always notify: the sort dropdown uses a repeated click on the same
-		// column to toggle its direction, exactly like a table header.
 		this.value = newValue;
 		this.updateMessage();
 		this.onChange.accept(newValue);

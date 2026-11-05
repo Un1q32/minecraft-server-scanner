@@ -1,19 +1,20 @@
 package com.mcdbbrowser;
 
+import java.util.Optional;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.events.GuiEventListener;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
-import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.Component;
 import org.jspecify.annotations.Nullable;
 
-/** A screen hosting {@link Dropdown}s. While a menu is open it draws on top of everything and takes all input. */
+/**
+ * A screen hosting {@link Dropdown}s. While a menu is open the dropdown is
+ * returned from getChildAt(), so ordinary vanilla mouse dispatch calls the
+ * dropdown's own mouseClicked() for both the button and the menu rows.
+ */
 abstract class DropdownScreen extends Screen {
-	private static final int LEFT_BUTTON = 0;
 	private static final int NO_MOUSE = -1;
-
-	private @Nullable Dropdown<?> opened;
 
 	protected DropdownScreen(Component title) {
 		super(title);
@@ -22,17 +23,7 @@ abstract class DropdownScreen extends Screen {
 	/** Draws whatever the screen shows besides its widgets. Open menus are drawn over this. */
 	protected abstract void extractForeground(GuiGraphicsExtractor graphics);
 
-	void markOpen(Dropdown<?> dropdown) {
-		this.opened = dropdown;
-	}
-
 	private @Nullable Dropdown<?> openDropdown() {
-		if (this.opened != null) {
-			if (this.opened.isOpen()) {
-				return this.opened;
-			}
-			this.opened = null;
-		}
 		for (GuiEventListener child : this.children()) {
 			if (child instanceof Dropdown<?> dropdown && dropdown.isOpen()) {
 				return dropdown;
@@ -53,13 +44,15 @@ abstract class DropdownScreen extends Screen {
 	}
 
 	@Override
-	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+	public Optional<GuiEventListener> getChildAt(double x, double y) {
+		// The open menu can overlap the server list and other widgets. Claim
+		// every click while it is open; Dropdown.mouseClicked() decides whether
+		// it was a row, the button, or an outside click that closes the menu.
 		Dropdown<?> open = this.openDropdown();
-		if (open == null) {
-			return super.mouseClicked(event, doubleClick);
+		if (open != null) {
+			return Optional.of(open);
 		}
-		open.menuClicked(event.x(), event.y(), event.button() == LEFT_BUTTON);
-		return true;
+		return super.getChildAt(x, y);
 	}
 
 	@Override
