@@ -508,15 +508,19 @@ MAX_SANITIZE_INPUT = 4000    # bound the regex work on hostile strings
 def _clean_player_name(name):
     """One server-reported name -> stored string, or "" to drop.
 
-    Content is preserved exactly (emoji, newlines, formatting codes); only
-    the length is capped so a hostile server cannot bloat the DB. Display
-    code escapes it separately via display_text().
+    Names containing Minecraft color codes, emoji, control characters or
+    other symbol-only junk are server-injected ad text, not real players.
+    "Anonymous Player" is preserved here; callers that record activity
+    filter it separately.
     """
     try:
         cleaned = "" if name is None else str(name)
     except Exception:
         return ""
-    return cleaned[:PLAYER_NAME_MAX_LEN]
+    cleaned = cleaned[:PLAYER_NAME_MAX_LEN]
+    if cleaned and db_format.is_spoofed_player_name(cleaned):
+        return ""
+    return cleaned
 
 
 def _sample_names(sample):
@@ -690,6 +694,11 @@ def _record_server_result_locked(con, result, source, now):
     # sample (webscan doesn't report one), so they must not blank the list
     # a previous full ping established — only full pings refresh it.
     sample_names = _sample_names(result.get("players_sample"))
+    # "Anonymous Player" belongs in the server's player list, but it is not
+    # a real account and must not enter the activity history.
+    activity_names = [
+        name for name in sample_names
+        if not db_format.is_anonymous_player_name(name)]
     has_sample = source != "minescan"
     cur = con.execute(
         "SELECT times_seen, cracked, whitelist, last_source,"
@@ -742,11 +751,11 @@ def _record_server_result_locked(con, result, source, now):
         " (ip_port, seen_at, players_online, max_players)"
         " VALUES (?, ?, ?, ?)",
         (ip_port, now, online, maximum))
-    if sample_names:
+    if activity_names:
         con.executemany(
             "INSERT OR IGNORE INTO player_history"
             " (ip_port, player_name, seen_at) VALUES (?, ?, ?)",
-            [(ip_port, name, now) for name in sample_names])
+            [(ip_port, name, now) for name in activity_names])
     return True
 
 
@@ -1577,6 +1586,9 @@ def netdb_merge_history(history_rows, player_rows):
         ip_port = strict_ip_port(raw.get("ip_port"))
         name = str(raw.get("player_name", "") or "").strip()
         if not ip_port or not name:
+            continue
+        if (db_format.is_spoofed_player_name(name)
+                or db_format.is_anonymous_player_name(name)):
             continue
         try:
             seen_at = float(raw.get("seen_at", 0) or 0)
@@ -7740,6 +7752,8 @@ class UserLogManager:
                 continue
             try:
                 player = _clean_player_name(row.get("player"))
+                if db_format.is_anonymous_player_name(player):
+                    continue
                 ip_port = strict_ip_port(row.get("ip"))
                 seen_at = float(row.get("last_seen") or 0)
             except Exception:
@@ -7840,7 +7854,7 @@ class UserLogManager:
         with self._lock:
             for _pid, pname in sample:
                 player = _clean_player_name(pname)
-                if not player:
+                if not player or db_format.is_anonymous_player_name(player):
                     continue
                 # A hostile server can keep inventing sample names; cap the
                 # on-disk player log so it cannot grow without bound.

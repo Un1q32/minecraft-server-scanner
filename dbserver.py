@@ -535,7 +535,10 @@ def decode_request_body(raw, encoding):
 def _clean_player_name(value):
     try:
         s = "" if value is None else str(value)
-        return s[:PLAYER_NAME_MAX_LEN]
+        s = s[:PLAYER_NAME_MAX_LEN]
+        if s and db_format.is_spoofed_player_name(s):
+            return ""
+        return s
     except Exception:
         return ""
 
@@ -637,7 +640,8 @@ def sanitize_player_event(raw, now=None):
         return None
     ip_port = _valid_ip_port(raw.get("ip_port"))
     name = _clean_player_name(raw.get("player_name")).strip()
-    if not ip_port or not name:
+    if (not ip_port or not name
+            or db_format.is_anonymous_player_name(name)):
         return None
     try:
         seen_at = float(raw.get("seen_at", 0) or 0)

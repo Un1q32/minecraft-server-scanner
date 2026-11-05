@@ -116,7 +116,10 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
   other people's databases via sync).
 - Each server also keeps two player-name lists from status-ping samples:
   players online now (latest sample) and everyone ever seen (union of all
-  samples, kept after logout, capped at 500 names per server).
+  samples, kept after logout, capped at 500 names per server). Names
+  containing `§`, emoji, control characters or other symbol-only ad text are
+  discarded. `Anonymous Player` stays in these lists but is not recorded in
+  `player_history` or the activity graphs because it is not a real account.
 - Every sighting is stored separately in `server_history` (timestamp,
   players online, max players), and every sampled player name is stored in
   `player_history` (timestamp, name). This is what the viewers graph.

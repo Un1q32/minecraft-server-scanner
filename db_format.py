@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import unicodedata
 
 CURRENT_FORMAT = 3
 BASE_FORMAT = 1
@@ -185,6 +186,32 @@ def _to_int(value, default=0) -> int:
         return default
 
 
+ANONYMOUS_PLAYER_NAMES = {"anonymous player", "anonymousplayer"}
+
+
+def is_anonymous_player_name(value) -> bool:
+    """Synthetic placeholder some servers use instead of a real player."""
+    return str(value or "").strip().lower() in ANONYMOUS_PLAYER_NAMES
+
+
+def is_spoofed_player_name(value) -> bool:
+    """True for color codes/emoji/control symbols used in fake ad names."""
+    text = str(value or "")
+    for ch in text:
+        if ch == "\u00a7":
+            return True
+        cp = ord(ch)
+        if cp >= 0x1F000:
+            return True
+        if 0x2600 <= cp <= 0x27BF or 0x2B00 <= cp <= 0x2BFF:
+            return True
+        if cp in (0x200D, 0x20E3, 0xFE0F):
+            return True
+        if unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "So"):
+            return True
+    return False
+
+
 def _name_list(value) -> list[str]:
     if value is None:
         return []
@@ -205,7 +232,7 @@ def _name_list(value) -> list[str]:
     seen = set()
     for item in raw:
         name = str(item or "").strip()
-        if name and name not in seen:
+        if name and not is_spoofed_player_name(name) and name not in seen:
             seen.add(name)
             out.append(name)
     return out
@@ -220,7 +247,9 @@ def _insert_history(con, ip_port, seen_at, players_online, max_players,
         " (ip_port, seen_at, players_online, max_players, synced)"
         " VALUES (?, ?, ?, ?, ?)",
         (ip_port, seen_at, players_online, max_players, synced))
-    rows = [(ip_port, name, seen_at, synced) for name in names]
+    rows = [(ip_port, name, seen_at, synced) for name in names
+            if name and not is_spoofed_player_name(name)
+            and not is_anonymous_player_name(name)]
     if rows:
         con.executemany(
             "INSERT OR IGNORE INTO player_history"
@@ -565,6 +594,66 @@ def migrate(con: sqlite3.Connection) -> bool:
     return changed
 
 
+def _json_name_list(names):
+    return json.dumps(names, ensure_ascii=False) if names else None
+
+
+def clean_spoofed_player_data(con: sqlite3.Connection):
+    """Drop ad/spoof names from activity and scrub stored player lists.
+
+    "Anonymous Player" is kept in the players_now/players_ever lists but is
+    not a real player, so it is removed from player_history.
+    """
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS db_meta ("
+            " key TEXT PRIMARY KEY, value TEXT)"
+        )
+        row = con.execute(
+            "SELECT value FROM db_meta WHERE key='player_name_filter'"
+        ).fetchone()
+        if row and str(row[0]) == "2":
+            return
+        if object_type(con, "player_history") == "table":
+            names = [r[0] for r in con.execute(
+                "SELECT DISTINCT player_name FROM player_history")]
+            bad = [name for name in names
+                   if is_spoofed_player_name(name)
+                   or is_anonymous_player_name(name)]
+            if bad:
+                con.executemany(
+                    "DELETE FROM player_history WHERE player_name=?",
+                    [(name,) for name in bad])
+        if object_type(con, STATE_TABLE) == "table":
+            cur = con.execute(
+                "SELECT ip_port, players_now, players_ever FROM server_state")
+            updates = []
+            while True:
+                rows = cur.fetchmany(1000)
+                if not rows:
+                    break
+                for ip_port, now, ever in rows:
+                    new_now = _json_name_list(_name_list(now))
+                    new_ever = _json_name_list(_name_list(ever))
+                    if new_now != now or new_ever != ever:
+                        updates.append((new_now, new_ever, ip_port))
+                if len(updates) >= 1000:
+                    con.executemany(
+                        "UPDATE server_state SET players_now=?,"
+                        " players_ever=? WHERE ip_port=?", updates)
+                    updates.clear()
+            if updates:
+                con.executemany(
+                    "UPDATE server_state SET players_now=?,"
+                    " players_ever=? WHERE ip_port=?", updates)
+        con.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value)"
+            " VALUES ('player_name_filter', '2')")
+        con.commit()
+    except Exception:
+        pass
+
+
 def ensure_format(con: sqlite3.Connection) -> int:
     migrate(con)
     fmt = detect_format(con)
@@ -573,4 +662,5 @@ def ensure_format(con: sqlite3.Connection) -> int:
         ensure_view(con)
         con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
         con.commit()
+        clean_spoofed_player_data(con)
     return detect_format(con)
