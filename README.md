@@ -191,9 +191,11 @@ and last-seen/MOTD/players/version (newest wins) on both sides. Player lists
 merge too: currently-online follows the newer sighting, ever-seen is the
 union of both sides. Per-sighting history and player samples are uploaded
 separately, so the shared DB and every client's graph eventually include all
-sightings from every node, not just the aggregate endpoints. A cracked
-verdict only changes when a client runs an explicit cracked or whitelist
-login probe; ordinary re-sights never overwrite it.
+sightings from every node, not just the aggregate endpoints. Large sync
+uploads are gzip-compressed when the server advertises support; older
+servers keep the uncompressed path. A cracked verdict only changes when a
+client runs an explicit cracked or whitelist login probe; ordinary
+re-sights never overwrite it.
 
 Full downloads use `GET /api/db`: the server makes a consistent compact
 snapshot with `VACUUM INTO` and streams the SQLite file itself, compressed
@@ -201,7 +203,10 @@ with zstd when available (Python 3.14+ `compression.zstd` or a `zstd` CLI),
 otherwise gzip. That skips the row-by-row merge path entirely.
 `mcscan.py --download-db` uses it when available (and falls back to normal
 row sync on older servers); `--sync` uses it automatically when the local
-DB is missing or empty. JSON sync responses use the same zstd/gzip choice.
+DB is missing or empty. The snapshot response also carries the server's
+history/player cursors, so the next sync only fetches new history instead of
+re-downloading the whole shared backlog. JSON sync responses use the same
+zstd/gzip choice.
 
 Server notes live in a separate, token-protected notes database
 (`notes.db` locally, `<db>-notes.sqlite3` on the server). Notes are

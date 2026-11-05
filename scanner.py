@@ -1221,10 +1221,11 @@ def _ensure_server_db():
 
 NETDB_CONFIG_FILE = "netdb.json"
 NETDB_TIMEOUT = 30
+NETDB_SERVER_COMPRESSED_REQUESTS = False
 NETDB_MAX_UPLOAD = 20000
-NETDB_MAX_HISTORY_UPLOAD = 20000
-NETDB_MAX_PLAYER_UPLOAD = 50000
-NETDB_HISTORY_PAGE = 50000
+NETDB_MAX_HISTORY_UPLOAD = 50000
+NETDB_MAX_PLAYER_UPLOAD = 100000
+NETDB_HISTORY_PAGE = 100000
 # Matches dbserver.py's MAX_SERVERS_PER_RESPONSE: one /api/sync reply carries
 # at most this many rows, so big first-sync downloads page through it.
 NETDB_PAGE_SIZE = 50000
@@ -1330,12 +1331,20 @@ def _netdb_auth_headers(method, path, body, token):
             "Authorization": f"HMAC {sig}"}
 
 
-def _netdb_request(url, token, method="GET", payload=None, timeout=None):
+def _netdb_request(url, token, method="GET", payload=None, timeout=None,
+                   compress=False):
     """One authenticated JSON request. Returns parsed dict. Raises on error."""
     timeout = timeout or NETDB_TIMEOUT
     body = b""
+    used_encoding = None
     if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
+        raw = json.dumps(payload).encode("utf-8")
+        body = raw
+        if compress and len(raw) >= 1024:
+            packed = gzip.compress(raw, 6)
+            if len(packed) < len(raw):
+                body = packed
+                used_encoding = "gzip"
     parsed = urllib.parse.urlparse(url)
     path = parsed.path or "/"
     if parsed.query:
@@ -1343,6 +1352,8 @@ def _netdb_request(url, token, method="GET", payload=None, timeout=None):
     headers = {"User-Agent": "MC-Scanner",
                "Content-Type": "application/json",
                "Accept-Encoding": NETDB_ACCEPT_ENCODING}
+    if used_encoding:
+        headers["Content-Encoding"] = used_encoding
     headers.update(_netdb_auth_headers(method, path, body, token))
     req = urllib.request.Request(url, data=body if method != "GET" else None,
                                  headers=headers, method=method)
@@ -1569,7 +1580,7 @@ def netdb_merge_history(history_rows, player_rows):
     return len(history_values), len(player_values)
 
 
-def netdb_sync_history(url, token, timeout=None):
+def netdb_sync_history(url, token, timeout=None, compress=False):
     """Upload unsynced local history and page in new shared history.
 
     Uses rowid cursors on the server, so this is incremental.  Old servers
@@ -1603,7 +1614,7 @@ def netdb_sync_history(url, token, timeout=None):
             }
             resp = _netdb_request(url + "/api/history/sync", token,
                                   method="POST", payload=payload,
-                                  timeout=timeout)
+                                  timeout=timeout, compress=compress)
             if not isinstance(resp, dict) or not resp.get("has_history"):
                 summary["history_unsupported"] = True
                 break
@@ -1832,11 +1843,15 @@ def netdb_get_credentials():
 
 def _netdb_server_format(url, token, timeout=None):
     """Advertised server DB format; legacy servers (and failures) are 1."""
+    global NETDB_SERVER_COMPRESSED_REQUESTS
     try:
         health = _netdb_request(url.rstrip("/") + "/api/health", token,
                                 method="GET", timeout=timeout)
+        NETDB_SERVER_COMPRESSED_REQUESTS = bool(
+            health.get("compressed_requests"))
         return 2 if int(health.get("format", 1) or 1) >= 2 else 1
     except Exception:
+        NETDB_SERVER_COMPRESSED_REQUESTS = False
         return 1
 
 
@@ -2085,7 +2100,16 @@ def _netdb_download_db(url, token, endpoint, target_file, prepare,
                                      method="GET")
         total = 0
         done = 0
+        history_seq_hdr = player_seq_hdr = None
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            try:
+                history_seq_hdr = int(resp.headers.get("X-History-Seq"))
+            except Exception:
+                history_seq_hdr = None
+            try:
+                player_seq_hdr = int(resp.headers.get("X-Player-Seq"))
+            except Exception:
+                player_seq_hdr = None
             try:
                 from email.utils import parsedate_to_datetime
                 dt = parsedate_to_datetime(resp.headers.get("Date") or "")
@@ -2148,6 +2172,17 @@ def _netdb_download_db(url, token, endpoint, target_file, prepare,
             after_install()
         except Exception:
             pass
+        if endpoint == "/api/db" and history_seq_hdr is not None:
+            # The snapshot already contains all history up to this rowid.
+            # Start incremental history sync after it instead of downloading
+            # the entire shared history again.
+            try:
+                netdb_save_config(
+                    last_history_seq=history_seq_hdr,
+                    last_player_seq=(player_seq_hdr
+                                     if player_seq_hdr is not None else 0))
+            except Exception:
+                pass
         _notify_server_db_tab()
         return (*prepared, now)
     except urllib.error.HTTPError as exc:
@@ -2295,6 +2330,7 @@ def netdb_sync_once(url, token, timeout=None):
     since = cfg.get("last_sync", 0) or 0
     last_seq = cfg.get("last_seq", 0) or 0
     server_format = _netdb_server_format(url, token, timeout=timeout)
+    compress_requests = NETDB_SERVER_COMPRESSED_REQUESTS
 
     def post(servers, cursor, cursor_seq=None):
         if servers and server_format >= 2:
@@ -2307,7 +2343,8 @@ def netdb_sync_once(url, token, timeout=None):
         if cursor_seq is not None:
             payload["since_seq"] = cursor_seq
         return _netdb_request(url + "/api/sync", token, method="POST",
-                              payload=payload, timeout=timeout)
+                              payload=payload, timeout=timeout,
+                              compress=compress_requests)
 
     # --- upload: batch until clean (flags of uncollected rows stay set) ---
     uploaded = 0
@@ -2420,7 +2457,8 @@ def netdb_sync_once(url, token, timeout=None):
                "total_remote": total_remote,
                "now": now}
     try:
-        summary.update(netdb_sync_history(url, token, timeout=timeout))
+        summary.update(netdb_sync_history(
+            url, token, timeout=timeout, compress=compress_requests))
     except Exception as exc:
         summary["history_error"] = str(exc)
     try:

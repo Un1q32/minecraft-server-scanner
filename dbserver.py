@@ -123,6 +123,7 @@ Stdlib only -- no pip dependencies.
 
 import argparse
 import gzip
+import zlib
 try:
     from compression import zstd as _zstd   # Python 3.14+
 except ImportError:
@@ -151,10 +152,11 @@ import db_format
 
 IP_PORT_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$")
 MAX_BODY_BYTES = 25 * 1024 * 1024
+MAX_DECOMPRESSED_BODY_BYTES = 64 * 1024 * 1024
 MAX_SERVERS_PER_REQUEST = 20000
 MAX_SERVERS_PER_RESPONSE = 50000
-MAX_HISTORY_PER_REQUEST = 50000
-MAX_HISTORY_PER_RESPONSE = 50000
+MAX_HISTORY_PER_REQUEST = 100000
+MAX_HISTORY_PER_RESPONSE = 100000
 SQLITE_MAX_INT = 2 ** 63 - 1     # larger ints overflow the sqlite3 binding
 MAX_TIMESTAMP = 1e18             # far beyond any real epoch, still finite
 TIMESTAMP_SKEW = 300
@@ -489,6 +491,23 @@ def _clamp_str(value, limit):
     """
     s = "" if value is None else str(value)
     return s[:limit]
+
+
+def decode_request_body(raw, encoding):
+    """Decode a gzip request body with a hard decompressed-size limit."""
+    encoding = (encoding or "").strip().lower()
+    if not encoding or encoding == "identity":
+        return raw
+    if encoding != "gzip":
+        raise ValueError(f"unsupported Content-Encoding: {encoding}")
+    dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = dec.decompress(raw, MAX_DECOMPRESSED_BODY_BYTES + 1)
+    if len(out) > MAX_DECOMPRESSED_BODY_BYTES or dec.unconsumed_tail:
+        raise ValueError("request body too large")
+    out += dec.flush()
+    if len(out) > MAX_DECOMPRESSED_BODY_BYTES:
+        raise ValueError("request body too large")
+    return out
 
 
 def _clean_player_name(value):
@@ -1042,9 +1061,22 @@ class Handler(BaseHTTPRequestHandler):
             os.unlink(tmp)
             # VACUUM INTO gives a consistent, compact snapshot (it reads
             # through the WAL) without the client doing row-by-row sync.
+            history_seq = player_seq = 0
             with _db_lock:
                 src = db_connect(db_path)
                 try:
+                    try:
+                        history_seq = int(src.execute(
+                            "SELECT COALESCE(MAX(rowid), 0)"
+                            " FROM server_history").fetchone()[0] or 0)
+                    except Exception:
+                        history_seq = 0
+                    try:
+                        player_seq = int(src.execute(
+                            "SELECT COALESCE(MAX(rowid), 0)"
+                            " FROM player_history").fetchone()[0] or 0)
+                    except Exception:
+                        player_seq = 0
                     src.execute("VACUUM INTO ?", (tmp,))
                 finally:
                     src.close()
@@ -1085,6 +1117,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition",
                              f'attachment; filename="{filename}"')
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-History-Seq", str(history_seq))
+            self.send_header("X-Player-Seq", str(player_seq))
             if encoding:
                 self.send_header("Content-Encoding", encoding)
                 self.send_header("Vary", "Accept-Encoding")
@@ -1155,6 +1189,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "servers": n,
                                       "notes": notes_n,
                                       "format": db_format_value,
+                                      "compressed_requests": True,
+                                      "history_sync": True,
                                       "now": _utcnow()})
                 return
             qs = parse_qs(parsed.query or "")
@@ -1200,9 +1236,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_auth(body):
             return
         try:
+            body = decode_request_body(
+                body, self.headers.get("Content-Encoding"))
             payload = json.loads(body.decode("utf-8")) if body else {}
         except Exception:
-            self._send_json(400, {"error": "invalid JSON"})
+            self._send_json(400, {"error": "invalid request body"})
             return
         if not isinstance(payload, dict):
             self._send_json(400, {"error": "invalid JSON"})
@@ -1308,34 +1346,39 @@ class Handler(BaseHTTPRequestHandler):
                 limit = MAX_HISTORY_PER_RESPONSE
             limit = max(1, min(limit, MAX_HISTORY_PER_RESPONSE))
             now = _utcnow()
+            history_values = []
+            for raw_row in history_in:
+                row = sanitize_history_row(raw_row, now)
+                if row is not None:
+                    history_values.append(
+                        (row["ip_port"], row["seen_at"],
+                         row["players_online"], row["max_players"]))
+            player_values = []
+            for raw_row in players_in:
+                row = sanitize_player_event(raw_row, now)
+                if row is not None:
+                    player_values.append(
+                        (row["ip_port"], row["player_name"], row["seen_at"]))
             merged_history = merged_players = 0
             with _db_lock:
                 con = db_connect(self.server.db_path)
                 try:
-                    for raw_row in history_in:
-                        row = sanitize_history_row(raw_row, now)
-                        if row is None:
-                            continue
-                        cur = con.execute(
+                    before = con.total_changes
+                    if history_values:
+                        con.executemany(
                             "INSERT OR IGNORE INTO server_history"
                             " (ip_port, seen_at, players_online, max_players,"
                             " synced) VALUES (?, ?, ?, ?, 1)",
-                            (row["ip_port"], row["seen_at"],
-                             row["players_online"], row["max_players"]))
-                        if cur.rowcount:
-                            merged_history += 1
-                    for raw_row in players_in:
-                        row = sanitize_player_event(raw_row, now)
-                        if row is None:
-                            continue
-                        cur = con.execute(
+                            history_values)
+                    merged_history = con.total_changes - before
+                    before = con.total_changes
+                    if player_values:
+                        con.executemany(
                             "INSERT OR IGNORE INTO player_history"
                             " (ip_port, player_name, seen_at, synced)"
                             " VALUES (?, ?, ?, 1)",
-                            (row["ip_port"], row["player_name"],
-                             row["seen_at"]))
-                        if cur.rowcount:
-                            merged_players += 1
+                            player_values)
+                    merged_players = con.total_changes - before
                     con.commit()
                     con.row_factory = sqlite3.Row
                     cur = con.execute(
