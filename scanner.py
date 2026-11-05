@@ -2428,12 +2428,16 @@ def netdb_replace_all(rows):
     return inserted
 
 
-def netdb_sync_once(url, token, timeout=None, history_download=True):
+def netdb_sync_once(url, token, timeout=None, history_download=True,
+                    notes_download=True):
     """Bidirectional sync, no row caps. Returns summary dict. Raises ConnectionError.
 
     Uploads loop in NETDB_MAX_UPLOAD batches until no dirty rows remain;
     downloads page through /api/sync until the server has nothing newer than
     our watermark, so arbitrarily large DBs sync completely (just in rounds).
+    ``history_download``/``notes_download`` can be turned off for upload-only
+    nodes such as continuous scanners, which should publish findings without
+    pulling the shared activity history or other people's notes.
     """
     url = (url or "").strip().rstrip("/")
     token = (token or "").strip()
@@ -2589,7 +2593,8 @@ def netdb_sync_once(url, token, timeout=None, history_download=True):
     except Exception as exc:
         summary["history_error"] = str(exc)
     try:
-        summary.update(netdb_notes_sync_once(url, token, timeout=timeout))
+        summary.update(netdb_notes_sync_once(
+            url, token, timeout=timeout, download=notes_download))
     except Exception as exc:
         summary["notes_error"] = str(exc)
     return summary
@@ -2815,11 +2820,14 @@ def notes_download_all(url, token, timeout=None):
     return list(by_id.values()), max_seq, now
 
 
-def netdb_notes_sync_once(url, token, timeout=None):
+def netdb_notes_sync_once(url, token, timeout=None, download=True):
     """Sync the separate notes DB. Returns a summary dict.
 
     An old server without /api/notes/* is treated as "no notes support":
     the local notes DB still works, and nothing is uploaded/downloaded.
+    ``download=False`` uploads local notes (continuous scanners publish
+    theirs) but never pulls notes from the server; the download cursor is
+    left where a later full ``--sync`` can resume.
     """
     url = (url or "").strip().rstrip("/")
     token = (token or "").strip()
@@ -2832,7 +2840,11 @@ def netdb_notes_sync_once(url, token, timeout=None):
                      and os.path.getsize(NOTES_DB_FILE) > 0)
     downloaded_total = 0
     try:
-        if not notes_existed:
+        if not download:
+            # Upload-only node: create the local notes DB if necessary,
+            # but never seed it from the shared notes database.
+            _ensure_notes_db()
+        elif not notes_existed:
             try:
                 _rows, max_seq, _now = netdb_notes_download_file(url, token)
                 netdb_save_config(last_notes_seq=max_seq)
@@ -2851,6 +2863,10 @@ def netdb_notes_sync_once(url, token, timeout=None):
 
     cfg = netdb_load_config()
     last_seq = cfg.get("last_notes_seq", 0) or 0
+    # In upload-only mode, send a cursor past every stored seq so upload
+    # responses contain just the current state of the notes we sent, not
+    # the whole shared backlog.
+    upload_since = last_seq if download else (2 ** 63 - 1)
     by_id = {}
 
     # Upload new notes / tombstones in batches.
@@ -2861,7 +2877,8 @@ def netdb_notes_sync_once(url, token, timeout=None):
         try:
             resp = _netdb_request(
                 url + "/api/notes/sync", token, method="POST",
-                payload={"notes": batch, "since_seq": last_seq, "format": 1},
+                payload={"notes": batch, "since_seq": upload_since,
+                         "format": 1},
                 timeout=timeout)
         except NetdbEndpointUnsupported:
             summary["notes_unsupported"] = True
@@ -2871,16 +2888,22 @@ def netdb_notes_sync_once(url, token, timeout=None):
                 resp.get("merged", 0) or 0)
         except Exception:
             pass
-        for note in (resp.get("notes") or []):
-            if not isinstance(note, dict):
-                continue
-            note_id = _canonical_note_id(note.get("id"))
-            if note_id:
-                by_id[note_id] = note
+        if download:
+            for note in (resp.get("notes") or []):
+                if not isinstance(note, dict):
+                    continue
+                note_id = _canonical_note_id(note.get("id"))
+                if note_id:
+                    by_id[note_id] = note
         notes_mark_synced(batch)
         summary["notes_uploaded"] += len(batch)
         if len(batch) < MAX_NOTES_PER_SYNC:
             break
+
+    if not download:
+        # Never advance last_notes_seq here: it is the download watermark,
+        # and a later full --sync must still fetch everything we skipped.
+        return summary
 
     # Download every note/tombstone newer than our cursor.
     cursor = last_seq

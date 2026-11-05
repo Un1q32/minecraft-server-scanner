@@ -711,9 +711,12 @@ def _sync_now(url, token):
         return False
     try:
         # A continuous node only needs to publish its findings.  Pulling the
-        # shared per-sighting/player history back would add a large download
-        # to every sync for no benefit here.
-        summary = scanner.netdb_sync_once(url, token, history_download=False)
+        # shared per-sighting/player history or other people's notes back
+        # would add a large download to every sync for no benefit here.
+        # Both cursors are left untouched, so a later full --sync can fetch
+        # everything that was skipped.
+        summary = scanner.netdb_sync_once(
+            url, token, history_download=False, notes_download=False)
     except Exception as exc:
         print(f"  sync failed: {exc}")
         return False
