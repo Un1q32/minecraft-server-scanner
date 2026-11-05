@@ -1014,6 +1014,35 @@ class ZstdSnapshotWriter:
         self._thread = None
         self._available = db_zstd.zstd_available()
         self._last_error = ""
+        self.meta_path = self.out_path + ".json"
+
+    def _history_seq(self):
+        try:
+            con = db_connect(self.db_path)
+            try:
+                return int(con.execute(
+                    "SELECT COALESCE(MAX(rowid), 0)"
+                    " FROM server_history").fetchone()[0] or 0)
+            finally:
+                con.close()
+        except Exception:
+            return 0
+
+    def _write_meta(self, meta):
+        tmp = self.meta_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(meta, f, separators=(",", ":"))
+            try:
+                os.chmod(tmp, 0o644)
+            except OSError:
+                pass
+            os.replace(tmp, self.meta_path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def start(self):
         if not self._available:
@@ -1057,8 +1086,18 @@ class ZstdSnapshotWriter:
             if self._stop.is_set():
                 break
             try:
+                source_state = db_zstd.db_state(self.db_path)
+                history_seq = self._history_seq()
                 before, after, seconds = db_zstd.snapshot_and_compress(
                     self.db_path, self.out_path, level=self.level)
+                self._write_meta({
+                    "db_state": source_state,
+                    "history_seq": history_seq,
+                    "player_seq": 0,
+                    "db_size": before,
+                    "zst_size": after,
+                    "created": time.time(),
+                })
                 self._last_error = ""
                 print(f"web db snapshot: {os.path.basename(self.out_path)} "
                       f"{before / 1048576:.1f} MB -> "
@@ -1160,7 +1199,77 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _cached_db_snapshot(self, db_path):
+        """Metadata for a fresh precompressed servers snapshot, or None."""
+        cached = getattr(self.server, "web_db_zst", "")
+        if not cached:
+            return None
+        try:
+            if os.path.abspath(db_path) != os.path.abspath(self.server.db_path):
+                return None
+        except Exception:
+            return None
+        accept = (self.headers.get("Accept-Encoding") or "").lower()
+        if "zstd" not in accept:
+            return None
+        try:
+            if not os.path.isfile(cached):
+                return None
+            with open(cached + ".json", "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            zst_size = int(meta.get("zst_size") or 0)
+            if zst_size <= 0 or os.path.getsize(cached) != zst_size:
+                return None
+            saved = meta.get("db_state")
+            if saved is not None:
+                saved = tuple(tuple(x) if x is not None else None
+                              for x in saved)
+            if saved != db_zstd.db_state(db_path):
+                return None
+            meta["zst_size"] = zst_size
+            meta["history_seq"] = int(meta.get("history_seq") or 0)
+            meta["player_seq"] = int(meta.get("player_seq") or 0)
+            meta["db_size"] = int(meta.get("db_size") or 0)
+            return meta
+        except Exception:
+            return None
+
     def _send_sqlite_snapshot(self, db_path, filename):
+        cached = self._cached_db_snapshot(db_path)
+        if cached is not None:
+            cached_path = self.server.web_db_zst
+            try:
+                f = open(cached_path, "rb")
+                try:
+                    size = int(cached.get("zst_size") or 0)
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "application/octet-stream")
+                    self.send_header("Content-Length", str(size))
+                    self.send_header(
+                        "Content-Disposition",
+                        f'attachment; filename="{filename}"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header(
+                        "X-History-Seq",
+                        str(int(cached.get("history_seq") or 0)))
+                    self.send_header(
+                        "X-Player-Seq",
+                        str(int(cached.get("player_seq") or 0)))
+                    self.send_header(
+                        "X-DB-Size", str(int(cached.get("db_size") or 0)))
+                    self.send_header("Content-Encoding", "zstd")
+                    self.send_header("Vary", "Accept-Encoding")
+                    self.end_headers()
+                    shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
+                    return
+                finally:
+                    f.close()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                # Snapshot disappeared/raced; use the on-demand path below.
+                pass
         tmp = gz_tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
@@ -1683,6 +1792,8 @@ def main(argv=None):
     server.shared_token = token
     server.daemon_threads = True
     server.zstd_writer = None
+    server.web_db_zst = (os.path.abspath(args.web_db_zst)
+                         if args.web_db_zst else "")
     writer = None
     if args.web_db_zst:
         writer = ZstdSnapshotWriter(

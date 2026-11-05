@@ -28,20 +28,8 @@ import time
 # This script lives in webui/; the shared helper is one level up.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from db_zstd import DEFAULT_LEVEL, snapshot_and_compress, zstd_available  # noqa: E402
-
-
-def _state(db_path):
-    parts = []
-    # -shm changes with reader/writer locks and would force a rewrite on
-    # every interval even when no data changed.
-    for suffix in ("", "-wal"):
-        try:
-            st = os.stat(db_path + suffix)
-            parts.append((st.st_mtime_ns, st.st_size))
-        except OSError:
-            parts.append(None)
-    return tuple(parts)
+from db_zstd import (DEFAULT_LEVEL, db_state, snapshot_and_compress,
+                     zstd_available)  # noqa: E402
 
 
 def _run_once(db_path, out_path, level, quiet=False):
@@ -102,7 +90,7 @@ def main(argv=None):
 
     last_state = None
     while not stopping["value"]:
-        state = _state(db_path)
+        state = db_state(db_path)
         if state == last_state and os.path.isfile(out_path):
             if args.once:
                 break

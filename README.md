@@ -610,6 +610,12 @@ a few seconds, and an SD card will see the snapshot writes, so raise the
 interval there. Python 3.14's `compression.zstd` is used when available;
 otherwise the `zstd` command-line tool is required.
 
+`mcscan.py --download-db` also uses the cached snapshot: if the client
+advertises zstd and the cached file matches the current DB/WAL state,
+`/api/db` streams it directly with `Content-Encoding: zstd`. If the client
+has no zstd decoder, or the snapshot is stale/missing, it falls back to the
+existing on-demand `VACUUM INTO` download (gzip or plain).
+
 Browsers with `DecompressionStream("zstd")` use the native (C/C++) decoder.
 Older browsers fall back to the bundled `fzstd.js`; that is pure JS and
 slower, but on the test file it still expanded 47 MB to 109 MB in roughly

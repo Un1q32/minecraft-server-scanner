@@ -30,6 +30,24 @@ def zstd_available() -> bool:
     return _zstd is not None or shutil.which("zstd") is not None
 
 
+def db_state(db_path: str):
+    """Comparable (mtime_ns, size) tuple for the DB and its WAL.
+
+    -shm changes with reader/writer locks and would force needless work.
+    """
+    parts = []
+    for suffix in ("", "-wal"):
+        try:
+            st = os.stat(db_path + suffix)
+            # An empty WAL carries no data; its mtime can change on
+            # checkpoint even though the snapshot is still current.
+            parts.append(None if (suffix == "-wal" and st.st_size == 0)
+                         else (st.st_mtime_ns, st.st_size))
+        except OSError:
+            parts.append(None)
+    return tuple(parts)
+
+
 def _level(value) -> int:
     try:
         return max(1, min(int(value), 19))
