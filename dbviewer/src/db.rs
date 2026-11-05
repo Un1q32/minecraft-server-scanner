@@ -539,6 +539,31 @@ pub fn history_json(servers_path: &str, ip: &str) -> String {
                     })
                     .collect();
             }
+        } else if let Ok(mut stmt) = con.prepare(
+            "SELECT player_name, seen_at FROM (\
+               SELECT player_name, seen_at FROM player_history \
+               WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?\
+             ) ORDER BY player_name ASC, seen_at ASC",
+        ) {
+            // Read-only viewer opened against a format-3 database.
+            if let Ok(rows) = stmt.query_map(
+                rusqlite::params![ip, PLAYER_EVENT_LIMIT],
+                |r| Ok((r.get::<_, String>(0).unwrap_or_default(),
+                        r.get::<_, f64>(1).unwrap_or(0.0))),
+            ) {
+                let mut grouped: std::collections::BTreeMap<String, Vec<f64>> =
+                    std::collections::BTreeMap::new();
+                for (name, seen_at) in rows.flatten() {
+                    grouped.entry(name).or_default().push(seen_at);
+                }
+                players = grouped
+                    .into_iter()
+                    .map(|(name, mut times)| {
+                        times.sort_by(|a, b| a.total_cmp(b));
+                        serde_json::json!({"name": name, "times": times})
+                    })
+                    .collect();
+            }
         }
     }
     serde_json::json!({"points": points, "players": players}).to_string()

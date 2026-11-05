@@ -1247,12 +1247,12 @@ async function boot() {
     setStatus("Starting WebAssembly…");
     if (typeof createCore !== "function") {
       // The script tag failed or was blocked; try once more explicitly.
-      await loadScript("core.js?v=7-retry");
+      await loadScript("core.js?v=8-retry");
     }
     if (typeof createCore !== "function") {
       let detail = "";
       try {
-        const probe = await fetch(assetUrl("core.js?v=7-probe"), { cache: "no-store" });
+        const probe = await fetch(assetUrl("core.js?v=8-probe"), { cache: "no-store" });
         const body = await probe.text();
         detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
       } catch (probeError) {
@@ -1264,7 +1264,7 @@ async function boot() {
       );
     }
     core = await createCore({
-      locateFile: (file) => assetUrl(file),
+      locateFile: (file) => assetUrl(file) + "?v=8",
       print: () => {},
       printErr: () => {},
     });

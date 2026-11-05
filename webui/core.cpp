@@ -1051,7 +1051,17 @@ std::string history_text(const std::string &ip) {
 
     out += "],\"players\":[";
     std::map<std::string, std::vector<double>> players;
+    bool has_roster_blob = false;
     if (g_db && table_exists("server_history")) {
+        sqlite3_stmt *probe = nullptr;
+        if (sqlite3_prepare_v2(g_db,
+                "SELECT players FROM server_history LIMIT 0",
+                -1, &probe, nullptr) == SQLITE_OK) {
+            has_roster_blob = true;
+        }
+        sqlite3_finalize(probe);
+    }
+    if (g_db && has_roster_blob) {
         sqlite3_stmt *stmt = nullptr;
         const char *sql =
             "SELECT seen_at, players FROM server_history"
@@ -1081,6 +1091,32 @@ std::string history_text(const std::string &ip) {
                         break;
                     }
                     start = end + 1;
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    } else if (g_db && table_exists("player_history")) {
+        // Read-only viewer opened against a format-3 database (e.g. the
+        // static file has not gone through the scanner migration yet).
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql =
+            "SELECT player_name, seen_at FROM ("
+            "  SELECT player_name, seen_at FROM player_history"
+            "  WHERE ip_port=? ORDER BY seen_at DESC LIMIT ?"
+            ") ORDER BY player_name ASC, seen_at ASC";
+        if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ip.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, event_limit);
+            size_t total = 0;
+            const size_t max_total = static_cast<size_t>(event_limit);
+            while (total < max_total && sqlite3_step(stmt) == SQLITE_ROW) {
+                const unsigned char *raw = sqlite3_column_text(stmt, 0);
+                std::string name = raw
+                    ? reinterpret_cast<const char *>(raw) : "";
+                if (!name.empty()) {
+                    players[name].push_back(
+                        sqlite3_column_double(stmt, 1));
+                    ++total;
                 }
             }
         }
