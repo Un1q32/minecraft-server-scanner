@@ -1345,6 +1345,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 limit = MAX_HISTORY_PER_RESPONSE
             limit = max(1, min(limit, MAX_HISTORY_PER_RESPONSE))
+            download = bool(payload.get("download", True))
             now = _utcnow()
             history_values = []
             for raw_row in history_in:
@@ -1380,26 +1381,32 @@ class Handler(BaseHTTPRequestHandler):
                             player_values)
                     merged_players = con.total_changes - before
                     con.commit()
-                    con.row_factory = sqlite3.Row
-                    cur = con.execute(
-                        "SELECT rowid AS seq, ip_port, seen_at,"
-                        " players_online, max_players"
-                        " FROM server_history WHERE rowid > ?"
-                        " ORDER BY rowid ASC LIMIT ?",
-                        (history_since, limit))
-                    history_out = [dict(r) for r in cur.fetchall()]
-                    cur = con.execute(
-                        "SELECT rowid AS seq, ip_port, player_name, seen_at"
-                        " FROM player_history WHERE rowid > ?"
-                        " ORDER BY rowid ASC LIMIT ?",
-                        (player_since, limit))
-                    players_out = [dict(r) for r in cur.fetchall()]
-                    history_seq = max(
-                        [history_since] +
-                        [int(r.get("seq", 0) or 0) for r in history_out])
-                    player_seq = max(
-                        [player_since] +
-                        [int(r.get("seq", 0) or 0) for r in players_out])
+                    if download:
+                        con.row_factory = sqlite3.Row
+                        cur = con.execute(
+                            "SELECT rowid AS seq, ip_port, seen_at,"
+                            " players_online, max_players"
+                            " FROM server_history WHERE rowid > ?"
+                            " ORDER BY rowid ASC LIMIT ?",
+                            (history_since, limit))
+                        history_out = [dict(r) for r in cur.fetchall()]
+                        cur = con.execute(
+                            "SELECT rowid AS seq, ip_port, player_name, seen_at"
+                            " FROM player_history WHERE rowid > ?"
+                            " ORDER BY rowid ASC LIMIT ?",
+                            (player_since, limit))
+                        players_out = [dict(r) for r in cur.fetchall()]
+                        history_seq = max(
+                            [history_since] +
+                            [int(r.get("seq", 0) or 0) for r in history_out])
+                        player_seq = max(
+                            [player_since] +
+                            [int(r.get("seq", 0) or 0) for r in players_out])
+                    else:
+                        history_out = []
+                        players_out = []
+                        history_seq = history_since
+                        player_seq = player_since
                 finally:
                     con.close()
             self._send_json(200, {

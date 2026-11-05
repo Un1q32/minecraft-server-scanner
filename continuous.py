@@ -666,14 +666,19 @@ def _sync_now(url, token):
     if not url or not token:
         return False
     try:
-        summary = scanner.netdb_sync_once(url, token)
+        # A continuous node only needs to publish its findings.  Pulling the
+        # shared per-sighting/player history back would add a large download
+        # to every sync for no benefit here.
+        summary = scanner.netdb_sync_once(url, token, history_download=False)
     except Exception as exc:
         print(f"  sync failed: {exc}")
         return False
     print(f"  synced: uploaded={summary.get('uploaded', 0)} "
           f"downloaded={summary.get('downloaded', 0)} "
           f"inserted={summary.get('inserted', 0)} "
-          f"updated={summary.get('updated', 0)}")
+          f"updated={summary.get('updated', 0)} "
+          f"history_uploaded={summary.get('history_uploaded', 0)} "
+          f"player_events_uploaded={summary.get('player_events_uploaded', 0)}")
     return True
 
 

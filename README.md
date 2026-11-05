@@ -335,7 +335,9 @@ counts servers found so far in that round — `new`, `updated` and total
 hits — and is rewritten in place as results arrive (when output is piped
 it prints a plain summary line every 15 seconds instead). The shared DB is
 synced every `--sync-every` seconds (default 300) and once more on exit, so
-peers see new finds promptly.
+peers see new finds promptly. Continuous nodes publish their sighting and
+player history but do not download the shared activity history; run a normal
+`--sync` later if you want the full activity history on that machine.
 
 `--strategies slash24a,slash32b` restricts the pool, `--no-rescan` skips
 the rescan half, and `--rounds N` stops after N rounds (useful for

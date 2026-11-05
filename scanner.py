@@ -1580,8 +1580,13 @@ def netdb_merge_history(history_rows, player_rows):
     return len(history_values), len(player_values)
 
 
-def netdb_sync_history(url, token, timeout=None, compress=False):
-    """Upload unsynced local history and page in new shared history.
+def netdb_sync_history(url, token, timeout=None, compress=False,
+                       download=True):
+    """Upload unsynced local history and optionally page in shared history.
+
+    ``download=False`` is used by the continuous scanner: it only publishes
+    its sightings.  No history response is requested or transferred, and the
+    local cursors are left untouched for a later full sync.
 
     Uses rowid cursors on the server, so this is incremental.  Old servers
     without /api/history/sync simply return unsupported and keep local rows
@@ -1604,12 +1609,15 @@ def netdb_sync_history(url, token, timeout=None, compress=False):
     try:
         for _ in range(NETDB_MAX_ROUNDS):
             history_up, players_up = netdb_collect_history_dirty()
+            if not download and not history_up and not players_up:
+                break
             payload = {
                 "history": history_up,
                 "players": players_up,
                 "history_since": history_since,
                 "player_since": player_since,
                 "limit": NETDB_HISTORY_PAGE,
+                "download": bool(download),
                 "format": db_format.CURRENT_FORMAT,
             }
             resp = _netdb_request(url + "/api/history/sync", token,
@@ -1619,30 +1627,37 @@ def netdb_sync_history(url, token, timeout=None, compress=False):
                 summary["history_unsupported"] = True
                 break
             netdb_mark_history_synced(history_up, players_up)
-            history_down = [r for r in (resp.get("history") or [])
-                            if isinstance(r, dict)]
-            players_down = [r for r in (resp.get("players") or [])
-                            if isinstance(r, dict)]
-            netdb_merge_history(history_down, players_down)
-            try:
-                history_since = max(history_since,
-                                    int(resp.get("history_seq", 0) or 0))
-            except Exception:
-                pass
-            try:
-                player_since = max(player_since,
-                                   int(resp.get("player_seq", 0) or 0))
-            except Exception:
-                pass
-            netdb_save_config(last_history_seq=history_since,
-                              last_player_seq=player_since)
+            history_down = []
+            players_down = []
+            if download:
+                history_down = [r for r in (resp.get("history") or [])
+                                if isinstance(r, dict)]
+                players_down = [r for r in (resp.get("players") or [])
+                                if isinstance(r, dict)]
+                netdb_merge_history(history_down, players_down)
+                try:
+                    history_since = max(history_since,
+                                        int(resp.get("history_seq", 0) or 0))
+                except Exception:
+                    pass
+                try:
+                    player_since = max(player_since,
+                                       int(resp.get("player_seq", 0) or 0))
+                except Exception:
+                    pass
+                netdb_save_config(last_history_seq=history_since,
+                                  last_player_seq=player_since)
             summary["history_uploaded"] += len(history_up)
             summary["player_events_uploaded"] += len(players_up)
             summary["history_downloaded"] += len(history_down)
             summary["player_events_downloaded"] += len(players_down)
-            if (not history_up and not players_up
-                    and len(history_down) < NETDB_HISTORY_PAGE
-                    and len(players_down) < NETDB_HISTORY_PAGE):
+            if download:
+                if (not history_up and not players_up
+                        and len(history_down) < NETDB_HISTORY_PAGE
+                        and len(players_down) < NETDB_HISTORY_PAGE):
+                    break
+            elif (len(history_up) < NETDB_MAX_HISTORY_UPLOAD
+                  and len(players_up) < NETDB_MAX_PLAYER_UPLOAD):
                 break
     except NetdbEndpointUnsupported:
         summary["history_unsupported"] = True
@@ -2303,7 +2318,7 @@ def netdb_replace_all(rows):
     return inserted
 
 
-def netdb_sync_once(url, token, timeout=None):
+def netdb_sync_once(url, token, timeout=None, history_download=True):
     """Bidirectional sync, no row caps. Returns summary dict. Raises ConnectionError.
 
     Uploads loop in NETDB_MAX_UPLOAD batches until no dirty rows remain;
@@ -2458,7 +2473,8 @@ def netdb_sync_once(url, token, timeout=None):
                "now": now}
     try:
         summary.update(netdb_sync_history(
-            url, token, timeout=timeout, compress=compress_requests))
+            url, token, timeout=timeout, compress=compress_requests,
+            download=history_download))
     except Exception as exc:
         summary["history_error"] = str(exc)
     try:
