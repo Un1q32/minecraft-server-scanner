@@ -46,7 +46,7 @@ SERVER_STATE_SCHEMA = (
     ")"
 )
 
-HISTORY_SCHEMA = (
+HISTORY_TABLES = (
     "CREATE TABLE IF NOT EXISTS server_history ("
     " ip_port TEXT NOT NULL,"
     " seen_at REAL NOT NULL,"
@@ -62,6 +62,9 @@ HISTORY_SCHEMA = (
     " synced INTEGER DEFAULT 0,"
     " PRIMARY KEY (ip_port, player_name, seen_at)"
     ")",
+)
+
+HISTORY_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_player_history_ip_time"
     " ON player_history(ip_port, seen_at ASC)",
     "CREATE INDEX IF NOT EXISTS idx_server_history_synced"
@@ -73,16 +76,19 @@ HISTORY_SCHEMA = (
 
 def init_history_schema(con: sqlite3.Connection):
     """Create the per-sighting tables used by the viewer graphs."""
-    for statement in HISTORY_SCHEMA:
+    for statement in HISTORY_TABLES:
         con.execute(statement)
     # Format 3 originally shipped without the sync flag.  Existing rows
     # become unsynced so the next sync uploads the local history once.
+    # The synced indexes must be created after this ALTER.
     for table in ("server_history", "player_history"):
         columns = {str(row[1]) for row in
                    con.execute(f"PRAGMA table_info({table})")}
         if "synced" not in columns:
             con.execute(f"ALTER TABLE {table}"
                         " ADD COLUMN synced INTEGER DEFAULT 0")
+    for statement in HISTORY_INDEXES:
+        con.execute(statement)
 
 
 def object_type(con: sqlite3.Connection, name: str):
