@@ -1,12 +1,13 @@
 """Continuous, self-tuning scanning mode (matscan-inspired).
 
-Alternates two round categories forever:
+Runs two round categories forever:
 
 * **normal** -- a scan strategy picked by weight:
     slash0    the whole IPv4 space on the configured ports (default 25565;
               time-boxed, random order)
     slash16a  /16 blocks around servers seen in the last 30 days
     slash16b  /16 blocks with >= 32 known IPs (busy subnets, last 365 days)
+    slash20a  /20 blocks around servers seen in the last 365 days
     slash24a  /24 blocks around servers seen in the last 365 days
     slash24b  ... same /24s on ports 25566-25568
     slash24c  ... same /24s on ports 25560-25564 + 25569-25570
@@ -15,7 +16,9 @@ Alternates two round categories forever:
     slash32c  IPs hosting >= 8 servers on all ports 1024-65535
 * **rescan** -- servers whose last successful ping is due, by age tier
   (2h-1d, 1-7d, 7-30d, 30-365d, >365d), plus a fast tier for servers
-  that have players online right now.
+  that have players online right now.  Rescans are cheap enough that they
+  no longer need to take every other round; by default one rescan runs
+  every ``DEFAULT_RESCAN_EVERY`` rounds (``--rescan-every``).
 
 After each normal round the strategy is scored like matscan:
 ``(new + 5*new_on_25565 + 0.1*revived) * 3600 / (seconds + 30)`` --
@@ -59,6 +62,7 @@ import scanner
 SLEEP_SECS = 10                 # quiet gap between rounds (attribution)
 DEFAULT_SCAN_DURATION = 300     # per-round time box (matscan: 5 min)
 DEFAULT_SYNC_EVERY = 300        # shared-DB sync cadence
+DEFAULT_RESCAN_EVERY = 4        # normal rounds between rescan rounds
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
 REVIVED_AFTER = 7 * 86400       # unseen this long -> a find is a "revival"
@@ -74,7 +78,7 @@ SHARD_TIMEOUT = 8.0             # per-heartbeat HTTP timeout (seconds)
 NODE_ID_FILE = "continuous_node_id"
 
 STRATEGY_NAMES = (
-    "slash0", "slash16a", "slash16b",
+    "slash0", "slash16a", "slash16b", "slash20a",
     "slash24a", "slash24b", "slash24c",
     "slash32a", "slash32b", "slash32c",
 )
@@ -202,6 +206,12 @@ def strat_slash16b(rows, base_ports=None):
     return (_prefixes_to_cidrs(groups, 16), _base_ports(base_ports))
 
 
+def strat_slash20a(rows, base_ports=None):
+    active = _active(rows, 365 * 86400)
+    groups = _group_by(active, 20)
+    return (_prefixes_to_cidrs(groups, 20), _base_ports(base_ports))
+
+
 def strat_slash24a(rows, base_ports=None):
     active = _active(rows, 365 * 86400)
     groups = _group_by(active, 24)
@@ -258,6 +268,7 @@ STRATEGIES = {
     "slash0": strat_slash0,
     "slash16a": strat_slash16a,
     "slash16b": strat_slash16b,
+    "slash20a": strat_slash20a,
     "slash24a": strat_slash24a,
     "slash24b": strat_slash24b,
     "slash24c": strat_slash24c,
@@ -905,10 +916,15 @@ class ShardManager:
 def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                    sync_every=DEFAULT_SYNC_EVERY, state_path="strategies.json",
                    backend="auto", strategies=None, do_rescan=True,
+                   rescan_every=DEFAULT_RESCAN_EVERY,
                    stop_event=None, max_rounds=None, shard=None, seed=None,
                    base_ports=None, auto_shard=False, node_id=None):
     """The forever loop. Returns a process exit code."""
     base_ports = _base_ports(base_ports)
+    try:
+        rescan_every = max(1, int(rescan_every))
+    except Exception:
+        rescan_every = DEFAULT_RESCAN_EVERY
     if backend == "minescan":
         print("error: continuous mode supports --backend auto, masscan or "
               "python (minescan is for one-off --scan).")
@@ -937,14 +953,14 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
             print("auto-shard: no shared-DB URL/token; sharding disabled")
 
     picker = StrategyPicker(state_path, strategies)
-    bodies = ["normal"] + (["rescan"] if do_rescan else [])
     shard_note = (f" shard={shard[0]}/{shard[1]}"
                   f" seed={seed if seed is not None else scanner.DEFAULT_SHARD_SEED}"
                   if shard else (" shard=auto" if shard_manager else ""))
     ports_note = ("" if base_ports == [25565]
                   else f" ports={','.join(str(p) for p in base_ports)}")
+    rescan_note = (f"every {rescan_every} round(s)" if do_rescan else "off")
     print(f"continuous mode: strategies={','.join(picker.enabled)} "
-          f"rescan={'on' if do_rescan else 'off'} "
+          f"rescan={rescan_note} "
           f"scan_duration={scan_duration}s backend={backend}"
           f"{ports_note}{shard_note}")
     print(f"shared-DB sync every {sync_every}s "
@@ -1001,8 +1017,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
         while not stop_event.is_set():
             if shard_manager:
                 shard_state["value"] = shard_manager.shard()
-            body = bodies[rounds % len(bodies)]
             rounds += 1
+            body = ("rescan" if do_rescan
+                    and rounds % rescan_every == 0 else "normal")
             print(f"\n=== round {rounds} ({body}) {time.strftime('%H:%M:%S')} ===")
             if shard_manager:
                 for message in shard_manager.drain_messages():
