@@ -63,6 +63,7 @@ SLEEP_SECS = 10                 # quiet gap between rounds (attribution)
 DEFAULT_SCAN_DURATION = 300     # per-round time box (matscan: 5 min)
 DEFAULT_SYNC_EVERY = 300        # shared-DB sync cadence
 DEFAULT_RESCAN_EVERY = 4        # normal rounds between rescan rounds
+RESCAN_PY_MAX = 100             # tiny port groups: ping directly, no masscan
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
 REVIVED_AFTER = 7 * 86400       # unseen this long -> a find is a "revival"
@@ -995,19 +996,22 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     # never dies just because it isn't running as root.
     state = {"backend": backend}
 
-    def do_round(ranges, ports, duration=None, on_hit=None, log=None):
+    def do_round(ranges, ports, duration=None, on_hit=None, log=None,
+                 backend=None):
         """run_round with daemon-grade error handling.
 
         Returns (results, fatal). A fatal error (masscan explicitly
         requested but missing/unprivileged) stops continuous mode;
         everything else is logged and the loop keeps going. In auto mode a
-        masscan failure retries the round with the Python backend.
+        masscan failure retries the round with the Python backend.  A
+        per-round ``backend`` override is used for tiny rescan groups,
+        where one masscan process costs more than the handshakes.
         """
         _log = log or print
         if shard_manager:
             shard_state["value"] = shard_manager.shard()
         for attempt in range(2):
-            current = state["backend"]
+            current = backend or state["backend"]
             try:
                 return (run_round(
                     ranges, ports, rate=rate, wait=wait,
@@ -1141,7 +1145,11 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                                        + max(30, scan_duration))
                     processed_ports = 0
                     try:
-                        for port, specs in sorted(by_port.items()):
+                        # Largest groups first: port 25565 usually holds most
+                        # of the servers, so it should get the shared budget
+                        # before the long tail of tiny ports.
+                        for port, specs in sorted(
+                                by_port.items(), key=lambda kv: -len(kv[1])):
                             if stop_event.is_set():
                                 break
                             remaining = rescan_deadline - time.monotonic()
@@ -1151,12 +1159,15 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                             # port, but never go past the shared deadline.
                             duration = min(
                                 max(30, scan_duration // 2), remaining)
+                            direct = len(specs) <= RESCAN_PY_MAX
                             status.note(
-                                f"  port {port}: {len(specs)} endpoint(s)")
+                                f"  port {port}: {len(specs)} endpoint(s)"
+                                + (" via python" if direct else ""))
                             group_started = time.monotonic()
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
-                                on_hit=on_hit, log=status.note)
+                                on_hit=on_hit, log=status.note,
+                                backend="python" if direct else None)
                             status.note(
                                 f"  port {port}: {len(batch)} result(s) in "
                                 f"{time.monotonic() - group_started:.0f}s")

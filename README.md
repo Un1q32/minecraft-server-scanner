@@ -336,7 +336,9 @@ probes, and padding turned a 155k-server rescan into hundreds of millions
 of useless probes. Neighborhood discovery stays in the normal
 `slash16*`/`slash20a`/`slash24*` strategies. Because rescans now check
 only known endpoints they are cheap, so one rescan round runs every
-`--rescan-every` rounds (default 4) rather than every other round.
+`--rescan-every` rounds (default 4) rather than every other round. Ports
+with only a handful of servers are pinged directly instead of starting a
+separate masscan process, and the largest port group runs first.
 
 Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
 sweeps a random slice of the internet rather than all four billion
