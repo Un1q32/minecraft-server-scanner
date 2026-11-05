@@ -6273,7 +6273,11 @@ def _write_masscan_exclude_file():
             except Exception:
                 continue
         if not lines:
-            return None
+            # masscan refuses internet-scale ranges such as 0.0.0.0/0
+            # ("range too big, need confirmation") unless at least one
+            # --exclude is supplied.  Exclude an unroutable address so slash0
+            # still runs on nodes without an exclude.conf.
+            lines = ["0.0.0.0/32"]
         fd, path = tempfile.mkstemp(prefix="mcscan_exclude_", suffix=".conf")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
