@@ -546,7 +546,7 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 pass
 
     if use_masscan:
-        pool = scanner.ThreadPoolExecutor(max_workers=scanner.MAX_WORKERS)
+        pool = scanner.ThreadPoolExecutor(max_workers=scanner.STATUS_WORKERS)
 
         def handshake(ip_port):
             if scanner.shutdown_requested():

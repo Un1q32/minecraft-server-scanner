@@ -440,7 +440,7 @@ def run_masscan_backend(target_text, ports, rate, wait, stop_event,
 
     results = []
     lock = threading.Lock()
-    pool = scanner.ThreadPoolExecutor(max_workers=scanner.MAX_WORKERS)
+    pool = scanner.ThreadPoolExecutor(max_workers=scanner.STATUS_WORKERS)
     probed = {"n": 0}
     last_status = [0.0]
 
