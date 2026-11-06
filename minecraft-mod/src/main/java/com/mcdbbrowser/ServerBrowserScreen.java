@@ -89,6 +89,9 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private int activityPaneWidth;
 	private int activityPaneHeight;
 	private final ChartView chartView = new ChartView();
+	private List<NotesDatabase.Note> selectedNotes = List.of();
+	private @Nullable String notesAddress;
+	private long notesGeneration;
 
 	public ServerBrowserScreen(Screen parent) {
 		this(parent, rememberedQuery);
@@ -332,7 +335,15 @@ public class ServerBrowserScreen extends DropdownScreen {
 			this.setQuery(this.query.withSearch(this.searchBox.getValue()));
 		}
 		this.updateActivitySelection();
+		this.updateNotesSelection();
 		this.updateButtonStates();
+	}
+
+	@Override
+	public void added() {
+		super.added();
+		// Reload after returning from the notes viewer, since notes may have changed.
+		this.notesAddress = null;
 	}
 
 	private void updateActivitySelection() {
@@ -367,6 +378,62 @@ public class ServerBrowserScreen extends DropdownScreen {
 		}));
 	}
 
+	private void updateNotesSelection() {
+		ServerRecord selected = this.selectedServer();
+		String address = selected == null ? null : selected.address();
+		if (address == null ? this.notesAddress == null : address.equals(this.notesAddress)) {
+			return;
+		}
+		this.notesAddress = address;
+		long generation = ++this.notesGeneration;
+		this.selectedNotes = List.of();
+		if (address == null) {
+			return;
+		}
+		NotesDatabase.list(address).whenComplete((loaded, throwable) -> this.minecraft.execute(() -> {
+			if (generation != this.notesGeneration) {
+				return;
+			}
+			if (throwable != null) {
+				Throwable cause = throwable instanceof CompletionException && throwable.getCause() != null
+					? throwable.getCause() : throwable;
+				McdbBrowserClient.LOGGER.warn("Could not load notes for {}", address, cause);
+				this.selectedNotes = List.of();
+			} else {
+				this.selectedNotes = loaded == null ? List.of() : loaded;
+			}
+		}));
+	}
+
+	private int notesPanelHeight() {
+		if (this.selectedNotes.isEmpty() || this.activityPaneHeight < 60) {
+			return 0;
+		}
+		// Keep enough room for both charts, then give the rest to notes.
+		int maxForCharts = this.activityPaneHeight - 72 - GAP;
+		int share = this.activityPaneHeight * 35 / 100;
+		return Math.max(28, Math.min(Math.min(100, share), maxForCharts));
+	}
+
+	private int chartPaneHeight() {
+		int notes = this.notesPanelHeight();
+		return notes == 0 ? this.activityPaneHeight : this.activityPaneHeight - notes - GAP;
+	}
+
+	private int notesPanelY() {
+		return this.activityPaneY + this.chartPaneHeight() + GAP;
+	}
+
+	private boolean overNotes(double x, double y) {
+		int height = this.notesPanelHeight();
+		if (height <= 0) {
+			return false;
+		}
+		int top = this.notesPanelY();
+		return x >= this.activityPaneX && x < this.activityPaneX + this.activityPaneWidth
+			&& y >= top && y < top + height;
+	}
+
 	private boolean overActivity(double x, double y) {
 		return x >= this.activityPaneX && x < this.activityPaneX + this.activityPaneWidth
 			&& y >= this.activityPaneY && y < this.activityPaneY + this.activityPaneHeight;
@@ -398,6 +465,10 @@ public class ServerBrowserScreen extends DropdownScreen {
 	@Override
 	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
 		if (super.mouseClicked(event, doubleClick)) {
+			return true;
+		}
+		if (event.button() == 0 && this.overNotes(event.x(), event.y())) {
+			this.openSelectedNotes();
 			return true;
 		}
 		if (this.activity != null && this.overActivity(event.x(), event.y())) {
@@ -564,6 +635,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 				}
 			} else {
 				this.showNotice(result.message());
+				this.notesAddress = null;
 				onSuccess.run();
 			}
 			this.updateButtonStates();
@@ -654,22 +726,28 @@ public class ServerBrowserScreen extends DropdownScreen {
 			this.activityPaneX + this.activityPaneWidth,
 			this.activityPaneY + this.activityPaneHeight);
 		try {
+			int chartHeight = this.chartPaneHeight();
 			if (this.selectedServer() == null) {
 				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-					this.activityPaneWidth, this.activityPaneHeight, "Select a server", GRAY);
+					this.activityPaneWidth, chartHeight, "Select a server", GRAY);
 			} else if (this.activityLoading) {
 				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-					this.activityPaneWidth, this.activityPaneHeight, "Loading activity...", GRAY);
+					this.activityPaneWidth, chartHeight, "Loading activity...", GRAY);
 			} else if (this.activityError != null) {
 				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-					this.activityPaneWidth, this.activityPaneHeight, this.activityError, RED);
+					this.activityPaneWidth, chartHeight, this.activityError, RED);
 			} else if (this.activity != null) {
 				ActivityCharts.drawAll(graphics, this.font, this.activityPaneX, this.activityPaneY,
-					this.activityPaneWidth, this.activityPaneHeight, this.activity,
+					this.activityPaneWidth, chartHeight, this.activity,
 					this.chartView.start(), this.chartView.end());
 			} else {
 				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-					this.activityPaneWidth, this.activityPaneHeight, "No activity", GRAY);
+					this.activityPaneWidth, chartHeight, "No activity", GRAY);
+			}
+			int notesHeight = this.notesPanelHeight();
+			if (notesHeight > 0) {
+				ActivityCharts.drawNotes(graphics, this.font, this.activityPaneX, this.notesPanelY(),
+					this.activityPaneWidth, notesHeight, this.selectedNotes);
 			}
 		} finally {
 			graphics.disableScissor();

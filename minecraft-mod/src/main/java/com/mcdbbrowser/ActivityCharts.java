@@ -9,6 +9,8 @@ import java.util.List;
 import java.util.Locale;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.network.chat.Component;
+import net.minecraft.util.FormattedCharSequence;
 
 /** Shared sighting/player-activity chart rendering for the list pane and full screen. */
 final class ActivityCharts {
@@ -34,8 +36,8 @@ final class ActivityCharts {
 			drawMessage(graphics, font, x, y, w, h, "Not enough room for activity", DARK_GRAY);
 			return;
 		}
-		int minSight = 40;
-		int minPlayer = 34;
+		int minSight = 38;
+		int minPlayer = 30;
 		if (h < minSight + minPlayer + GAP) {
 			drawSightings(graphics, font, x, y, w, h, data.points(), viewStart, viewEnd);
 			return;
@@ -206,6 +208,57 @@ final class ActivityCharts {
 		if (sorted.size() > shown) {
 			graphics.text(font, "+" + (sorted.size() - shown) + " more player(s)",
 				x + 4, top + shown * rowHeight, DARK_GRAY);
+		}
+	}
+
+	/** Notes for the selected server, shown under the charts in the browser pane. */
+	static void drawNotes(GuiGraphicsExtractor graphics, Font font, int x, int y, int w, int h,
+	                      List<NotesDatabase.Note> notes) {
+		if (notes.isEmpty() || h < 20) {
+			return;
+		}
+		NotesDatabase.Note newest = notes.getLast();
+		String stamp = TIME.format(Instant.ofEpochSecond((long) newest.createdAt()));
+		panel(graphics, font, x, y, w, h, String.format(Locale.ROOT,
+			"NOTES • %,d • %s", notes.size(), stamp));
+
+		int textX = x + 4;
+		int textWidth = Math.max(20, w - 8);
+		int lineHeight = font.lineHeight + 1;
+		int top = y + 14;
+		int maxLines = Math.max(0, (y + h - 3 - top) / lineHeight);
+		if (maxLines == 0) {
+			return;
+		}
+		List<FormattedCharSequence> lines = new ArrayList<>();
+		for (int i = notes.size() - 1; i >= 0; i--) {
+			String body = notes.get(i).text();
+			if (body == null) {
+				continue;
+			}
+			for (String raw : body.replace('\r', ' ').split("\n")) {
+				String line = raw.strip();
+				if (line.isEmpty()) {
+					if (!lines.isEmpty()) {
+						lines.add(FormattedCharSequence.EMPTY);
+					}
+					continue;
+				}
+				lines.addAll(font.split(Component.literal(line), textWidth));
+			}
+			if (i > 0) {
+				lines.add(FormattedCharSequence.EMPTY);
+			}
+		}
+		boolean truncated = lines.size() > maxLines;
+		int shown = truncated && maxLines > 1 ? maxLines - 1 : Math.min(lines.size(), maxLines);
+		for (int i = 0; i < shown; i++) {
+			graphics.text(font, lines.get(i), textX, top + i * lineHeight,
+				i == 0 ? WHITE : 0xFFD0D0D0);
+		}
+		if (truncated && shown < maxLines) {
+			graphics.text(font, "+" + (lines.size() - shown) + " more line(s) — click for all notes",
+				textX, top + shown * lineHeight, DARK_GRAY);
 		}
 	}
 
