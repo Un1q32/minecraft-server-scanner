@@ -751,7 +751,9 @@ def merge_row(con, row):
             " (SELECT COALESCE(MAX(seq), 0) + 1 FROM server_state))",
             (row["ip_port"], None, row["port"], row["motd"],
              row["players_online"], row["max_players"], row["version"],
-             row["protocol"], row["cracked"], row["whitelist"],
+             row["protocol"],
+             row["cracked"] if row["last_source"] == "cracked" else None,
+             row["whitelist"],
              row["times_seen"], row["last_source"],
              row["players_now"], row["players_ever"]))
         fallback_now = _utcnow()

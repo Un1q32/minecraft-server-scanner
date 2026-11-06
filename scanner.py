@@ -686,7 +686,11 @@ def _record_server_result_locked(con, result, source, now):
     except Exception:
         source = "scan"
     protocol = sanitize_protocol(result.get("protocol"))
-    cracked = 1 if result.get("cracked") else None
+    # Only an authoritative cracked/whitelist probe may persist a verdict.
+    if db_format.source_is_cracked_verdict(source):
+        cracked = 1 if result.get("cracked") else None
+    else:
+        cracked = None
     # Player-name lists: the live sample is the current roster; the union of
     # every sample ever seen stays after logout. Minescan hits carry no
     # sample (webscan doesn't report one), so they must not blank the list
@@ -1820,7 +1824,10 @@ def netdb_merge_remote(servers, upload_watermark=None):
                          sanitize_motd(raw.get("motd", "")),
                          r_online, r_maximum,
                          sanitize_motd(raw.get("version", "") or ""),
-                         raw.get("protocol"), db_format.cracked_state(raw.get("cracked")),
+                         raw.get("protocol"),
+                         (db_format.cracked_state(raw.get("cracked"))
+                          if db_format.source_is_cracked_verdict(
+                              raw.get("last_source")) else None),
                          str(raw.get("whitelist", "") or ""),
                          max(1, r_times),
                          str(raw.get("last_source", "") or "netdb"),
@@ -4425,29 +4432,13 @@ def ping_server(entry, proxy=None, persist=True):
                 if pname:
                     players_sample.append((pid, pname))
 
-            # Cracked hint from the status sample.  Require ALL sampled
-            # players to have offline-mode UUIDs: online-mode servers behind
-            # a proxy can list a single legacy/offline UUID among Mojang
-            # UUIDs, which used to mark the whole server as cracked.  This
-            # stays a hint; the login probe is the authoritative check.
+            # A status sample cannot prove offline mode.  Online-mode
+            # servers behind proxies and hybrid-auth servers routinely list
+            # offline UUIDs in players.sample, and proxy backends answer a
+            # login probe with Login Success while still being part of an
+            # online-mode network.  Only the explicit cracked checker /
+            # whitelist probe writes a cracked verdict.
             cracked = None
-            if players_sample:
-                all_offline = True
-                for pid, pname in players_sample:
-                    if not pname or not pid:
-                        all_offline = False
-                        break
-                    try:
-                        off_uuid = offline_uuid_nodash(pname)
-                        reported = pid.replace('-', '').lower()
-                        if reported != off_uuid:
-                            all_offline = False
-                            break
-                    except Exception:
-                        all_offline = False
-                        break
-                if all_offline:
-                    cracked = True
 
             version_obj = response.get('version') or {}
             if not isinstance(version_obj, dict):
