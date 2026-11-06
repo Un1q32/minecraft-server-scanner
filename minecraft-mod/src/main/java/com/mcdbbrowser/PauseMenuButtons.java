@@ -46,9 +46,13 @@ final class PauseMenuButtons {
 			.bounds(MARGIN, MARGIN + 2 * SPACING, WIDTH, HEIGHT).build());
 
 		ServerAddress address = ServerAddress.parseString(server.ip);
+		String hostAndPort = address.getHost() + ":" + address.getPort();
 		widgets.add(Button.builder(Component.literal("Seen Names"),
-			button -> minecraft.gui.setScreen(new PlayerHistoryScreen(screen, address.getHost() + ":" + address.getPort())))
+			button -> minecraft.gui.setScreen(new PlayerHistoryScreen(screen, hostAndPort)))
 			.bounds(MARGIN, MARGIN + 3 * SPACING, WIDTH, HEIGHT).build());
+		widgets.add(Button.builder(Component.literal("Notes"),
+			button -> minecraft.gui.setScreen(new NotesScreen(screen, hostAndPort)))
+			.bounds(MARGIN, MARGIN + 4 * SPACING, WIDTH, HEIGHT).build());
 	}
 
 	/** Fabric re-fires AFTER_INIT on resize, and resize keeps the existing widgets. */
