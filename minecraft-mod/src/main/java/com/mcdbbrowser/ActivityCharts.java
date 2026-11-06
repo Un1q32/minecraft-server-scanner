@@ -29,19 +29,36 @@ final class ActivityCharts {
 	}
 
 	static void drawAll(GuiGraphicsExtractor graphics, Font font, int x, int y, int w, int h,
-	                    ServerDatabase.ServerActivity data) {
-		double[] range = timeRange(data.points(), data.players());
-		int sightHeight = Math.max(44, h * 44 / 100);
+	                    ServerDatabase.ServerActivity data, double viewStart, double viewEnd) {
+		if (h < 54) {
+			drawMessage(graphics, font, x, y, w, h, "Not enough room for activity", DARK_GRAY);
+			return;
+		}
+		int minSight = 40;
+		int minPlayer = 34;
+		if (h < minSight + minPlayer + GAP) {
+			drawSightings(graphics, font, x, y, w, h, data.points(), viewStart, viewEnd);
+			return;
+		}
+		int sightHeight = Math.min(h - minPlayer - GAP, Math.max(minSight, h * 44 / 100));
 		int playerY = y + sightHeight + GAP;
-		int playerHeight = Math.max(38, y + h - playerY);
-		drawSightings(graphics, font, x, y, w, sightHeight, data.points(), range[0], range[1]);
-		drawPlayers(graphics, font, x, playerY, w, playerHeight, data.players(), range[0], range[1]);
+		int playerHeight = y + h - playerY;
+		drawSightings(graphics, font, x, y, w, sightHeight, data.points(), viewStart, viewEnd);
+		drawPlayers(graphics, font, x, playerY, w, playerHeight, data.players(), viewStart, viewEnd);
+	}
+
+	static int plotLeft(int x) {
+		return x + 34;
+	}
+
+	static int plotRight(int x, int w) {
+		return x + w - 8;
 	}
 
 	static void drawMessage(GuiGraphicsExtractor graphics, Font font, int x, int y, int w, int h,
 	                        String message, int color) {
 		graphics.fill(x, y, x + w, y + h, 0x30000000);
-		graphics.outline(x, y, x + w, y + h, 0x50808080);
+		graphics.outline(x, y, w, h, 0x50808080);
 		graphics.centeredText(font, message, x + w / 2, y + h / 2 - 4, color);
 	}
 
@@ -49,7 +66,12 @@ final class ActivityCharts {
 	                                  List<ServerDatabase.HistoryPoint> points, double t0, double t1) {
 		int peak = 1;
 		boolean counted = false;
+		int visible = 0;
 		for (ServerDatabase.HistoryPoint point : points) {
+			if (point.seenAt() < t0 || point.seenAt() > t1) {
+				continue;
+			}
+			visible++;
 			if (point.playersOnline() != null) {
 				peak = Math.max(peak, point.playersOnline());
 				counted = true;
@@ -57,7 +79,8 @@ final class ActivityCharts {
 		}
 		if (!counted) {
 			for (ServerDatabase.HistoryPoint point : points) {
-				if (point.maxPlayers() != null) {
+				if (point.seenAt() >= t0 && point.seenAt() <= t1
+						&& point.maxPlayers() != null) {
 					peak = Math.max(peak, point.maxPlayers());
 				}
 			}
@@ -92,8 +115,10 @@ final class ActivityCharts {
 		boolean[] hasPoint = new boolean[pixels + 1];
 		boolean[] tick = new boolean[pixels + 1];
 		for (ServerDatabase.HistoryPoint point : points) {
+			if (point.seenAt() < t0 || point.seenAt() > t1) {
+				continue;
+			}
 			int px = left + (int) Math.round((point.seenAt() - t0) * pixels / span);
-			px = Math.max(left, Math.min(right, px));
 			tick[px - left] = true;
 			if (point.playersOnline() == null) {
 				continue;
@@ -126,7 +151,10 @@ final class ActivityCharts {
 				graphics.fill(left + i, bottom + 1, left + i + 1, bottom + 4, 0xFF7AA6CC);
 			}
 		}
-		if (!counted) {
+		if (visible == 0) {
+			graphics.centeredText(font, "No sightings in this window", (left + right) / 2,
+				(top + bottom) / 2, DARK_GRAY);
+		} else if (!counted) {
 			graphics.centeredText(font, "No player counts recorded", (left + right) / 2,
 				(top + bottom) / 2, DARK_GRAY);
 		}
@@ -167,8 +195,11 @@ final class ActivityCharts {
 			List<Double> times = player.times();
 			int step = Math.max(1, times.size() / MAX_DOTS_PER_PLAYER);
 			for (int i = 0; i < times.size(); i += step) {
-				int px = left + (int) Math.round((times.get(i) - t0) * pixels / span);
-				px = Math.max(left, Math.min(right, px));
+				double time = times.get(i);
+				if (time < t0 || time > t1) {
+					continue;
+				}
+				int px = left + (int) Math.round((time - t0) * pixels / span);
 				graphics.fill(px - 1, centerY - 1, px + 2, centerY + 2, COLORS[row % COLORS.length]);
 			}
 		}
@@ -180,7 +211,7 @@ final class ActivityCharts {
 
 	private static void panel(GuiGraphicsExtractor graphics, Font font, int x, int y, int w, int h, String title) {
 		graphics.fill(x, y, x + w, y + h, 0x30000000);
-		graphics.outline(x, y, x + w, y + h, 0x50808080);
+		graphics.outline(x, y, w, h, 0x50808080);
 		graphics.text(font, title, x + 4, y + 3, WHITE);
 	}
 
@@ -207,8 +238,8 @@ final class ActivityCharts {
 		}
 	}
 
-	private static double[] timeRange(List<ServerDatabase.HistoryPoint> points,
-	                                  List<ServerDatabase.PlayerActivity> players) {
+	static double[] fullRange(List<ServerDatabase.HistoryPoint> points,
+	                          List<ServerDatabase.PlayerActivity> players) {
 		double lo = 0;
 		double hi = 0;
 		for (ServerDatabase.HistoryPoint point : points) {

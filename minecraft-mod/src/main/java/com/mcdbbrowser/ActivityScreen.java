@@ -5,6 +5,7 @@ import java.util.concurrent.CompletionException;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import org.jspecify.annotations.Nullable;
@@ -25,6 +26,7 @@ public class ActivityScreen extends Screen {
 	private @Nullable String status;
 	private int statusColor = GRAY;
 	private @Nullable Button reloadButton;
+	private final ChartView chartView = new ChartView();
 
 	public ActivityScreen(Screen parent, String hostAndPort) {
 		super(Component.literal("Activity: " + hostAndPort));
@@ -65,6 +67,7 @@ public class ActivityScreen extends Screen {
 				} else {
 					this.activity = loaded;
 					this.status = null;
+					this.chartView.reset(ActivityCharts.fullRange(loaded.points(), loaded.players()));
 				}
 			}));
 	}
@@ -93,13 +96,85 @@ public class ActivityScreen extends Screen {
 				Math.max(20, bottom - top), this.status == null ? "No activity" : this.status, this.statusColor);
 			return;
 		}
-		ActivityCharts.drawAll(graphics, this.font, MARGIN, top, this.width - 2 * MARGIN,
-			Math.max(20, bottom - top), this.activity);
+		graphics.enableScissor(MARGIN, top, this.width - MARGIN, bottom);
+		try {
+			ActivityCharts.drawAll(graphics, this.font, MARGIN, top, this.width - 2 * MARGIN,
+				Math.max(20, bottom - top), this.activity,
+				this.chartView.start(), this.chartView.end());
+		} finally {
+			graphics.disableScissor();
+		}
 
 		int statusY = this.height - FOOTER_HEIGHT + 10;
 		String text = String.format(Locale.ROOT, "%,d sightings • %,d players seen",
 			this.activity.points().size(), this.activity.players().size());
 		graphics.centeredText(this.font, text, this.width / 2, statusY, GRAY);
+	}
+
+	private boolean overChart(double x, double y) {
+		return x >= MARGIN && x < this.width - MARGIN
+			&& y >= 30 && y < this.height - FOOTER_HEIGHT;
+	}
+
+	private int plotLeft() {
+		return ActivityCharts.plotLeft(MARGIN);
+	}
+
+	private int plotRight() {
+		return ActivityCharts.plotRight(MARGIN, this.width - 2 * MARGIN);
+	}
+
+	@Override
+	public boolean mouseScrolled(double x, double y, double scrollX, double scrollY) {
+		if (super.mouseScrolled(x, y, scrollX, scrollY)) {
+			return true;
+		}
+		if (this.activity != null && this.overChart(x, y)) {
+			int left = this.plotLeft();
+			int right = this.plotRight();
+			if (x >= left && x <= right && this.chartView.scroll(x, scrollY, left, right)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	@Override
+	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+		if (super.mouseClicked(event, doubleClick)) {
+			return true;
+		}
+		if (this.activity != null && this.overChart(event.x(), event.y())) {
+			int left = this.plotLeft();
+			int right = this.plotRight();
+			if (doubleClick) {
+				this.chartView.reset(ActivityCharts.fullRange(this.activity.points(), this.activity.players()));
+				return true;
+			}
+			if ((event.button() == 0 || event.button() == 1) && event.x() >= left && event.x() <= right) {
+				this.chartView.press(event.x());
+			}
+			return true;
+		}
+		return false;
+	}
+
+	@Override
+	public boolean mouseDragged(MouseButtonEvent event, double dragX, double dragY) {
+		if (this.chartView.isDragging()) {
+			this.chartView.drag(event.x(), this.plotLeft(), this.plotRight());
+			return true;
+		}
+		return super.mouseDragged(event, dragX, dragY);
+	}
+
+	@Override
+	public boolean mouseReleased(MouseButtonEvent event) {
+		if (this.chartView.isDragging()) {
+			this.chartView.release();
+			return true;
+		}
+		return super.mouseReleased(event);
 	}
 
 	@Override

@@ -88,6 +88,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private int activityPaneY;
 	private int activityPaneWidth;
 	private int activityPaneHeight;
+	private final ChartView chartView = new ChartView();
 
 	public ServerBrowserScreen(Screen parent) {
 		this(parent, rememberedQuery);
@@ -345,6 +346,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.activity = null;
 		this.activityError = null;
 		this.activityLoading = address != null;
+		this.chartView.reset(new double[] {0, 0});
 		if (address == null) {
 			return;
 		}
@@ -360,8 +362,75 @@ public class ServerBrowserScreen extends DropdownScreen {
 					? cause.getClass().getSimpleName() : cause.getMessage();
 			} else {
 				this.activity = data;
+				this.chartView.reset(ActivityCharts.fullRange(data.points(), data.players()));
 			}
 		}));
+	}
+
+	private boolean overActivity(double x, double y) {
+		return x >= this.activityPaneX && x < this.activityPaneX + this.activityPaneWidth
+			&& y >= this.activityPaneY && y < this.activityPaneY + this.activityPaneHeight;
+	}
+
+	private int activityPlotLeft() {
+		return ActivityCharts.plotLeft(this.activityPaneX);
+	}
+
+	private int activityPlotRight() {
+		return ActivityCharts.plotRight(this.activityPaneX, this.activityPaneWidth);
+	}
+
+	@Override
+	public boolean mouseScrolled(double x, double y, double scrollX, double scrollY) {
+		if (super.mouseScrolled(x, y, scrollX, scrollY)) {
+			return true;
+		}
+		if (this.activity != null && this.overActivity(x, y)) {
+			int left = this.activityPlotLeft();
+			int right = this.activityPlotRight();
+			if (x >= left && x <= right && this.chartView.scroll(x, scrollY, left, right)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	@Override
+	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+		if (super.mouseClicked(event, doubleClick)) {
+			return true;
+		}
+		if (this.activity != null && this.overActivity(event.x(), event.y())) {
+			int left = this.activityPlotLeft();
+			int right = this.activityPlotRight();
+			if (doubleClick) {
+				this.chartView.reset(ActivityCharts.fullRange(this.activity.points(), this.activity.players()));
+				return true;
+			}
+			if ((event.button() == 0 || event.button() == 1) && event.x() >= left && event.x() <= right) {
+				this.chartView.press(event.x());
+			}
+			return true;
+		}
+		return false;
+	}
+
+	@Override
+	public boolean mouseDragged(MouseButtonEvent event, double dragX, double dragY) {
+		if (this.chartView.isDragging()) {
+			this.chartView.drag(event.x(), this.activityPlotLeft(), this.activityPlotRight());
+			return true;
+		}
+		return super.mouseDragged(event, dragX, dragY);
+	}
+
+	@Override
+	public boolean mouseReleased(MouseButtonEvent event) {
+		if (this.chartView.isDragging()) {
+			this.chartView.release();
+			return true;
+		}
+		return super.mouseReleased(event);
 	}
 
 	private void updateButtonStates() {
@@ -581,21 +650,29 @@ public class ServerBrowserScreen extends DropdownScreen {
 		if (this.activityPaneWidth <= 0 || this.activityPaneHeight <= 0) {
 			return;
 		}
-		if (this.selectedServer() == null) {
-			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-				this.activityPaneWidth, this.activityPaneHeight, "Select a server", GRAY);
-		} else if (this.activityLoading) {
-			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-				this.activityPaneWidth, this.activityPaneHeight, "Loading activity...", GRAY);
-		} else if (this.activityError != null) {
-			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-				this.activityPaneWidth, this.activityPaneHeight, this.activityError, RED);
-		} else if (this.activity != null) {
-			ActivityCharts.drawAll(graphics, this.font, this.activityPaneX, this.activityPaneY,
-				this.activityPaneWidth, this.activityPaneHeight, this.activity);
-		} else {
-			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
-				this.activityPaneWidth, this.activityPaneHeight, "No activity", GRAY);
+		graphics.enableScissor(this.activityPaneX, this.activityPaneY,
+			this.activityPaneX + this.activityPaneWidth,
+			this.activityPaneY + this.activityPaneHeight);
+		try {
+			if (this.selectedServer() == null) {
+				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+					this.activityPaneWidth, this.activityPaneHeight, "Select a server", GRAY);
+			} else if (this.activityLoading) {
+				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+					this.activityPaneWidth, this.activityPaneHeight, "Loading activity...", GRAY);
+			} else if (this.activityError != null) {
+				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+					this.activityPaneWidth, this.activityPaneHeight, this.activityError, RED);
+			} else if (this.activity != null) {
+				ActivityCharts.drawAll(graphics, this.font, this.activityPaneX, this.activityPaneY,
+					this.activityPaneWidth, this.activityPaneHeight, this.activity,
+					this.chartView.start(), this.chartView.end());
+			} else {
+				ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+					this.activityPaneWidth, this.activityPaneHeight, "No activity", GRAY);
+			}
+		} finally {
+			graphics.disableScissor();
 		}
 	}
 
