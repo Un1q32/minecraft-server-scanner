@@ -46,7 +46,7 @@ final class PauseMenuButtons {
 			.bounds(MARGIN, MARGIN + 2 * SPACING, WIDTH, HEIGHT).build());
 
 		ServerAddress address = ServerAddress.parseString(server.ip);
-		widgets.add(Button.builder(Component.literal("Player History"),
+		widgets.add(Button.builder(Component.literal("Seen Names"),
 			button -> minecraft.gui.setScreen(new PlayerHistoryScreen(screen, address.getHost() + ":" + address.getPort())))
 			.bounds(MARGIN, MARGIN + 3 * SPACING, WIDTH, HEIGHT).build());
 	}

@@ -127,7 +127,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.joinButton = this.addRenderableWidget(this.footerButton(Component.translatable("selectServer.select"), serverRowX, serverRowY, this::joinSelected));
 		this.addButton = this.addRenderableWidget(this.footerButton(Component.literal("Add to List"), serverRowX + step, serverRowY, this::addSelectedToServerList));
 		this.copyButton = this.addRenderableWidget(this.footerButton(Component.literal("Copy IP"), serverRowX + 2 * step, serverRowY, this::copySelected));
-		this.historyButton = this.addRenderableWidget(this.footerButton(Component.literal("Player History"), serverRowX + 3 * step, serverRowY, this::openSelectedHistory));
+		this.historyButton = this.addRenderableWidget(this.footerButton(Component.literal("Seen Names"), serverRowX + 3 * step, serverRowY, this::openSelectedHistory));
 
 		int actionRowY = this.height - 52;
 		int actionRowX = this.footerRowX(3, ACTION_BUTTON_WIDTH);
@@ -554,6 +554,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		private static final int LIST_PADDING = 2;
 		private static final int MAX_ROW_WIDTH = 420;
 		private static final int MAX_VERSION_WIDTH = 140;
+		private static final int TOOLTIP_NAME_LIMIT = 30;
 		/** Rows kept ready above and below the viewport so small scrolls don't rebuild. */
 		private static final int WINDOW_BUFFER = 4;
 
@@ -879,14 +880,39 @@ public class ServerBrowserScreen extends DropdownScreen {
 
 			private List<Component> playersTooltip() {
 				if (this.playersTooltip == null) {
-					List<String> names = this.server.playersNow();
-					this.playersTooltip = new ArrayList<>(names.size() + 1);
-					if (!names.isEmpty()) {
-						this.playersTooltip.add(Component.literal("Players seen online:").withStyle(ChatFormatting.YELLOW));
-						names.forEach(name -> this.playersTooltip.add(Component.literal(name)));
+					List<String> now = this.server.playersNow();
+					List<String> seenOnly = new ArrayList<>();
+					for (String name : this.server.playersEver()) {
+						if (!now.contains(name)) {
+							seenOnly.add(name);
+						}
+					}
+					this.playersTooltip = new ArrayList<>(now.size() + seenOnly.size() + 3);
+					if (!now.isEmpty()) {
+						this.playersTooltip.add(Component.literal("Players online now:").withStyle(ChatFormatting.YELLOW));
+						addTooltipNames(this.playersTooltip, now);
+					}
+					if (!seenOnly.isEmpty()) {
+						if (!this.playersTooltip.isEmpty()) {
+							this.playersTooltip.add(Component.empty());
+						}
+						this.playersTooltip.add(Component.literal(now.isEmpty() ? "Seen names:" : "Also seen before:")
+							.withStyle(ChatFormatting.YELLOW));
+						addTooltipNames(this.playersTooltip, seenOnly);
 					}
 				}
 				return this.playersTooltip;
+			}
+
+			private void addTooltipNames(List<Component> out, List<String> names) {
+				int shown = Math.min(names.size(), TOOLTIP_NAME_LIMIT);
+				for (int i = 0; i < shown; i++) {
+					out.add(Component.literal(names.get(i)));
+				}
+				if (names.size() > shown) {
+					out.add(Component.literal("... and " + (names.size() - shown) + " more (open Seen Names)")
+						.withStyle(ChatFormatting.DARK_GRAY));
+				}
 			}
 
 			private List<Component> detailsTooltip() {

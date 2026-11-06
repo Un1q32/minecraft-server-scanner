@@ -39,11 +39,12 @@ public class PlayerHistoryScreen extends Screen {
 	private EditBox filterBox;
 	private NameList list;
 	private Button copyButton;
+	private @Nullable Button loginButton;
 	private @Nullable Button meteorButton;
-	private boolean addingToMeteor;
+	private boolean meteorBusy;
 
 	public PlayerHistoryScreen(Screen parent, String hostAndPort) {
-		super(Component.literal("Player history: " + hostAndPort));
+		super(Component.literal("Seen names: " + hostAndPort));
 		this.parent = parent;
 		this.hostAndPort = hostAndPort;
 	}
@@ -58,18 +59,28 @@ public class PlayerHistoryScreen extends Screen {
 		this.list = this.addRenderableWidget(new NameList(this.width, this.height - FOOTER_HEIGHT - LIST_TOP, LIST_TOP));
 		this.refreshList();
 
-		int buttonCount = METEOR_LOADED ? 3 : 2;
+		int buttonCount = METEOR_LOADED ? 4 : 2;
 		int footerY = this.height - 28;
-		int footerX = (this.width - (buttonCount * BUTTON_WIDTH + (buttonCount - 1) * GAP)) / 2;
-		int step = BUTTON_WIDTH + GAP;
-		this.copyButton = this.addRenderableWidget(Button.builder(Component.literal("Copy Name"), button -> this.copySelected())
-			.bounds(footerX, footerY, BUTTON_WIDTH, ROW_HEIGHT).build());
+		int buttonWidth = Math.max(70,
+			Math.min(BUTTON_WIDTH, (this.width - 2 * MARGIN - (buttonCount - 1) * GAP) / buttonCount));
+		int footerX = (this.width - (buttonCount * buttonWidth + (buttonCount - 1) * GAP)) / 2;
+		int step = buttonWidth + GAP;
+		int x = footerX;
 		if (METEOR_LOADED) {
-			this.meteorButton = this.addRenderableWidget(Button.builder(Component.literal("Add to Meteor Alts"), button -> this.confirmAddToMeteor())
-				.bounds(footerX + step, footerY, BUTTON_WIDTH, ROW_HEIGHT).build());
+			this.loginButton = this.addRenderableWidget(Button.builder(Component.literal("Login as Name"), button -> this.loginSelected())
+				.bounds(x, footerY, buttonWidth, ROW_HEIGHT).build());
+			x += step;
+		}
+		this.copyButton = this.addRenderableWidget(Button.builder(Component.literal("Copy Name"), button -> this.copySelected())
+			.bounds(x, footerY, buttonWidth, ROW_HEIGHT).build());
+		x += step;
+		if (METEOR_LOADED) {
+			this.meteorButton = this.addRenderableWidget(Button.builder(Component.literal("Add All as Alts"), button -> this.confirmAddToMeteor())
+				.bounds(x, footerY, buttonWidth, ROW_HEIGHT).build());
+			x += step;
 		}
 		this.addRenderableWidget(Button.builder(CommonComponents.GUI_BACK, button -> this.onClose())
-			.bounds(footerX + (buttonCount - 1) * step, footerY, BUTTON_WIDTH, ROW_HEIGHT).build());
+			.bounds(x, footerY, buttonWidth, ROW_HEIGHT).build());
 
 		this.setInitialFocus(this.filterBox);
 		if (this.names == null && !this.loading) {
@@ -131,11 +142,34 @@ public class PlayerHistoryScreen extends Screen {
 		}, title, message));
 	}
 
+	private void loginSelected() {
+		NameList.Entry entry = this.list.getSelected();
+		if (entry == null) {
+			return;
+		}
+		String name = entry.name;
+		this.meteorBusy = true;
+		this.showStatus("Signing in as " + name + "...", GRAY);
+		MeteorAlts.loginCracked(name).whenComplete((result, throwable) -> this.minecraft.execute(() -> {
+			this.meteorBusy = false;
+			if (throwable != null) {
+				McdbBrowserClient.LOGGER.error("Failed to sign in to Meteor as {}", name, throwable);
+				this.showStatus("Could not sign in as " + name + ": " + throwable.getMessage(), RED);
+			} else if (result == null || !result.loggedIn()) {
+				String error = result == null || result.error() == null ? "unknown error" : result.error();
+				this.showStatus("Could not sign in as " + name + ": " + error, RED);
+			} else {
+				String suffix = this.minecraft.level == null ? "" : " (applies to the next server you join)";
+				this.showStatus("Signed in as " + result.name() + " with a cracked account" + suffix, GREEN);
+			}
+		}));
+	}
+
 	private void addToMeteor(List<String> names) {
-		this.addingToMeteor = true;
+		this.meteorBusy = true;
 		this.showStatus("Adding to Meteor alts...", GRAY);
 		MeteorAlts.addCracked(names).whenComplete((result, throwable) -> this.minecraft.execute(() -> {
-			this.addingToMeteor = false;
+			this.meteorBusy = false;
 			if (throwable != null) {
 				McdbBrowserClient.LOGGER.error("Failed to add Meteor alts", throwable);
 				this.showStatus("Failed to add Meteor alts: " + throwable.getMessage(), RED);
@@ -153,9 +187,13 @@ public class PlayerHistoryScreen extends Screen {
 
 	@Override
 	public void tick() {
-		this.copyButton.active = this.list.getSelected() != null;
+		boolean hasSelection = this.list.getSelected() != null;
+		this.copyButton.active = hasSelection;
+		if (this.loginButton != null) {
+			this.loginButton.active = !this.meteorBusy && hasSelection;
+		}
 		if (this.meteorButton != null) {
-			this.meteorButton.active = !this.addingToMeteor && !this.list.children().isEmpty();
+			this.meteorButton.active = !this.meteorBusy && !this.list.children().isEmpty();
 		}
 	}
 
@@ -182,7 +220,7 @@ public class PlayerHistoryScreen extends Screen {
 
 	private class NameList extends ObjectSelectionList<NameList.Entry> {
 		private static final int ENTRY_HEIGHT = 12;
-		private static final int ROW_WIDTH = 200;
+		private static final int ROW_WIDTH = 400;
 
 		NameList(int width, int height, int y) {
 			super(PlayerHistoryScreen.this.minecraft, width, height, y, ENTRY_HEIGHT);
@@ -195,7 +233,7 @@ public class PlayerHistoryScreen extends Screen {
 
 		@Override
 		public int getRowWidth() {
-			return ROW_WIDTH;
+			return Math.min(ROW_WIDTH, this.width - 4 * MARGIN);
 		}
 
 		class Entry extends ObjectSelectionList.Entry<Entry> {
