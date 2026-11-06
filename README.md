@@ -326,7 +326,9 @@ Normal rounds choose one strategy, weighted by history:
 After each normal round the strategy is scored as new servers per hour,
 `(new + 5×new_on_25565 + 0.1×revived) × 3600 / (seconds + 30)` — finds on
 the default port count 5× (they last longer), a server unseen for a week
-that answers again counts 0.1×. Scores persist in `strategies.json`
+that answers again counts 0.1×. New ports that merely repeat a server
+already known on that host (same MOTD/version/protocol) are ignored, so a
+port-spray/NAT artifact cannot inflate a strategy's score. Scores persist in `strategies.json`
 (`--state-file`); 90% of rounds take the best strategy, 10% explore a
 random one, and untried strategies go first so the empty case bootstraps
 with `slash0`.

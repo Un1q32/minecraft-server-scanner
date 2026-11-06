@@ -21,7 +21,10 @@ Runs two round categories forever:
 After each normal round the strategy is scored like matscan:
 ``(new + 5*new_on_25565 + 0.1*revived) * 3600 / (seconds + 30)`` --
 new servers per hour, with default-port finds weighted 5x because they
-last longer. Scores persist to ``strategies.json``; 90% of rounds take
+last longer. A new port merely repeating a server already known on that
+host (same MOTD/version/protocol) does not count as a new server, so
+port-spray/NAT artifacts cannot inflate a strategy's score. Scores persist
+to ``strategies.json``; 90% of rounds take
 the best strategy, 10% explore a random one. An empty/unknown DB makes
 everything tie, which bootstraps with ``slash0``.
 
@@ -682,10 +685,52 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
     return results
 
 
-def _classify_one(before, result, now=None):
+def _protocol(value):
+    try:
+        return int(value)
+    except Exception:
+        return -1
+
+
+def _row_signature(row):
+    """Identity used to recognise the same server on another port."""
+    return (_host_of(row.get("ip_port", "")),
+            str(row.get("motd") or "").strip().lower(),
+            str(row.get("version") or "").strip().lower(),
+            _protocol(row.get("protocol")))
+
+
+def _result_signature(result):
+    return (_host_of(result.get("ip", "")),
+            str(result.get("motd") or "").strip().lower(),
+            str(result.get("version") or "").strip().lower(),
+            _protocol(result.get("protocol")))
+
+
+def _signature_index(rows):
+    """(known signatures, latest last_seen per signature)."""
+    known = set()
+    latest = {}
+    for row in rows:
+        sig = _row_signature(row)
+        known.add(sig)
+        try:
+            last = float(row.get("last_seen") or 0)
+        except Exception:
+            last = 0.0
+        if last > latest.get(sig, 0.0):
+            latest[sig] = last
+    return known, latest
+
+
+def _classify_one(before, result, now=None, known_signatures=None,
+                  seen_signatures=None, signature_last_seen=None):
     """Classify one result: 'new' | 'updated' | 'revived' | None.
 
-    'revived' is an updated server that had been unseen for a week.
+    'revived' is an updated server that had been unseen for a week.  A new
+    port repeating a known host/signature is never counted as new, and a
+    known port is not counted as revived while another port on the same host
+    with the same signature was seen recently.
     """
     try:
         ip_port = result.get("ip", "")
@@ -695,27 +740,62 @@ def _classify_one(before, result, now=None):
         return None
     now = now or _now()
     seen = before.get(ip_port)
-    if seen is None:
-        return "new"
-    if seen > 0 and now - seen > REVIVED_AFTER:
-        return "revived"
-    return "updated"
+    if seen is not None:
+        if seen > 0 and now - seen > REVIVED_AFTER:
+            if signature_last_seen is not None:
+                sig = _result_signature(result)
+                if signature_last_seen.get(sig, 0) > now - REVIVED_AFTER:
+                    return None
+            return "revived"
+        return "updated"
+
+    if known_signatures is not None:
+        sig = _result_signature(result)
+        if sig in known_signatures:
+            return None
+        if seen_signatures is not None:
+            if sig in seen_signatures:
+                return None
+            seen_signatures.add(sig)
+    return "new"
 
 
-def _classify(before, results):
-    """(new, new_on_25565, revived) versus the pre-round snapshot."""
-    new = new_def = revived = 0
+def _classify(before, results, known_signatures=None, signature_last_seen=None):
+    """(new, new_on_25565, revived) versus the pre-round snapshot.
+
+    New counts unique host/signature pairs, so many ports of one server are
+    one find.  new_on_25565 is set when any port in that group is 25565.
+    """
+    known = known_signatures or set()
+    latest = signature_last_seen or {}
+    now = _now()
+    new_sigs = {}
+    revived = 0
     for result in results:
-        kind = _classify_one(before, result)
-        if kind == "new":
-            new += 1
-            try:
-                if _port_of(result.get("ip", "")) == 25565:
-                    new_def += 1
-            except Exception:
-                pass
-        elif kind == "revived":
-            revived += 1
+        try:
+            ip_port = result.get("ip", "")
+        except Exception:
+            continue
+        if not ip_port:
+            continue
+        seen = before.get(ip_port)
+        if seen is not None:
+            if seen > 0 and now - seen > REVIVED_AFTER:
+                sig = _result_signature(result)
+                if latest.get(sig, 0) <= now - REVIVED_AFTER:
+                    revived += 1
+            continue
+        sig = _result_signature(result)
+        if sig in known:
+            continue
+        canonical = _port_of(ip_port) == 25565
+        if sig in new_sigs:
+            if canonical:
+                new_sigs[sig] = True
+        else:
+            new_sigs[sig] = canonical
+    new = len(new_sigs)
+    new_def = sum(1 for value in new_sigs.values() if value)
     return new, new_def, revived
 
 
@@ -1052,6 +1132,8 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                         row.get("last_seen") or 0)
                 except Exception:
                     continue
+            before_signatures, signature_last_seen = _signature_index(before_rows)
+            seen_signatures = set(before_signatures)
             started = time.time()
             results = []
             name = None
@@ -1059,11 +1141,15 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
             counts = {"new": 0, "updated": 0, "revived": 0, "total": 0}
             count_lock = threading.Lock()
 
-            def on_hit(result, _before=before):
-                kind = _classify_one(_before, result)
-                if kind is None:
-                    return
+            def on_hit(result, _before=before, _seen=seen_signatures):
                 with count_lock:
+                    kind = _classify_one(
+                        _before, result,
+                        known_signatures=before_signatures,
+                        seen_signatures=_seen,
+                        signature_last_seen=signature_last_seen)
+                    if kind is None:
+                        return
                     counts[kind] += 1
                     counts["total"] += 1
                 status.hit(kind)
@@ -1166,7 +1252,10 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     print("  nothing due")
 
             elapsed = max(0.0, time.time() - started)
-            new, new_def, revived = _classify(before, results)
+            new, new_def, revived = _classify(
+                before, results,
+                known_signatures=before_signatures,
+                signature_last_seen=signature_last_seen)
             with count_lock:
                 live_total = counts["total"]
                 live_updated = counts["updated"]
