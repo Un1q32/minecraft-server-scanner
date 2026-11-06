@@ -722,14 +722,16 @@ def _record_server_result_locked(con, result, source, now):
             times_seen = int(times_seen or 0) + 1
         except Exception:
             times_seen = 1
-        # A plain status ping never changes an existing cracked
-        # verdict (including the unset/NULL state).  Only the explicit
-        # cracked checker, a whitelist probe, or a transient reconnect
-        # kick (which unsets it) may do that.
+        # Authoritative verdicts (the explicit cracked checker / whitelist
+        # probe) are never overwritten by a plain status ping.  A verdict
+        # that came from an earlier status sample is only a hint, so let the
+        # newest sample refresh or clear it instead of keeping it forever.
         keep_cracked = old_cracked
-        if (db_format.source_is_cracked_verdict(old_source)
-                and not db_format.source_is_cracked_verdict(source)):
-            source = old_source
+        if db_format.source_is_cracked_verdict(old_source):
+            if not db_format.source_is_cracked_verdict(source):
+                source = old_source
+        else:
+            keep_cracked = cracked
         now_json = (_encode_player_list(sample_names) if has_sample
                     else old_now)
         ever_json = _encode_player_list(
@@ -4423,21 +4425,29 @@ def ping_server(entry, proxy=None, persist=True):
                 if pname:
                     players_sample.append((pid, pname))
 
-            # cracked detection: if any reported player id matches the
-            # offline-mode UUID for that name.  offline_uuid_nodash() caches
-            # by name because players repeat across servers.
+            # Cracked hint from the status sample.  Require ALL sampled
+            # players to have offline-mode UUIDs: online-mode servers behind
+            # a proxy can list a single legacy/offline UUID among Mojang
+            # UUIDs, which used to mark the whole server as cracked.  This
+            # stays a hint; the login probe is the authoritative check.
             cracked = None
-            for pid, pname in players_sample:
-                if not pname:
-                    continue
-                try:
-                    off_uuid = offline_uuid_nodash(pname)
-                    reported = pid.replace('-', '').lower()
-                    if reported == off_uuid:
-                        cracked = True
+            if players_sample:
+                all_offline = True
+                for pid, pname in players_sample:
+                    if not pname or not pid:
+                        all_offline = False
                         break
-                except Exception:
-                    continue
+                    try:
+                        off_uuid = offline_uuid_nodash(pname)
+                        reported = pid.replace('-', '').lower()
+                        if reported != off_uuid:
+                            all_offline = False
+                            break
+                    except Exception:
+                        all_offline = False
+                        break
+                if all_offline:
+                    cracked = True
 
             version_obj = response.get('version') or {}
             if not isinstance(version_obj, dict):
@@ -4760,8 +4770,8 @@ def get_server_status_full(host, port=25565, proxy=None):
         samples = players.get("sample") or []
         if not isinstance(samples, list):
             samples = []
-        any_sample = False
-        any_offline_match = False
+        sample_count = 0
+        offline_matches = 0
         for player in samples:
             if len(sample_names) >= MAX_SAMPLE_NAMES:
                 break
@@ -4771,15 +4781,16 @@ def get_server_status_full(host, port=25565, proxy=None):
             pid = str(player.get("id") or "")[:64]
             if not name or not pid:
                 continue
-            any_sample = True
+            sample_count += 1
             sample_names.append(name)
             offline_id = offline_uuid_nodash(name)
             reported = pid.replace("-", "").lower()
             if offline_id == reported:
-                any_offline_match = True
+                offline_matches += 1
 
-        if any_sample:
-            sample_hint = True if any_offline_match else False
+        if sample_count:
+            # Only an all-offline sample is a meaningful offline-mode hint.
+            sample_hint = offline_matches == sample_count
         else:
             sample_hint = None
 
@@ -8266,14 +8277,9 @@ def verify_monitor_cracked_result(result):
         result["cracked_last_check"] = checked_at
         return result
 
-    if result.get("cracked"):
-        fallback_message = message or "CRACKED by players.sample UUID during status ping"
-        result["cracked"] = True
-        result["cracked_message"] = fallback_message
-        result["cracked_last_check"] = checked_at
-        if not cached_before_probe:
-            record_cracked_server(ip, fallback_message, extra=result)
-        return result
+    # A status-sample hint is not authoritative: mixed samples are normal on
+    # online-mode servers behind proxies, so an inconclusive login probe
+    # leaves the verdict unchanged instead of promoting the hint to cracked.
 
     cached = cached_before_probe
     if cached:
