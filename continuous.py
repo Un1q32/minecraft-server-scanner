@@ -804,13 +804,10 @@ def _sync_now(url, token):
     if not url or not token:
         return False
     try:
-        # A continuous node only needs to publish its findings.  Pulling the
-        # shared per-sighting/player history or other people's notes back
-        # would add a large download to every sync for no benefit here.
-        # Both cursors are left untouched, so a later full --sync can fetch
-        # everything that was skipped.
-        summary = scanner.netdb_sync_once(
-            url, token, history_download=False, notes_download=False)
+        # Continuous nodes need the shared sighting history too: last_seen
+        # is derived from it, and without it rescan tiers think servers are
+        # overdue when another node has already refreshed them.
+        summary = scanner.netdb_sync_once(url, token)
     except Exception as exc:
         print(f"  sync failed: {exc}")
         return False
@@ -819,6 +816,7 @@ def _sync_now(url, token):
           f"inserted={summary.get('inserted', 0)} "
           f"updated={summary.get('updated', 0)} "
           f"history_uploaded={summary.get('history_uploaded', 0)} "
+          f"history_downloaded={summary.get('history_downloaded', 0)} "
           f"player_events_uploaded={summary.get('player_events_uploaded', 0)}")
     return True
 

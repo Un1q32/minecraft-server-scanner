@@ -354,10 +354,9 @@ hits — and is rewritten in place as results arrive, with the elapsed clock
 refreshed at least once a second even between hits (when output is piped it
 prints a plain summary line every 15 seconds instead). The shared DB is
 synced every `--sync-every` seconds (default 300) and once more on exit, so
-peers see new finds promptly. Continuous nodes publish their sighting,
-player history and notes, but do not download the shared activity history
-or other people's notes; run a normal `--sync` later if you want the full
-activity history and notes on that machine.
+peers see new finds promptly. Continuous nodes both publish and download
+sighting/player history and notes, so last-seen dates and rescan tiers stay
+current across all nodes.
 Each rescan round has one shared `--scan-duration` budget even when the due
 servers use many different ports, so a 40-port rescan cannot turn into
 40 separate full-length sweeps. Normal rounds obey the same deadline:
