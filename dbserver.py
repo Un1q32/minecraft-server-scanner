@@ -1819,10 +1819,12 @@ def main(argv=None):
                          "directory is used when this file is absent.")
     ap.add_argument("--tls-cert", default="", help="PEM chain for https://")
     ap.add_argument("--tls-key", default="", help="PEM private key for https://")
-    ap.add_argument("--web-db-zst", default="", metavar="PATH",
+    ap.add_argument("--web-db-zst", default=None, metavar="PATH",
                     help="write a consistent zstd snapshot here after DB "
                          "writes, for the static web viewer "
-                         "(e.g. /srv/mc-scanner/servers.db.zst)")
+                         "(default: <db>.zst; use --no-web-db-zst to disable)")
+    ap.add_argument("--no-web-db-zst", action="store_true",
+                    help="do not maintain the default <db>.zst snapshot")
     ap.add_argument("--web-db-zst-level", type=int, default=1, metavar="N",
                     help="zstd level for --web-db-zst (default: 1)")
     ap.add_argument("--dedupe", action="store_true",
@@ -1838,6 +1840,15 @@ def main(argv=None):
     except Exception:
         pass
     init_db(args.db)
+    web_db_zst = args.web_db_zst
+    if args.no_web_db_zst:
+        web_db_zst = ""
+    elif web_db_zst is None:
+        web_db_zst = os.path.abspath(args.db) + ".zst"
+    elif not str(web_db_zst).strip():
+        web_db_zst = ""
+    else:
+        web_db_zst = os.path.abspath(web_db_zst)
     if args.dedupe:
         stats = dedupe_database(args.db)
         print(f"dedupe complete: {stats['groups']} groups, "
@@ -1868,12 +1879,11 @@ def main(argv=None):
     server.shared_token = token
     server.daemon_threads = True
     server.zstd_writer = None
-    server.web_db_zst = (os.path.abspath(args.web_db_zst)
-                         if args.web_db_zst else "")
+    server.web_db_zst = web_db_zst
     writer = None
-    if args.web_db_zst:
+    if web_db_zst:
         writer = ZstdSnapshotWriter(
-            server.db_path, args.web_db_zst,
+            server.db_path, web_db_zst,
             level=args.web_db_zst_level)
         server.zstd_writer = writer
     scheme = "http"
@@ -1897,7 +1907,7 @@ def main(argv=None):
     print(f"Serving netdb on {scheme}://{args.host}:{args.port} "
           f"(db={server.db_path}, notes={server.notes_db_path})")
     if writer is not None:
-        print(f"Web DB snapshot: {os.path.abspath(args.web_db_zst)} "
+        print(f"Web DB snapshot: {web_db_zst} "
               f"(zstd level {args.web_db_zst_level})")
         writer.start()
     deduper = None

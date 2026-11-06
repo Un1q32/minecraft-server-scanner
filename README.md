@@ -588,12 +588,14 @@ The viewer first tries `servers.db.zst` and falls back to `servers.db` plus
 `servers.db-wal`. A compressed snapshot avoids serving the live WAL and
 typically transfers about a third as many bytes.
 
-`dbserver.py` can maintain that file automatically. Writes only signal a
-background worker; it coalesces bursts (continuous scanners write constantly)
-and rewrites the snapshot after a short quiet period:
+`dbserver.py` maintains that file automatically by default: it writes
+`<db>.zst` next to the database. Writes only signal a background worker; it
+coalesces bursts (continuous scanners write constantly) and rewrites the
+snapshot after a short quiet period. Point it at the directory the web server
+serves with `--web-db-zst PATH`, or disable it with `--no-web-db-zst`:
 
     python3 dbserver.py ... \
-        --web-db-zst /srv/mc-scanner/servers.db.zst \
+        --web-db-zst /srv/www/mc-scanner/servers.db.zst \
         --web-db-zst-level 1
 
 If the database is maintained elsewhere, use `webui/compress_db.py` instead;
