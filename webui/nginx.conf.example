@@ -71,6 +71,17 @@ server {
         add_header X-Content-Type-Options nosniff always;
     }
 
+    # Optional uncompressed consistent snapshot. The viewer tries this
+    # before the live DB when the .zst snapshot is unavailable or cannot be
+    # decoded. Create it with: VACUUM INTO '.../servers.db.snapshot'.
+    location = /servers.db.snapshot {
+        alias /home/uniq/devel/minecraft-server-scanner/servers.db.snapshot;
+        default_type application/octet-stream;
+        gzip off;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+    }
+
     # SQLite's WAL sidecar. A 404 is normal when the WAL has been
     # checkpointed or the database is idle; the viewer handles it.
     location = /servers.db-wal {
