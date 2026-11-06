@@ -736,9 +736,13 @@ folded into the roster blob on the matching sighting.
 ## Minecraft mod (`minecraft-mod`)
 
 A Fabric client mod adds a **Server DB** button to the multiplayer screen and
-browses the downloaded `servers.db` in-game. The browser footer also has
-**Rescan**, **Recheck Whitelist**, and **Sync DB** buttons. The Python
-scanner sources are bundled inside the mod jar and extracted to
+browses the downloaded `servers.db` in-game. It downloads the compact
+`servers.db.zst` snapshot (the same consistent `VACUUM INTO` snapshot the web
+viewer uses), decompresses it locally, and validates the schema and SQLite
+integrity before replacing the cached copy. Hosts without a snapshot fall
+back to the plain `servers.db`. The browser footer also has **Rescan**,
+**Recheck Whitelist**, and **Sync DB** buttons. The Python scanner sources
+are bundled inside the mod jar and extracted to
 `<game>/mcdbbrowser/scanner/` on first use; only a Python 3 interpreter is
 required on the machine.
 

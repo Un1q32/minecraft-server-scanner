@@ -22,6 +22,10 @@ dependencies {
 	implementation "org.xerial:sqlite-jdbc:${project.sqlite_jdbc_version}"
 	include "org.xerial:sqlite-jdbc:${project.sqlite_jdbc_version}"
 
+	// Zstandard decompression for the compact shared-DB snapshot (jar-in-jar)
+	implementation "com.github.luben:zstd-jni:${project.zstd_jni_version}"
+	include "com.github.luben:zstd-jni:${project.zstd_jni_version}"
+
 	compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
 	compileOnly("meteordevelopment:meteor-client:${project.meteor_version}") {
 		transitive = false

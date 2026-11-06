@@ -1,5 +1,6 @@
 package com.mcdbbrowser;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -33,6 +34,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
+import com.github.luben.zstd.ZstdInputStream;
 import net.fabricmc.loader.api.FabricLoader;
 import org.jspecify.annotations.Nullable;
 import org.sqlite.SQLiteConfig;
@@ -40,7 +42,8 @@ import org.sqlite.SQLiteDataSource;
 import org.sqlite.SQLiteOpenMode;
 
 public final class ServerDatabase {
-	public static final String DB_URL = "https://mcdb.uniq.gay/servers.db";
+	public static final String DB_URL = "https://mcdb.uniq.gay/servers.db.zst";
+	private static final String PLAIN_DB_URL = "https://mcdb.uniq.gay/servers.db";
 	private static final Path CACHE_DIR = FabricLoader.getInstance().getGameDir().resolve("mcdbbrowser");
 	private static final Path DB_FILE = CACHE_DIR.resolve("servers.db");
 	private static final long MAX_DOWNLOAD_BYTES = 512L * 1024 * 1024;
@@ -153,12 +156,47 @@ public final class ServerDatabase {
 		}
 	}
 
+	/**
+	 * Downloads the compact zstd snapshot. The live servers.db is written in
+	 * place and can be captured mid-write, which surfaced as "corrupt" after
+	 * Redownload; the snapshot is produced with VACUUM INTO and an atomic
+	 * rename, so it is always a consistent database. A plain download is only
+	 * used when the host does not publish a snapshot.
+	 */
 	private static void download(DownloadProgress progress) throws IOException, InterruptedException {
-		HttpRequest request = HttpRequest.newBuilder(URI.create(DB_URL)).header("User-Agent", "mcdb-browser-fabric/1.0").build();
+		IOException failure = null;
+		for (int attempt = 0; attempt < 2; attempt++) {
+			try {
+				downloadSnapshot(URI.create(DB_URL), true, progress);
+				return;
+			} catch (MissingSnapshotException e) {
+				downloadSnapshot(URI.create(PLAIN_DB_URL), false, progress);
+				return;
+			} catch (IOException e) {
+				failure = e;
+				if (attempt == 0) {
+					try {
+						Thread.sleep(750L);
+					} catch (InterruptedException interrupted) {
+						Thread.currentThread().interrupt();
+						throw interrupted;
+					}
+				}
+			}
+		}
+		throw failure != null ? failure : new IOException("Download failed");
+	}
+
+	private static void downloadSnapshot(URI uri, boolean compressed, DownloadProgress progress)
+			throws IOException, InterruptedException {
+		HttpRequest request = HttpRequest.newBuilder(uri).header("User-Agent", "mcdb-browser-fabric/1.0").build();
 		HttpResponse<InputStream> response = HTTP.send(request, HttpResponse.BodyHandlers.ofInputStream());
 		if (response.statusCode() != 200) {
 			response.body().close();
-			throw new IOException("HTTP " + response.statusCode() + " from " + DB_URL);
+			if (compressed && response.statusCode() == 404) {
+				throw new MissingSnapshotException();
+			}
+			throw new IOException("HTTP " + response.statusCode() + " from " + uri);
 		}
 
 		long totalBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
@@ -168,37 +206,56 @@ public final class ServerDatabase {
 		}
 		Files.createDirectories(CACHE_DIR);
 		Path partial = Files.createTempFile(CACHE_DIR, "servers-", ".part");
-		try (InputStream in = response.body(); OutputStream out = Files.newOutputStream(partial)) {
-			byte[] buffer = new byte[64 * 1024];
-			long downloadedBytes = 0;
-			int read;
-			while ((read = in.read(buffer)) != -1) {
-				out.write(buffer, 0, read);
-				downloadedBytes += read;
-				if (downloadedBytes > MAX_DOWNLOAD_BYTES) {
-					throw new IOException("Server list is larger than " + MAX_DOWNLOAD_BYTES + " bytes");
+		try {
+			try (InputStream body = response.body();
+				 CountingInputStream network = new CountingInputStream(body);
+				 InputStream in = compressed ? new ZstdInputStream(network) : network;
+				 OutputStream out = Files.newOutputStream(partial)) {
+				byte[] buffer = new byte[64 * 1024];
+				long written = 0;
+				int read;
+				while ((read = in.read(buffer)) != -1) {
+					out.write(buffer, 0, read);
+					written += read;
+					if (written > MAX_DOWNLOAD_BYTES) {
+						throw new IOException("Server list is larger than " + MAX_DOWNLOAD_BYTES + " bytes");
+					}
+					progress.update(network.count(), totalBytes);
 				}
-				progress.update(downloadedBytes, totalBytes);
 			}
-		} catch (IOException e) {
-			Files.deleteIfExists(partial);
-			throw e;
-		}
 
-		close();
-		Files.move(partial, DB_FILE, StandardCopyOption.REPLACE_EXISTING);
+			// Never replace a working cache with a torn or truncated download.
+			try (Connection check = openReadOnly(partial)) {
+				validateSchema(check);
+				try (Statement statement = check.createStatement();
+					 ResultSet rs = statement.executeQuery("PRAGMA quick_check")) {
+					while (rs.next()) {
+						String result = rs.getString(1);
+						if (!"ok".equalsIgnoreCase(result)) {
+							throw new SQLException("Server list integrity check failed: " + result);
+						}
+					}
+				}
+			} catch (SQLException e) {
+				throw new IOException("Downloaded server list is corrupt: " + describe(e), e);
+			}
+
+			close();
+			Files.move(partial, DB_FILE, StandardCopyOption.REPLACE_EXISTING);
+			partial = null;
+		} finally {
+			if (partial != null) {
+				Files.deleteIfExists(partial);
+			}
+		}
+	}
+
+	private static String describe(SQLException e) {
+		return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
 	}
 
 	private static void open() throws SQLException {
-		SQLiteConfig config = new SQLiteConfig();
-		config.setReadOnly(true);
-		config.enableLoadExtension(false);
-		config.setOpenMode(SQLiteOpenMode.OPEN_URI);
-		SQLiteDataSource dataSource = new SQLiteDataSource(config);
-		// immutable=1 stops SQLite from reading or creating -wal/-shm side files, so only the downloaded bytes are ever used
-		dataSource.setUrl("jdbc:sqlite:" + DB_FILE.toAbsolutePath().toUri() + "?immutable=1");
-
-		Connection opened = dataSource.getConnection();
+		Connection opened = openReadOnly(DB_FILE);
 		try {
 			validateSchema(opened);
 		} catch (SQLException e) {
@@ -212,6 +269,17 @@ public final class ServerDatabase {
 		} catch (IOException e) {
 			downloadedAtMillis = 0;
 		}
+	}
+
+	private static Connection openReadOnly(Path file) throws SQLException {
+		SQLiteConfig config = new SQLiteConfig();
+		config.setReadOnly(true);
+		config.enableLoadExtension(false);
+		config.setOpenMode(SQLiteOpenMode.OPEN_URI);
+		SQLiteDataSource dataSource = new SQLiteDataSource(config);
+		// immutable=1 stops SQLite from reading or creating -wal/-shm side files, so only the downloaded bytes are ever used
+		dataSource.setUrl("jdbc:sqlite:" + file.toAbsolutePath().toUri() + "?immutable=1");
+		return dataSource.getConnection();
 	}
 
 	/**
@@ -729,6 +797,46 @@ public final class ServerDatabase {
 	@FunctionalInterface
 	public interface DownloadProgress {
 		void update(long downloadedBytes, long totalBytes);
+	}
+
+	private static final class CountingInputStream extends FilterInputStream {
+		private long count;
+
+		CountingInputStream(InputStream in) {
+			super(in);
+		}
+
+		long count() {
+			return this.count;
+		}
+
+		@Override
+		public int read() throws IOException {
+			int value = super.read();
+			if (value != -1) {
+				this.count++;
+			}
+			return value;
+		}
+
+		@Override
+		public int read(byte[] bytes, int offset, int length) throws IOException {
+			int read = super.read(bytes, offset, length);
+			if (read > 0) {
+				this.count += read;
+			}
+			return read;
+		}
+
+		@Override
+		public long skip(long amount) throws IOException {
+			long skipped = super.skip(amount);
+			this.count += skipped;
+			return skipped;
+		}
+	}
+
+	private static final class MissingSnapshotException extends IOException {
 	}
 
 	public interface Labeled {
