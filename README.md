@@ -584,20 +584,9 @@ query and sort. It never starts a scan or a sync.
 
 ### Compressed database snapshots
 
-The viewer first tries `servers.db.zst`, then an optional uncompressed
-`servers.db.snapshot`, then `servers.db` on its own, and only then the live
-`servers.db` + `servers.db-wal` pair. The DB-only step avoids the common race
-where a slow client downloads the main file and the WAL at different points
-and SQLite reports the result as malformed. A compressed snapshot avoids
-serving the live WAL and typically transfers about a third as many bytes.
-
-An uncompressed consistent snapshot can be created with:
-
-    sqlite3 servers.db "VACUUM INTO '/srv/mc-scanner/servers.db.snapshot'"
-
-Serve it with the `location = /servers.db.snapshot` block in
-`webui/nginx.conf.example`. The page must be served over `http://` or
-`https://`; Firefox blocks fetching the database from a `file://` URL.
+The viewer first tries `servers.db.zst` and falls back to `servers.db` plus
+`servers.db-wal`. A compressed snapshot avoids serving the live WAL and
+typically transfers about a third as many bytes.
 
 `dbserver.py` can maintain that file automatically. Writes only signal a
 background worker; it coalesces bursts (continuous scanners write constantly)

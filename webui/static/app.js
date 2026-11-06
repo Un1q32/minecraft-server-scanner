@@ -1187,95 +1187,55 @@ async function decompressZstd(bytes) {
   throw new Error("no zstd decompressor available");
 }
 
-function isFileProtocol() {
+async function loadDatabase() {
+  let compressed = false;
   try {
-    return new URL("servers.db", document.baseURI).protocol === "file:";
-  } catch (error) {
-    return window.location.protocol === "file:";
-  }
-}
-
-function nativeZstdSupported() {
-  if (typeof DecompressionStream !== "function") {
-    return false;
-  }
-  try {
-    new DecompressionStream("zstd");
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
-function clearDatabaseFiles() {
-  if (mc) {
-    try {
-      mc.close();
-    } catch (error) {
-      // Already closed.
-    }
-  }
-  for (const name of ["/servers.db", "/servers.db-wal", "/servers.db-shm"]) {
-    try {
-      core.FS.unlink(name);
-    } catch (error) {
-      // Not present.
-    }
-  }
-}
-
-function databaseHeaderOk() {
-  try {
-    const stream = core.FS.open("/servers.db", "r");
-    try {
-      const head = new Uint8Array(16);
-      const read = core.FS.read(stream, head, 0, 16, 0);
-      return read === 16 && new TextDecoder().decode(head) === "SQLite format 3\0";
-    } finally {
-      core.FS.close(stream);
+    setStatus("Loading compressed database…");
+    const zst = await fetch(assetUrl(`servers.db.zst?ts=${Date.now()}`),
+                            { cache: "no-store" });
+    if (zst.ok && typeof fzstd !== "undefined" && fzstd.decompress) {
+      const packed = new Uint8Array(await zst.arrayBuffer());
+      const bytes = await decompressZstd(packed);
+      core.FS.writeFile("/servers.db", bytes);
+      try {
+        core.FS.unlink("/servers.db-wal");
+      } catch (error) {
+        // No stale WAL to remove.
+      }
+      compressed = true;
     }
   } catch (error) {
-    return false;
+    // A corrupt/missing .zst must not break the viewer; use the raw files.
+    if (typeof console !== "undefined") {
+      console.warn("compressed database unavailable:", error);
+    }
   }
-}
-
-async function streamResponseToFile(response, path) {
-  const reader = response.body && response.body.getReader
-    ? response.body.getReader()
-    : null;
-  if (!reader) {
+  if (!compressed) {
+    setStatus("Loading database…");
+    const response = await fetch(assetUrl(`servers.db?ts=${Date.now()}`),
+                                 { cache: "no-store" });
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).trim();
+      throw new Error(`HTTP ${response.status} loading servers.db${detail ? `: ${detail}` : ""}`);
+    }
     const bytes = new Uint8Array(await response.arrayBuffer());
-    core.FS.writeFile(path, bytes);
-    return bytes.length;
-  }
-  let total = 0;
-  const stream = core.FS.open(path, "w");
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      if (value && value.length) {
-        core.FS.write(stream, value, 0, value.length);
-        total += value.length;
+    core.FS.writeFile("/servers.db", bytes);
+
+    // WAL mode keeps recent commits in servers.db-wal until a checkpoint.
+    // Serve that existing file too; it is not a snapshot, just the live sidecar.
+    const wal = await fetch(assetUrl(`servers.db-wal?ts=${Date.now()}`),
+                            { cache: "no-store" });
+    if (wal.ok) {
+      core.FS.writeFile("/servers.db-wal", new Uint8Array(await wal.arrayBuffer()));
+    } else {
+      try {
+        core.FS.unlink("/servers.db-wal");
+      } catch (error) {
+        // No stale WAL to remove.
       }
     }
-  } finally {
-    core.FS.close(stream);
   }
-  const expected = Number(response.headers.get("content-length") || 0);
-  const encoding = (response.headers.get("content-encoding") || "").toLowerCase();
-  if (expected > 0 && !encoding && total !== expected) {
-    throw new Error(`truncated download (${total} of ${expected} bytes)`);
-  }
-  return total;
-}
 
-async function openDatabase() {
-  if (!databaseHeaderOk()) {
-    throw new Error("downloaded file is not a SQLite database");
-  }
   if (mc.open("/servers.db") !== 0) {
     throw new Error(mc.error() || "could not open database");
   }
@@ -1285,120 +1245,6 @@ async function openDatabase() {
   }
   rowCount = count;
   totalCount = mc.total();
-}
-
-async function tryDatabase(label, loader) {
-  clearDatabaseFiles();
-  try {
-    await loader();
-    await openDatabase();
-    return true;
-  } catch (error) {
-    clearDatabaseFiles();
-    throw new Error(`${label}: ${String(error)}`);
-  }
-}
-
-async function loadCompressedDatabase() {
-  const response = await fetch(assetUrl(`servers.db.zst?ts=${Date.now()}`),
-                               { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  const encoding = (response.headers.get("content-encoding") || "").toLowerCase();
-  if (encoding.includes("zstd")) {
-    // A proxy already decoded it for us.
-    await streamResponseToFile(response, "/servers.db");
-    return;
-  }
-  if (nativeZstdSupported() && response.body) {
-    const decompressed = response.body.pipeThrough(
-      new DecompressionStream("zstd"));
-    await streamResponseToFile(new Response(decompressed), "/servers.db");
-    return;
-  }
-  if (typeof fzstd === "undefined" || !fzstd.decompress) {
-    throw new Error("no zstd decompressor available");
-  }
-  const packed = new Uint8Array(await response.arrayBuffer());
-  const bytes = await decompressZstd(packed);
-  core.FS.writeFile("/servers.db", bytes);
-}
-
-async function loadSnapshotDatabase() {
-  const response = await fetch(assetUrl(`servers.db.snapshot?ts=${Date.now()}`),
-                               { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  await streamResponseToFile(response, "/servers.db");
-}
-
-async function loadLiveDatabase(withWal) {
-  const response = await fetch(assetUrl(`servers.db?ts=${Date.now()}`),
-                               { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  await streamResponseToFile(response, "/servers.db");
-  if (withWal) {
-    // WAL mode keeps recent commits in servers.db-wal until a checkpoint.
-    // A WAL fetched from a live database can race the DB download, which is
-    // why it is only the last resort after the DB without WAL was tried.
-    const wal = await fetch(assetUrl(`servers.db-wal?ts=${Date.now()}`),
-                            { cache: "no-store" });
-    if (wal.ok) {
-      await streamResponseToFile(wal, "/servers.db-wal");
-    }
-  }
-}
-
-async function loadDatabase() {
-  const errors = [];
-  setStatus("Loading compressed database…");
-  try {
-    await tryDatabase("compressed snapshot", loadCompressedDatabase);
-    return;
-  } catch (error) {
-    errors.push(String(error));
-    if (typeof console !== "undefined") {
-      console.warn("compressed database unavailable:", error);
-    }
-  }
-
-  setStatus("Loading consistent snapshot…");
-  try {
-    await tryDatabase("uncompressed snapshot", loadSnapshotDatabase);
-    return;
-  } catch (error) {
-    errors.push(String(error));
-  }
-
-  setStatus("Loading database…");
-  try {
-    // Prefer the main DB without the live WAL: a slow client is more likely
-    // to race a checkpoint while fetching both files, and a mismatched WAL
-    // makes SQLite report the database as malformed.
-    await tryDatabase("live database (no WAL)", () => loadLiveDatabase(false));
-    return;
-  } catch (error) {
-    errors.push(String(error));
-  }
-
-  setStatus("Retrying database with WAL…");
-  try {
-    await tryDatabase("live database + WAL", () => loadLiveDatabase(true));
-    return;
-  } catch (error) {
-    errors.push(String(error));
-  }
-
-  throw new Error(
-    "Could not load a consistent database.\n\n" +
-    errors.join("\n") +
-    "\n\nServe a consistent servers.db.zst snapshot (recommended), or " +
-    "open this page over http:// instead of file://.",
-  );
 }
 
 async function refreshDatabase() {
@@ -1441,25 +1287,15 @@ document.addEventListener("keydown", (event) => {
 
 async function boot() {
   try {
-    if (isFileProtocol()) {
-      const message = "This page was opened from a file:// URL. Firefox " +
-        "blocks fetching servers.db from local files.\n\n" +
-        "Serve webui/static over HTTP, for example:\n" +
-        "  cd webui/static\n  python3 -m http.server 8000\n\n" +
-        "Then open http://localhost:8000/";
-      setStatus("Open this page over http://, not file://");
-      detailEl.textContent = message;
-      return;
-    }
     setStatus("Starting WebAssembly…");
     if (typeof createCore !== "function") {
       // The script tag failed or was blocked; try once more explicitly.
-      await loadScript("core.js?v=11-retry");
+      await loadScript("core.js?v=10-retry");
     }
     if (typeof createCore !== "function") {
       let detail = "";
       try {
-        const probe = await fetch(assetUrl("core.js?v=11-probe"), { cache: "no-store" });
+        const probe = await fetch(assetUrl("core.js?v=10-probe"), { cache: "no-store" });
         const body = await probe.text();
         detail = ` — ${probe.status}, ${probe.headers.get("content-type") || "no content-type"}, ${body.length} bytes`;
       } catch (probeError) {
@@ -1471,7 +1307,7 @@ async function boot() {
       );
     }
     core = await createCore({
-      locateFile: (file) => assetUrl(file) + "?v=11",
+      locateFile: (file) => assetUrl(file) + "?v=10",
       print: () => {},
       printErr: () => {},
     });
