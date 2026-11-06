@@ -20,7 +20,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
@@ -85,6 +87,9 @@ public final class ServerDatabase {
 		.connectTimeout(Duration.ofSeconds(15))
 		.build();
 	private static final AtomicLong latestQueryId = new AtomicLong();
+	/** A host with this many identical ports is almost certainly one server behind a port spray. */
+	private static final int DEDUP_MIN_PORTS = 5;
+	private static final int DEDUP_PORT_PREVIEW = 10;
 
 	private static @Nullable Connection connection;
 	private static volatile long downloadedAtMillis;
@@ -374,11 +379,110 @@ public final class ServerDatabase {
 				}
 			}
 		}
+		rows = deduplicatePorts(rows);
 		// SQLite is already native, but letting it compute derived columns and
 		// then sorting Java records keeps sort changes entirely in memory.
 		rows.sort(comparator(sortKeys));
 
 		return new QueryResult(rows);
+	}
+
+	/**
+	 * Collapse a host that answers identically on many ports into one row.
+	 *
+	 * These are usually a firewall/NAT forwarding a whole port range to one
+	 * Minecraft server (the real port is normally 25565). Small groups are
+	 * left alone so genuinely separate instances on one machine survive, and
+	 * only rows with the same MOTD/version/protocol are grouped.
+	 */
+	private static List<ServerRecord> deduplicatePorts(List<ServerRecord> rows) {
+		Map<String, List<ServerRecord>> byHost = new LinkedHashMap<>();
+		for (ServerRecord row : rows) {
+			byHost.computeIfAbsent(hostOf(row.address()), key -> new ArrayList<>()).add(row);
+		}
+
+		List<ServerRecord> out = new ArrayList<>(rows.size());
+		for (List<ServerRecord> hostRows : byHost.values()) {
+			if (hostRows.size() < DEDUP_MIN_PORTS) {
+				out.addAll(hostRows);
+				continue;
+			}
+			Map<String, List<ServerRecord>> bySignature = new LinkedHashMap<>();
+			for (ServerRecord row : hostRows) {
+				bySignature.computeIfAbsent(portSignature(row), key -> new ArrayList<>()).add(row);
+			}
+			for (List<ServerRecord> group : bySignature.values()) {
+				if (group.size() < DEDUP_MIN_PORTS) {
+					out.addAll(group);
+					continue;
+				}
+				ServerRecord primary = representative(group);
+				List<Integer> ports = new ArrayList<>(group.size());
+				for (ServerRecord row : group) {
+					ports.add(portNumber(row.address()));
+				}
+				ports.sort(Integer::compareTo);
+				List<String> shown = new ArrayList<>(Math.min(DEDUP_PORT_PREVIEW, ports.size()));
+				for (int i = 0; i < ports.size() && i < DEDUP_PORT_PREVIEW; i++) {
+					shown.add(Integer.toString(ports.get(i)));
+				}
+				String summary = String.join(", ", shown);
+				if (ports.size() > DEDUP_PORT_PREVIEW) {
+					summary += " (+" + (ports.size() - DEDUP_PORT_PREVIEW) + " more)";
+				}
+				out.add(primary.withPortGroup(group.size(), summary));
+			}
+		}
+		return out;
+	}
+
+	private static String hostOf(String address) {
+		int colon = address.lastIndexOf(':');
+		return colon <= 0 ? address : address.substring(0, colon);
+	}
+
+	private static int portNumber(String address) {
+		int colon = address.lastIndexOf(':');
+		if (colon < 0 || colon + 1 >= address.length()) {
+			return 0;
+		}
+		try {
+			return Integer.parseInt(address.substring(colon + 1));
+		} catch (NumberFormatException e) {
+			return 0;
+		}
+	}
+
+	private static String portSignature(ServerRecord row) {
+		return row.motd().strip().toLowerCase(Locale.ROOT) + '\u0000'
+			+ row.version().strip().toLowerCase(Locale.ROOT) + '\u0000'
+			+ row.protocol();
+	}
+
+	private static ServerRecord representative(List<ServerRecord> group) {
+		ServerRecord best = group.get(0);
+		for (int i = 1; i < group.size(); i++) {
+			ServerRecord candidate = group.get(i);
+			if (preferred(candidate, best)) {
+				best = candidate;
+			}
+		}
+		return best;
+	}
+
+	private static boolean preferred(ServerRecord candidate, ServerRecord current) {
+		boolean candidateCanonical = portNumber(candidate.address()) == 25565;
+		boolean currentCanonical = portNumber(current.address()) == 25565;
+		if (candidateCanonical != currentCanonical) {
+			return candidateCanonical;
+		}
+		if (candidate.timesSeen() != current.timesSeen()) {
+			return candidate.timesSeen() > current.timesSeen();
+		}
+		if (candidate.playersOnline() != current.playersOnline()) {
+			return candidate.playersOnline() > current.playersOnline();
+		}
+		return portNumber(candidate.address()) < portNumber(current.address());
 	}
 
 	private static void bind(PreparedStatement statement, List<Object> values) throws SQLException {

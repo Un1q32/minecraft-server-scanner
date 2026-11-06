@@ -21,7 +21,9 @@ public record ServerRecord(
 	double lastSeenEpochSeconds,
 	int timesSeen,
 	String playersNowJson,
-	String playersEverJson
+	String playersEverJson,
+	String portSummary,
+	int portCount
 ) {
 	static ServerRecord fromRow(ResultSet rs) throws SQLException {
 		return new ServerRecord(
@@ -37,7 +39,9 @@ public record ServerRecord(
 			rs.getDouble("last_seen"),
 			rs.getInt("times_seen"),
 			nullToEmpty(rs.getString("players_now")),
-			nullToEmpty(rs.getString("players_ever"))
+			nullToEmpty(rs.getString("players_ever")),
+			"",
+			1
 		);
 	}
 
@@ -49,7 +53,14 @@ public record ServerRecord(
 		return new ServerRecord(this.address, this.motd, this.playersOnline, this.maxPlayers,
 			this.version, this.protocol, this.cracked, newWhitelist == null ? "" : newWhitelist,
 			this.firstSeenEpochSeconds, this.lastSeenEpochSeconds, this.timesSeen,
-			this.playersNowJson, this.playersEverJson);
+			this.playersNowJson, this.playersEverJson, this.portSummary, this.portCount);
+	}
+
+	ServerRecord withPortGroup(int count, String summary) {
+		return new ServerRecord(this.address, this.motd, this.playersOnline, this.maxPlayers,
+			this.version, this.protocol, this.cracked, this.whitelist,
+			this.firstSeenEpochSeconds, this.lastSeenEpochSeconds, this.timesSeen,
+			this.playersNowJson, this.playersEverJson, summary == null ? "" : summary, count);
 	}
 
 	public WhitelistState whitelistState() {

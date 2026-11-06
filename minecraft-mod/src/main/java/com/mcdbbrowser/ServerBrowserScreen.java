@@ -868,7 +868,11 @@ public class ServerBrowserScreen extends DropdownScreen {
 				String lastSeen = "seen " + timeAgo(this.server.lastSeenEpochSeconds());
 
 				graphics.text(font, this.playerCount, playerCountX, top + 1, this.server.playersOnline() > 0 ? GREEN : GRAY);
-				graphics.text(font, font.plainSubstrByWidth(this.server.address(), playerCountX - left - 8), left, top + 1, WHITE);
+				String addressText = this.server.address();
+				if (this.server.portCount() > 1) {
+					addressText += "  (+" + (this.server.portCount() - 1) + " ports)";
+				}
+				graphics.text(font, font.plainSubstrByWidth(addressText, playerCountX - left - 8), left, top + 1, WHITE);
 				graphics.text(font, this.motdLine(font, width), left, top + 12, GRAY);
 				graphics.text(font, this.details, left, top + 23, WHITE);
 				graphics.text(font, lastSeen, right - font.width(lastSeen), top + 23, DARK_GRAY);
@@ -943,6 +947,14 @@ public class ServerBrowserScreen extends DropdownScreen {
 					}
 					this.detailsTooltip.add(Component.literal("First seen " + timeAgo(this.server.firstSeenEpochSeconds())).withStyle(ChatFormatting.GRAY));
 					this.detailsTooltip.add(Component.literal("Seen " + this.server.timesSeen() + " times").withStyle(ChatFormatting.GRAY));
+					if (this.server.portCount() > 1) {
+						this.detailsTooltip.add(Component.literal("Grouped " + this.server.portCount()
+							+ " ports from this host").withStyle(ChatFormatting.GRAY));
+						if (!this.server.portSummary().isEmpty()) {
+							this.detailsTooltip.add(Component.literal("Ports: " + this.server.portSummary())
+								.withStyle(ChatFormatting.DARK_GRAY));
+						}
+					}
 				}
 				return this.detailsTooltip;
 			}
