@@ -37,10 +37,11 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private static final int RED = 0xFFFF5555;
 	private static final int MARGIN = 10;
 	private static final int ROW_HEIGHT = 20;
-	private static final int SEARCH_ROW_Y = 22;
-	private static final int FILTER_ROW_Y = 46;
-	private static final int LIST_TOP = 70;
-	private static final int FOOTER_HEIGHT = 108;
+	private static final int SEARCH_ROW_Y = 20;
+	private static final int FILTER_ROW_Y = 42;
+	private static final int LIST_TOP = 62;
+	private static final int FOOTER_HEIGHT = 88;
+	private static final int ACTIVITY_TOP = 44;
 	private static final int FOOTER_BUTTON_WIDTH = 90;
 	private static final int ACTION_BUTTON_WIDTH = 120;
 	private static final int SORT_BUTTON_WIDTH = 170;
@@ -71,7 +72,6 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private Button copyButton;
 	private Button historyButton;
 	private Button notesButton;
-	private Button activityButton;
 	private Button redownloadButton;
 	private Button directionButton;
 	private Button rescanButton;
@@ -79,6 +79,15 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private Button syncButton;
 	private boolean scannerBusy;
 	private volatile @Nullable String scannerStatus;
+	private ServerDatabase.@Nullable ServerActivity activity;
+	private @Nullable String activityAddress;
+	private long activityGeneration;
+	private boolean activityLoading;
+	private @Nullable String activityError;
+	private int activityPaneX;
+	private int activityPaneY;
+	private int activityPaneWidth;
+	private int activityPaneHeight;
 
 	public ServerBrowserScreen(Screen parent) {
 		this(parent, rememberedQuery);
@@ -93,41 +102,49 @@ public class ServerBrowserScreen extends DropdownScreen {
 	@Override
 	protected void init() {
 		WhitelistAutoUpdate.attach(this);
-		int right = this.width - MARGIN;
-		int directionX = right - ROW_HEIGHT;
-		int sortX = directionX - GAP - SORT_BUTTON_WIDTH;
+		int paneWidth = Math.max(150, Math.min(280, this.width * 40 / 100));
+		int listWidth = Math.max(140, this.width - 2 * MARGIN - GAP - paneWidth);
+		paneWidth = this.width - 2 * MARGIN - GAP - listWidth;
+		int paneX = MARGIN + listWidth + GAP;
+		int leftWidth = listWidth - 2 * MARGIN;
 
-		this.searchBox = new EditBox(this.font, MARGIN, SEARCH_ROW_Y, sortX - GAP - MARGIN, ROW_HEIGHT, this.searchBox, Component.literal("Search"));
+		this.searchBox = new EditBox(this.font, MARGIN, SEARCH_ROW_Y, leftWidth, ROW_HEIGHT, this.searchBox, Component.literal("Search"));
 		this.searchBox.setMaxLength(256);
 		this.searchBox.setHint(Component.literal("Search address, MOTD, version, player...").withStyle(EditBox.SEARCH_HINT_STYLE));
 		this.searchBox.setValue(this.query.search());
 		this.searchBox.setResponder(search -> this.ticksUntilSearch = SEARCH_DEBOUNCE_TICKS);
 		this.addRenderableWidget(this.searchBox);
 
-		this.addRenderableWidget(new Dropdown<>(sortX, SEARCH_ROW_Y, SORT_BUTTON_WIDTH, ROW_HEIGHT, "Sort", ServerDatabase.Sort.values(), this.primarySort(),
+		int sortWidth = Math.max(90, paneWidth - ROW_HEIGHT - GAP);
+		this.addRenderableWidget(new Dropdown<>(paneX, SEARCH_ROW_Y, sortWidth, ROW_HEIGHT, "Sort", ServerDatabase.Sort.values(), this.primarySort(),
 			this::toggleSort));
 		this.directionButton = this.addRenderableWidget(Button.builder(
 			directionArrow(this.primaryDescending()), button -> this.toggleDirection())
-			.bounds(directionX, SEARCH_ROW_Y, ROW_HEIGHT, ROW_HEIGHT).build());
+			.bounds(paneX + sortWidth + GAP, SEARCH_ROW_Y, ROW_HEIGHT, ROW_HEIGHT).build());
 
-		int filterWidth = (right - MARGIN - 2 * GAP) / 3;
+		int filterWidth = Math.max(52, (leftWidth - 2 * GAP) / 3);
 		this.addRenderableWidget(new Dropdown<>(MARGIN, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Players", ServerDatabase.PlayersFilter.values(), this.query.players(),
 			players -> this.setQuery(this.query.withPlayers(players))));
 		this.addRenderableWidget(new Dropdown<>(MARGIN + filterWidth + GAP, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Auth", ServerDatabase.AuthFilter.values(), this.query.auth(),
 			auth -> this.setQuery(this.query.withAuth(auth))));
-		this.addRenderableWidget(new Dropdown<>(right - filterWidth, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Whitelist", ServerDatabase.WhitelistFilter.values(), this.query.whitelist(),
+		this.addRenderableWidget(new Dropdown<>(MARGIN + 2 * (filterWidth + GAP), FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Whitelist", ServerDatabase.WhitelistFilter.values(), this.query.whitelist(),
 			whitelist -> this.setQuery(this.query.withWhitelist(whitelist))));
 
-		this.list = this.addRenderableWidget(new ServerListWidget(this.width, this.height - FOOTER_HEIGHT - LIST_TOP, LIST_TOP));
+		this.list = this.addRenderableWidget(new ServerListWidget(listWidth, this.height - FOOTER_HEIGHT - LIST_TOP, LIST_TOP));
+		this.list.setX(MARGIN);
 		if (this.result != null) {
 			this.list.setRows(this.result.rows());
 		}
+		this.activityPaneX = paneX;
+		this.activityPaneY = ACTIVITY_TOP;
+		this.activityPaneWidth = paneWidth;
+		this.activityPaneHeight = this.height - FOOTER_HEIGHT - ACTIVITY_TOP;
 
-		int serverButtonCount = 6;
+		int serverButtonCount = 5;
 		int serverButtonWidth = Math.max(60, Math.min(FOOTER_BUTTON_WIDTH,
 			(this.width - 2 * MARGIN - (serverButtonCount - 1) * GAP) / serverButtonCount));
 		int step = serverButtonWidth + GAP;
-		int serverRowY = this.height - 76;
+		int serverRowY = this.height - 66;
 		int serverRowX = (this.width - (serverButtonCount * serverButtonWidth
 			+ (serverButtonCount - 1) * GAP)) / 2;
 		this.joinButton = this.addRenderableWidget(this.footerButton(Component.translatable("selectServer.select"), serverRowX, serverRowY, serverButtonWidth, this::joinSelected));
@@ -135,9 +152,8 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.copyButton = this.addRenderableWidget(this.footerButton(Component.literal("Copy IP"), serverRowX + 2 * step, serverRowY, serverButtonWidth, this::copySelected));
 		this.historyButton = this.addRenderableWidget(this.footerButton(Component.literal("Seen Names"), serverRowX + 3 * step, serverRowY, serverButtonWidth, this::openSelectedHistory));
 		this.notesButton = this.addRenderableWidget(this.footerButton(Component.literal("Notes"), serverRowX + 4 * step, serverRowY, serverButtonWidth, this::openSelectedNotes));
-		this.activityButton = this.addRenderableWidget(this.footerButton(Component.literal("Activity"), serverRowX + 5 * step, serverRowY, serverButtonWidth, this::openSelectedActivity));
 
-		int actionRowY = this.height - 52;
+		int actionRowY = this.height - 44;
 		int actionRowX = this.footerRowX(3, ACTION_BUTTON_WIDTH);
 		this.rescanButton = this.addRenderableWidget(this.actionButton("Rescan",
 			"Run mcscan.py --rescan for the selected server, then sync", actionRowX, actionRowY, this::rescanSelected));
@@ -148,7 +164,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 			"Run mcscan.py --sync, then reload the server list",
 			actionRowX + 2 * (ACTION_BUTTON_WIDTH + GAP), actionRowY, this::syncDatabase));
 
-		int screenRowY = this.height - 28;
+		int screenRowY = this.height - 22;
 		int screenRowX = this.footerRowX(4);
 		this.redownloadButton = this.addRenderableWidget(this.footerButton(Component.literal("Redownload"), screenRowX, screenRowY, () -> this.load(true)));
 		this.addRenderableWidget(this.footerButton(Component.literal("History"), screenRowX + step, screenRowY,
@@ -314,7 +330,38 @@ public class ServerBrowserScreen extends DropdownScreen {
 		if (this.ticksUntilSearch >= 0 && this.ticksUntilSearch-- == 0) {
 			this.setQuery(this.query.withSearch(this.searchBox.getValue()));
 		}
+		this.updateActivitySelection();
 		this.updateButtonStates();
+	}
+
+	private void updateActivitySelection() {
+		ServerRecord selected = this.selectedServer();
+		String address = selected == null ? null : selected.address();
+		if (address == null ? this.activityAddress == null : address.equals(this.activityAddress)) {
+			return;
+		}
+		this.activityAddress = address;
+		long generation = ++this.activityGeneration;
+		this.activity = null;
+		this.activityError = null;
+		this.activityLoading = address != null;
+		if (address == null) {
+			return;
+		}
+		ServerDatabase.activity(address).whenComplete((data, throwable) -> this.minecraft.execute(() -> {
+			if (generation != this.activityGeneration) {
+				return;
+			}
+			this.activityLoading = false;
+			if (throwable != null) {
+				Throwable cause = throwable instanceof CompletionException && throwable.getCause() != null
+					? throwable.getCause() : throwable;
+				this.activityError = cause.getMessage() == null
+					? cause.getClass().getSimpleName() : cause.getMessage();
+			} else {
+				this.activity = data;
+			}
+		}));
 	}
 
 	private void updateButtonStates() {
@@ -325,7 +372,6 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.copyButton.active = hasSelection;
 		this.historyButton.active = hasSelection;
 		this.notesButton.active = hasSelection;
-		this.activityButton.active = hasSelection;
 		this.rescanButton.active = idle && hasSelection;
 		this.whitelistButton.active = idle && hasSelection;
 		this.syncButton.active = idle;
@@ -380,13 +426,6 @@ public class ServerBrowserScreen extends DropdownScreen {
 		ServerRecord server = this.selectedServer();
 		if (server != null) {
 			this.minecraft.gui.setScreen(new NotesScreen(this, server.address()));
-		}
-	}
-
-	private void openSelectedActivity() {
-		ServerRecord server = this.selectedServer();
-		if (server != null) {
-			this.minecraft.gui.setScreen(new ActivityScreen(this, server.address()));
 		}
 	}
 
@@ -521,6 +560,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	@Override
 	protected void extractForeground(GuiGraphicsExtractor graphics) {
 		graphics.centeredText(this.font, this.title, this.width / 2, 8, WHITE);
+		this.drawActivityPane(graphics);
 
 		int statusY = this.height - FOOTER_HEIGHT + 8;
 		if (this.loading) {
@@ -534,6 +574,28 @@ public class ServerBrowserScreen extends DropdownScreen {
 			graphics.centeredText(this.font, this.notice, this.width / 2, statusY, GREEN);
 		} else if (this.result != null) {
 			graphics.centeredText(this.font, this.resultStatus(this.result), this.width / 2, statusY, GRAY);
+		}
+	}
+
+	private void drawActivityPane(GuiGraphicsExtractor graphics) {
+		if (this.activityPaneWidth <= 0 || this.activityPaneHeight <= 0) {
+			return;
+		}
+		if (this.selectedServer() == null) {
+			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+				this.activityPaneWidth, this.activityPaneHeight, "Select a server", GRAY);
+		} else if (this.activityLoading) {
+			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+				this.activityPaneWidth, this.activityPaneHeight, "Loading activity...", GRAY);
+		} else if (this.activityError != null) {
+			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+				this.activityPaneWidth, this.activityPaneHeight, this.activityError, RED);
+		} else if (this.activity != null) {
+			ActivityCharts.drawAll(graphics, this.font, this.activityPaneX, this.activityPaneY,
+				this.activityPaneWidth, this.activityPaneHeight, this.activity);
+		} else {
+			ActivityCharts.drawMessage(graphics, this.font, this.activityPaneX, this.activityPaneY,
+				this.activityPaneWidth, this.activityPaneHeight, "No activity", GRAY);
 		}
 	}
 
@@ -884,8 +946,12 @@ public class ServerBrowserScreen extends DropdownScreen {
 				}
 				graphics.text(font, font.plainSubstrByWidth(addressText, playerCountX - left - 8), left, top + 1, WHITE);
 				graphics.text(font, this.motdLine(font, width), left, top + 12, GRAY);
-				graphics.text(font, this.details, left, top + 23, WHITE);
-				graphics.text(font, lastSeen, right - font.width(lastSeen), top + 23, DARK_GRAY);
+				int lastSeenX = right - font.width(lastSeen);
+				List<FormattedCharSequence> detailLines = font.split(this.details,
+					Math.max(0, lastSeenX - left - 8));
+				graphics.text(font, detailLines.isEmpty() ? FormattedCharSequence.EMPTY : detailLines.getFirst(),
+					left, top + 23, WHITE);
+				graphics.text(font, lastSeen, lastSeenX, top + 23, DARK_GRAY);
 
 				if (!hovered) {
 					return;
