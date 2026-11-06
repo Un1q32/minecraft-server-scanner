@@ -230,6 +230,14 @@ public final class ServerDatabase {
 			try (ResultSet rs = statement.executeQuery("SELECT type, name, tbl_name, sql FROM sqlite_schema")) {
 				while (rs.next()) {
 					SchemaObject object = new SchemaObject(rs.getString("type"), rs.getString("name"), rs.getString("tbl_name"), rs.getString("sql"));
+					if (object.type().equals("table") && object.name().equals("server_state")) {
+						// Shared DBs initialized from a scanner DB carry the
+						// scanner-only needs_sync flag. It does not affect the
+						// browser queries, so accept it as an optional column.
+						object = new SchemaObject(object.type(), object.name(), object.table(),
+							object.sql() == null ? null : object.sql().replaceAll(
+								",\\s*needs_sync\\s+INTEGER\\s+DEFAULT\\s+\\d+", ""));
+					}
 					if (!missing.remove(object)) {
 						throw new SQLException("Server list has an unexpected " + object.type() + " (" + object.name() + ")");
 					}
@@ -331,6 +339,100 @@ public final class ServerDatabase {
 					}
 				}
 			}
+		}, WORKER);
+	}
+
+	public record HistoryPoint(double seenAt, @Nullable Integer playersOnline,
+	                           @Nullable Integer maxPlayers) {
+	}
+
+	public record PlayerActivity(String name, List<Double> times) {
+	}
+
+	public record ServerActivity(List<HistoryPoint> points, List<PlayerActivity> players) {
+	}
+
+	/** Sighting and player-activity history for the viewer charts. */
+	public static CompletableFuture<ServerActivity> activity(String hostAndPort) {
+		return CompletableFuture.supplyAsync(() -> {
+			if (connection == null) {
+				throw new IllegalStateException("Server list not loaded");
+			}
+			List<HistoryPoint> points = new ArrayList<>();
+			try (PreparedStatement statement = connection.prepareStatement(
+					"SELECT seen_at, players_online, max_players FROM ("
+						+ " SELECT seen_at, players_online, max_players FROM server_history"
+						+ " WHERE ip_port = ? ORDER BY seen_at DESC LIMIT 5000"
+						+ ") ORDER BY seen_at ASC")) {
+				statement.setString(1, hostAndPort);
+				try (ResultSet rs = statement.executeQuery()) {
+					while (rs.next()) {
+						Integer online = rs.getObject(2) == null ? null : rs.getInt(2);
+						Integer max = rs.getObject(3) == null ? null : rs.getInt(3);
+						points.add(new HistoryPoint(rs.getDouble(1), online, max));
+					}
+				}
+			} catch (SQLException e) {
+				throw new CompletionException(e);
+			}
+
+			if (points.isEmpty()) {
+				// Older databases still know the first/last sighting.
+				try (PreparedStatement statement = connection.prepareStatement(
+						"SELECT first_seen, last_seen FROM servers WHERE ip_port = ?")) {
+					statement.setString(1, hostAndPort);
+					try (ResultSet rs = statement.executeQuery()) {
+						if (rs.next()) {
+							double first = rs.getDouble(1);
+							double last = rs.getDouble(2);
+							if (first > 0) {
+								points.add(new HistoryPoint(first, null, null));
+							}
+							if (last > first) {
+								points.add(new HistoryPoint(last, null, null));
+							}
+						}
+					}
+				} catch (SQLException e) {
+					throw new CompletionException(e);
+				}
+			}
+
+			Map<String, List<Double>> byName = new LinkedHashMap<>();
+			int total = 0;
+			try (PreparedStatement statement = connection.prepareStatement(
+					"SELECT seen_at, players FROM server_history"
+						+ " WHERE ip_port = ? AND players IS NOT NULL"
+						+ " ORDER BY seen_at DESC LIMIT 20000")) {
+				statement.setString(1, hostAndPort);
+				try (ResultSet rs = statement.executeQuery()) {
+					while (total < 20000 && rs.next()) {
+						double seenAt = rs.getDouble(1);
+						String blob = rs.getString(2);
+						if (blob == null || blob.isEmpty()) {
+							continue;
+						}
+						for (String name : blob.split("\u001f")) {
+							if (total >= 20000) {
+								break;
+							}
+							if (!name.isEmpty()) {
+								byName.computeIfAbsent(name, key -> new ArrayList<>()).add(seenAt);
+								total++;
+							}
+						}
+					}
+				}
+			} catch (SQLException e) {
+				throw new CompletionException(e);
+			}
+
+			List<PlayerActivity> players = new ArrayList<>(byName.size());
+			for (Map.Entry<String, List<Double>> entry : byName.entrySet()) {
+				entry.getValue().sort(Double::compareTo);
+				players.add(new PlayerActivity(entry.getKey(), entry.getValue()));
+			}
+			return new ServerActivity(points, players);
 		}, WORKER);
 	}
 

@@ -53,6 +53,9 @@ final class PauseMenuButtons {
 		widgets.add(Button.builder(Component.literal("Notes"),
 			button -> minecraft.gui.setScreen(new NotesScreen(screen, hostAndPort)))
 			.bounds(MARGIN, MARGIN + 4 * SPACING, WIDTH, HEIGHT).build());
+		widgets.add(Button.builder(Component.literal("Activity"),
+			button -> minecraft.gui.setScreen(new ActivityScreen(screen, hostAndPort)))
+			.bounds(MARGIN, MARGIN + 5 * SPACING, WIDTH, HEIGHT).build());
 	}
 
 	/** Fabric re-fires AFTER_INIT on resize, and resize keeps the existing widgets. */

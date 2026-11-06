@@ -71,6 +71,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private Button copyButton;
 	private Button historyButton;
 	private Button notesButton;
+	private Button activityButton;
 	private Button redownloadButton;
 	private Button directionButton;
 	private Button rescanButton;
@@ -122,7 +123,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 			this.list.setRows(this.result.rows());
 		}
 
-		int serverButtonCount = 5;
+		int serverButtonCount = 6;
 		int serverButtonWidth = Math.max(60, Math.min(FOOTER_BUTTON_WIDTH,
 			(this.width - 2 * MARGIN - (serverButtonCount - 1) * GAP) / serverButtonCount));
 		int step = serverButtonWidth + GAP;
@@ -134,6 +135,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.copyButton = this.addRenderableWidget(this.footerButton(Component.literal("Copy IP"), serverRowX + 2 * step, serverRowY, serverButtonWidth, this::copySelected));
 		this.historyButton = this.addRenderableWidget(this.footerButton(Component.literal("Seen Names"), serverRowX + 3 * step, serverRowY, serverButtonWidth, this::openSelectedHistory));
 		this.notesButton = this.addRenderableWidget(this.footerButton(Component.literal("Notes"), serverRowX + 4 * step, serverRowY, serverButtonWidth, this::openSelectedNotes));
+		this.activityButton = this.addRenderableWidget(this.footerButton(Component.literal("Activity"), serverRowX + 5 * step, serverRowY, serverButtonWidth, this::openSelectedActivity));
 
 		int actionRowY = this.height - 52;
 		int actionRowX = this.footerRowX(3, ACTION_BUTTON_WIDTH);
@@ -323,6 +325,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.copyButton.active = hasSelection;
 		this.historyButton.active = hasSelection;
 		this.notesButton.active = hasSelection;
+		this.activityButton.active = hasSelection;
 		this.rescanButton.active = idle && hasSelection;
 		this.whitelistButton.active = idle && hasSelection;
 		this.syncButton.active = idle;
@@ -377,6 +380,13 @@ public class ServerBrowserScreen extends DropdownScreen {
 		ServerRecord server = this.selectedServer();
 		if (server != null) {
 			this.minecraft.gui.setScreen(new NotesScreen(this, server.address()));
+		}
+	}
+
+	private void openSelectedActivity() {
+		ServerRecord server = this.selectedServer();
+		if (server != null) {
+			this.minecraft.gui.setScreen(new ActivityScreen(this, server.address()));
 		}
 	}
 
