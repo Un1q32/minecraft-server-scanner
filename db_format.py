@@ -330,6 +330,200 @@ def name_list(value) -> list[str]:
     return _name_list(value)
 
 
+DEDUPE_MIN_PORTS = 5
+DEDUPE_PLAYER_CAP = 500
+
+
+def _dedupe_chunks(values, size=500):
+    values = list(values)
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _dedupe_signature(motd, version, protocol):
+    try:
+        protocol = int(protocol)
+    except Exception:
+        protocol = -1
+    return (str(motd or "").strip().lower(),
+            str(version or "").strip().lower(), protocol)
+
+
+def _dedupe_port(ip_port):
+    try:
+        return int(str(ip_port).rsplit(":", 1)[1])
+    except Exception:
+        return 0
+
+
+def _dedupe_host(ip_port):
+    return str(ip_port).rsplit(":", 1)[0]
+
+
+def _dedupe_whitelist_rank(value):
+    text = str(value or "").strip().lower()
+    if text.startswith("not whitelisted"):
+        return 3
+    if text.startswith("whitelisted"):
+        return 2
+    if text.startswith("unknown"):
+        return 1
+    return 0
+
+
+def _dedupe_names(value, out):
+    for name in _name_list(value):
+        out.add(name)
+
+
+def deduplicate_ports(con, min_ports=DEDUPE_MIN_PORTS, mark_dirty=True):
+    """Merge a host that answers identically on many ports into one row.
+
+    This is the same rule the Minecraft viewer applies: same host + same
+    MOTD/version/protocol, with at least ``min_ports`` rows.  The
+    representative prefers port 25565, then the most-seen port.  Duplicate
+    history is removed (after preserving the group's first/last endpoints on
+    the representative) so VACUUM can reclaim the file space.
+
+    The caller owns the transaction and must commit/rollback.  Returns a dict
+    with groups/removed/inserted counts.
+    """
+    table = base_table(con)
+    columns = {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")}
+    required = {"ip_port", "motd", "version", "protocol", "players_online",
+                "max_players", "times_seen", "players_now", "players_ever"}
+    if not required.issubset(columns):
+        return {"groups": 0, "removed_state": 0, "removed_history": 0,
+                "inserted_history": 0}
+    has_needs_sync = "needs_sync" in columns
+    has_seq = "seq" in columns
+
+    old_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        groups = {}
+        for row in con.execute(f"SELECT * FROM {table}"):
+            key = (_dedupe_host(row["ip_port"]),
+                   _dedupe_signature(row["motd"], row["version"], row["protocol"]))
+            groups.setdefault(key, []).append(row)
+        work = [group for group in groups.values() if len(group) >= min_ports]
+        if not work:
+            return {"groups": 0, "removed_state": 0, "removed_history": 0,
+                    "inserted_history": 0}
+
+        history = {}
+        all_ips = [row["ip_port"] for group in work for row in group]
+        for chunk in _dedupe_chunks(all_ips):
+            marks = ",".join("?" * len(chunk))
+            for ip, first, last in con.execute(
+                    f"SELECT ip_port, MIN(seen_at), MAX(seen_at)"
+                    f" FROM server_history WHERE ip_port IN ({marks})"
+                    f" GROUP BY ip_port", chunk):
+                history[ip] = (float(first or 0), float(last or 0))
+
+        removed_state = removed_history = inserted_history = 0
+        synced = 0 if (has_needs_sync and mark_dirty) else 1
+        for group in work:
+            representative = group[0]
+            best_port = _dedupe_port(representative["ip_port"]) == 25565
+            for row in group[1:]:
+                canonical = _dedupe_port(row["ip_port"]) == 25565
+                if canonical != best_port:
+                    if canonical:
+                        representative = row
+                        best_port = True
+                    continue
+                if int(row["times_seen"] or 0) > int(representative["times_seen"] or 0):
+                    representative = row
+                elif (int(row["times_seen"] or 0) == int(representative["times_seen"] or 0)
+                      and int(row["players_online"] or 0) > int(representative["players_online"] or 0)):
+                    representative = row
+
+            ever_names = set()
+            now_names = []
+            online = maximum = times_seen = 0
+            cracked = None
+            whitelist = ""
+            source = ""
+            for row in group:
+                _dedupe_names(row["players_ever"], ever_names)
+                _dedupe_names(row["players_now"], ever_names)
+                names_now = _name_list(row["players_now"])
+                if names_now and not now_names:
+                    now_names = names_now
+                online = max(online, int(row["players_online"] or 0))
+                maximum = max(maximum, int(row["max_players"] or 0))
+                times_seen = max(times_seen, int(row["times_seen"] or 0))
+                if cracked is None and row["cracked"] is not None:
+                    cracked = row["cracked"]
+                if _dedupe_whitelist_rank(row["whitelist"]) > _dedupe_whitelist_rank(whitelist):
+                    whitelist = row["whitelist"] or ""
+                if source_is_cracked_verdict(row["last_source"]):
+                    source = row["last_source"] or ""
+            if not source:
+                source = representative["last_source"] or ""
+            if not now_names:
+                now_names = _name_list(representative["players_now"])
+            if not whitelist:
+                whitelist = representative["whitelist"] or ""
+            if cracked is None:
+                cracked = representative["cracked"]
+
+            first = min((history[ip][0] for ip in
+                         (row["ip_port"] for row in group)
+                         if ip in history and history[ip][0] > 0), default=0.0)
+            last = max((history[ip][1] for ip in
+                        (row["ip_port"] for row in group)
+                        if ip in history), default=0.0)
+            if first > 0 and last >= first:
+                insert_range(con, representative["ip_port"], first, last,
+                             online, maximum, now_names,
+                             sorted(ever_names, key=str.lower)[:DEDUPE_PLAYER_CAP],
+                             synced=synced)
+                inserted_history += 2 if abs(last - first) >= 1e-9 else 1
+
+            duplicate_ips = [row["ip_port"] for row in group
+                             if row["ip_port"] != representative["ip_port"]]
+            for chunk in _dedupe_chunks(duplicate_ips):
+                marks = ",".join("?" * len(chunk))
+                cur = con.execute(
+                    f"DELETE FROM server_history WHERE ip_port IN ({marks})", chunk)
+                removed_history += max(0, cur.rowcount)
+
+            ever_json = json.dumps(sorted(ever_names, key=str.lower)[:DEDUPE_PLAYER_CAP],
+                                   ensure_ascii=False) if ever_names else None
+            now_json = json.dumps(now_names[:DEDUPE_PLAYER_CAP],
+                                  ensure_ascii=False) if now_names else None
+            assignments = [
+                "motd=?", "players_online=?", "max_players=?", "version=?",
+                "protocol=?", "cracked=?", "whitelist=?", "times_seen=?",
+                "last_source=?", "players_now=?", "players_ever=?",
+            ]
+            values = [representative["motd"], online, maximum,
+                      representative["version"], representative["protocol"],
+                      cracked, whitelist, times_seen, source, now_json, ever_json]
+            if has_needs_sync:
+                assignments.append("needs_sync=1" if mark_dirty else "needs_sync=0")
+            if has_seq:
+                assignments.append(
+                    f"seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM {table})")
+            con.execute(
+                f"UPDATE {table} SET {', '.join(assignments)} WHERE ip_port=?",
+                (*values, representative["ip_port"]))
+
+            for chunk in _dedupe_chunks(duplicate_ips):
+                marks = ",".join("?" * len(chunk))
+                cur = con.execute(
+                    f"DELETE FROM {table} WHERE ip_port IN ({marks})", chunk)
+                removed_state += max(0, cur.rowcount)
+
+        return {"groups": len(work), "removed_state": removed_state,
+                "removed_history": removed_history,
+                "inserted_history": inserted_history}
+    finally:
+        con.row_factory = old_factory
+
+
 def insert_history(con, ip_port, seen_at, players_online=None,
                    max_players=None, names=(), synced=0, merge=False):
     """Insert one sighting (and its player samples) with duplicate safety."""

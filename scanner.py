@@ -1117,6 +1117,50 @@ def query_server_notes(ip_port, include_deleted=False):
             con.close()
 
 
+def deduplicate_local_db(vacuum=True, mark_dirty=True):
+    """Merge same-host duplicate ports in the local servers.db.
+
+    Returns the db_format stats plus before/after file sizes.  ``mark_dirty``
+    makes the merged representative upload on the next sync; downloaded
+    snapshots should pass False so they stay clean.
+    """
+    init_server_db()
+    path = os.path.abspath(SERVERS_DB_FILE)
+    try:
+        before = os.path.getsize(path)
+    except OSError:
+        before = 0
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            stats = db_format.deduplicate_ports(con, mark_dirty=mark_dirty)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+    if vacuum and stats.get("removed_state"):
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                con.execute("VACUUM")
+            except Exception as exc:
+                print(f"warning: could not compact servers.db: {exc}",
+                      flush=True)
+            finally:
+                con.close()
+    try:
+        after = os.path.getsize(path)
+    except OSError:
+        after = 0
+    stats = dict(stats)
+    stats["before_bytes"] = before
+    stats["after_bytes"] = after
+    _notify_server_db_tab()
+    return stats
+
+
 def query_notes_counts():
     """Active note count per server, for the Servers table."""
     _ensure_notes_db()
@@ -2077,9 +2121,15 @@ def _prepare_downloaded_db(path):
         _init_history_schema(con)
         _merge_previous_history(con)
         db_format.ensure_view(con, recreate=added_columns)
+        dedupe_stats = db_format.deduplicate_ports(con, mark_dirty=False)
         con.commit()
-        # The shared server already sends a compact VACUUM INTO snapshot;
-        # a second VACUUM here was by far the slowest part on slow disks.
+        # Only compact when the deduper actually removed pages; a plain
+        # snapshot is already compact, and a second VACUUM would be slow.
+        if dedupe_stats.get("removed_state"):
+            try:
+                con.execute("VACUUM")
+            except Exception:
+                pass
         rows = int(con.execute(
             f"SELECT COUNT(*) FROM {base}").fetchone()[0] or 0)
         quick = con.execute("PRAGMA quick_check").fetchone()

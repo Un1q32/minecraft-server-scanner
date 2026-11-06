@@ -1111,6 +1111,70 @@ class ZstdSnapshotWriter:
                           flush=True)
 
 
+def dedupe_database(db_path):
+    """Merge same-host duplicate ports and compact the shared DB."""
+    with _db_lock:
+        con = db_connect(db_path)
+        try:
+            stats = db_format.deduplicate_ports(con, mark_dirty=False)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+        if stats.get("removed_state"):
+            con = db_connect(db_path)
+            try:
+                con.execute("VACUUM")
+            finally:
+                con.close()
+    return stats
+
+
+class PortDeduper:
+    """Keep the shared DB compact without blocking request handlers forever."""
+
+    def __init__(self, db_path, interval, writer=None):
+        self.db_path = db_path
+        self.interval = max(1.0, float(interval))
+        self.writer = writer
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, name="db-port-deduper", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=10.0)
+            except Exception:
+                pass
+            self._thread = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                stats = dedupe_database(self.db_path)
+                if stats.get("removed_state"):
+                    print(
+                        f"port dedupe: {stats['groups']} groups, "
+                        f"{stats['removed_state']} server rows, "
+                        f"{stats['removed_history']} history rows removed",
+                        flush=True)
+                    if self.writer is not None:
+                        self.writer.notify()
+            except Exception as exc:
+                print(f"port dedupe failed: {exc}", file=sys.stderr,
+                      flush=True)
+            if self._stop.wait(self.interval):
+                break
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MCNetDB/1.0"
 
@@ -1761,6 +1825,12 @@ def main(argv=None):
                          "(e.g. /srv/mc-scanner/servers.db.zst)")
     ap.add_argument("--web-db-zst-level", type=int, default=1, metavar="N",
                     help="zstd level for --web-db-zst (default: 1)")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="merge same-host duplicate ports, compact servers.db, "
+                         "then exit")
+    ap.add_argument("--dedupe-every", type=float, default=900.0, metavar="SECS",
+                    help="merge duplicate ports in the background every SECS "
+                         "seconds (0 disables; default: 900)")
     args = ap.parse_args(argv)
 
     try:
@@ -1768,6 +1838,12 @@ def main(argv=None):
     except Exception:
         pass
     init_db(args.db)
+    if args.dedupe:
+        stats = dedupe_database(args.db)
+        print(f"dedupe complete: {stats['groups']} groups, "
+              f"{stats['removed_state']} server rows, "
+              f"{stats['removed_history']} history rows removed")
+        return
     notes_db = (args.notes_db.strip() or
                 os.path.splitext(os.path.abspath(args.db))[0] + "-notes.sqlite3")
     init_notes_db(notes_db)
@@ -1824,6 +1900,11 @@ def main(argv=None):
         print(f"Web DB snapshot: {os.path.abspath(args.web_db_zst)} "
               f"(zstd level {args.web_db_zst_level})")
         writer.start()
+    deduper = None
+    if args.dedupe_every > 0:
+        deduper = PortDeduper(server.db_path, args.dedupe_every, writer)
+        deduper.start()
+        print(f"Port dedupe: every {args.dedupe_every:.0f}s")
     if scheme == "http":
         print("NOTE: plain HTTP -- clients auth with HMAC so the token itself "
               "is never sent in cleartext, but drop cert.pem + privkey.pem in "
@@ -1834,6 +1915,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if deduper is not None:
+            deduper.stop()
         if writer is not None:
             writer.stop()
 

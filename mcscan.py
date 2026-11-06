@@ -9,6 +9,7 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --sync                  sync shared DB (creds from netdb.json)
   mcscan.py --download-db           replace local DB with the latest shared DB
   mcscan.py --vacuum-db             compact the local servers.db
+  mcscan.py --dedupe                merge same-host duplicate ports + compact
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --recheck-whitelist IP:PORT ...
                                     probe whitelist status for those servers
@@ -189,6 +190,27 @@ def cmd_vacuum_db():
         after = 0
     print(f"database compacted: {before / (1024 * 1024):.1f} MB -> "
           f"{after / (1024 * 1024):.1f} MB", flush=True)
+    return 0
+
+
+def cmd_dedupe():
+    """Merge duplicate same-host ports and compact the local DB."""
+    try:
+        stats = scanner.deduplicate_local_db(vacuum=True)
+    except Exception as exc:
+        print(f"error: dedupe failed: {exc}", flush=True)
+        return 1
+    before = stats.get("before_bytes", 0)
+    after = stats.get("after_bytes", 0)
+    saved = max(0, before - after)
+    print(
+        "dedupe complete: "
+        f"{stats.get('groups', 0)} groups, "
+        f"{stats.get('removed_state', 0)} server rows, "
+        f"{stats.get('removed_history', 0)} history rows removed; "
+        f"{before / (1024 * 1024):.1f} MB -> {after / (1024 * 1024):.1f} MB "
+        f"({saved / (1024 * 1024):.1f} MB saved)",
+        flush=True)
     return 0
 
 
@@ -822,6 +844,10 @@ def main(argv=None):
         "--vacuum-db", action="store_true",
         help="compact the local servers.db (can take a while on SD cards; "
              "run it when not scanning/syncing)")
+    parser.add_argument(
+        "--dedupe", action="store_true",
+        help="merge same-host duplicate ports (same MOTD/version/protocol) "
+             "and compact servers.db")
 
     parser.add_argument(
         "--scan", nargs="+", metavar="TARGET", dest="targets",
@@ -913,7 +939,8 @@ def main(argv=None):
             and args.init_db is None and not args.continuous \
             and args.recheck_whitelist is None and args.set_whitelist is None \
             and args.rescan is None \
-            and not args.download_db and not args.vacuum_db:
+            and not args.download_db and not args.vacuum_db \
+            and not args.dedupe:
         parser.print_help()
         return 2
     install_signal_handlers()
@@ -933,6 +960,8 @@ def main(argv=None):
             rc = cmd_download_db() or rc
         if args.vacuum_db:
             rc = cmd_vacuum_db() or rc
+        if args.dedupe:
+            rc = cmd_dedupe() or rc
         if args.sync:
             rc = cmd_sync() or rc
         if args.recheck_whitelist is not None:

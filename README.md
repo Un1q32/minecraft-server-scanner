@@ -270,6 +270,7 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
     python mcscan.py --sync                  # sync shared DB (auto-full-download if local DB is missing)
     python mcscan.py --download-db           # replace local servers + notes DBs from the shared DB
     python mcscan.py --vacuum-db             # compact the local servers.db after index migrations
+    python mcscan.py --dedupe                # merge same-host duplicate ports, then compact
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
@@ -595,6 +596,13 @@ and rewrites the snapshot after a short quiet period:
 
 If the database is maintained elsewhere, use `webui/compress_db.py` instead;
 it watches the DB/WAL mtimes and supports `--once` for a timer:
+
+Port-spray hosts (one backend answering on hundreds of ports) are merged in
+the shared DB automatically. `dbserver.py` runs the merge every 15 minutes by
+default and compacts only when it removed rows; adjust it with
+`--dedupe-every SECS` (0 disables it) or run a one-shot merge and exit with
+`--dedupe`. Local scanner DBs can be compacted the same way with
+`mcscan.py --dedupe`.
 
     python3 webui/compress_db.py \
         --db /path/servers.db \
