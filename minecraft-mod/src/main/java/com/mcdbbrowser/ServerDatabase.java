@@ -46,7 +46,10 @@ public final class ServerDatabase {
 	private static final String PLAIN_DB_URL = "https://mcdb.uniq.gay/servers.db";
 	private static final Path CACHE_DIR = FabricLoader.getInstance().getGameDir().resolve("mcdbbrowser");
 	private static final Path DB_FILE = CACHE_DIR.resolve("servers.db");
-	private static final long MAX_DOWNLOAD_BYTES = 512L * 1024 * 1024;
+	// The shared DB is currently ~550 MB decompressed and can briefly exceed
+	// that before the server's format-5 retention prune runs. Keep enough
+	// headroom for the zstd snapshot without allowing unbounded downloads.
+	private static final long MAX_DOWNLOAD_BYTES = 2L * 1024 * 1024 * 1024;
 	private static final String COLUMNS = String.join(", ",
 		"substr(ip_port, 1, 300) AS ip_port",
 		"substr(motd, 1, 1024) AS motd",
