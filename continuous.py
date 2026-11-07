@@ -115,16 +115,24 @@ RESCAN_TIERS = (
 
 # --high-res tightens the player tier from 10 to 2 minutes and the recent
 # tier from 2 hours to 15 minutes.  The older tiers keep their normal
-# cadence so ancient rows don't consume the rescan budget.
+# cadence so ancient rows don't consume the rescan budget.  High-resolution
+# data is about the known addresses, so padded tiers never expand to /20
+# blocks here: each server is re-pinged on its own IP and port.
 _HIGH_RES_OVERRIDES = {
     "rescan-players": HIGH_RES_PLAYER_SPACING,
     "rescan-1d": HIGH_RES_RESCAN_SPACING,
 }
-HIGH_RES_RESCAN_TIERS = tuple(
-    {**tier, "every": _HIGH_RES_OVERRIDES[tier["name"]]}
-    if tier["name"] in _HIGH_RES_OVERRIDES else tier
-    for tier in RESCAN_TIERS
-)
+
+
+def _high_res_tier(tier):
+    out = {**tier, "padded": False}
+    every = _HIGH_RES_OVERRIDES.get(tier["name"])
+    if every is not None:
+        out["every"] = every
+    return out
+
+
+HIGH_RES_RESCAN_TIERS = tuple(_high_res_tier(tier) for tier in RESCAN_TIERS)
 
 
 # --- helpers --------------------------------------------------------------
