@@ -64,6 +64,7 @@ SLEEP_SECS = 10                 # quiet gap between rounds (attribution)
 DEFAULT_SCAN_DURATION = 300     # per-round time box (matscan: 5 min)
 DEFAULT_SYNC_EVERY = 300        # shared-DB sync cadence
 DEFAULT_RESCAN_EVERY = 2        # normal rounds between rescan rounds
+HIGH_RES_RESCAN_SPACING = 900   # --high-res: 15 minutes between rescans
 RESCAN_PY_MAX = 100             # tiny port groups: ping directly, no masscan
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
@@ -108,6 +109,16 @@ RESCAN_TIERS = (
      "limit": 500_000, "sort": "random", "padded": True},
     {"name": "rescan-old", "every": 365 * 86400, "max_age": 3650 * 86400,
      "limit": 500_000, "sort": "random", "padded": True},
+)
+
+
+# --high-res tightens the recent tier from 2 hours to 15 minutes.  Servers
+# with players keep their 10-minute priority tier; the older tiers keep
+# their normal cadence so ancient rows don't consume the rescan budget.
+HIGH_RES_RESCAN_TIERS = tuple(
+    {**tier, "every": HIGH_RES_RESCAN_SPACING}
+    if tier["name"] == "rescan-1d" else tier
+    for tier in RESCAN_TIERS
 )
 
 
@@ -1011,15 +1022,17 @@ class ShardManager:
 def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                    sync_every=DEFAULT_SYNC_EVERY, state_path="strategies.json",
                    backend="auto", strategies=None, do_rescan=True,
-                   rescan_every=DEFAULT_RESCAN_EVERY,
+                   rescan_every=None, high_res=False,
                    stop_event=None, max_rounds=None, shard=None, seed=None,
                    base_ports=None, auto_shard=False, node_id=None):
     """The forever loop. Returns a process exit code."""
     base_ports = _base_ports(base_ports)
+    if rescan_every is None:
+        rescan_every = 1 if high_res else DEFAULT_RESCAN_EVERY
     try:
         rescan_every = max(1, int(rescan_every))
     except Exception:
-        rescan_every = DEFAULT_RESCAN_EVERY
+        rescan_every = 1 if high_res else DEFAULT_RESCAN_EVERY
     if backend == "minescan":
         print("error: continuous mode supports --backend auto, masscan or "
               "python (minescan is for one-off --scan).")
@@ -1054,6 +1067,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     ports_note = ("" if base_ports == [25565]
                   else f" ports={','.join(str(p) for p in base_ports)}")
     rescan_note = (f"every {rescan_every} round(s)" if do_rescan else "off")
+    if high_res and do_rescan:
+        rescan_note += (f" high-res ({HIGH_RES_RESCAN_SPACING // 60}m due"
+                        f" spacing)")
     print(f"continuous mode: strategies={','.join(picker.enabled)} "
           f"rescan={rescan_note} scan_duration={scan_duration}s "
           f"rate={rate}pps wait={wait}s backend={backend}"
@@ -1180,7 +1196,8 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
             else:
                 targets = []
                 seen_targets = set()
-                for tier in RESCAN_TIERS:
+                for tier in (HIGH_RES_RESCAN_TIERS if high_res
+                             else RESCAN_TIERS):
                     try:
                         picked = rescan_targets(before_rows, tier)
                     except Exception as exc:

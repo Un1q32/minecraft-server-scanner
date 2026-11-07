@@ -20,6 +20,8 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --export out.csv        dump the full local DB to CSV
   mcscan.py --continuous            self-tuning forever scan (matscan-style;
                                     auto-shards against the shared DB)
+  mcscan.py --high-res              rescan-focused continuous mode: rescan
+                                    every round with 15-minute due spacing
 
 Discovery only (status ping + player sample) unless --recheck-whitelist
 is used, which runs the same login probes as the GUI's Check Whitelist
@@ -804,6 +806,10 @@ def cmd_continuous(args):
             print(f"error: --shard must satisfy 1 <= I <= N, got {args.shard!r}")
             return 2
         shard = (index, total)
+    high_res = bool(getattr(args, "high_res", False))
+    rescan_every = getattr(args, "rescan_every", None)
+    if high_res and rescan_every is None:
+        rescan_every = 1
     return continuous.run_continuous(
         rate=args.rate,
         wait=args.wait,
@@ -813,7 +819,8 @@ def cmd_continuous(args):
         backend=args.backend,
         strategies=strategies,
         do_rescan=not getattr(args, "no_rescan", False),
-        rescan_every=getattr(args, "rescan_every", None),
+        rescan_every=rescan_every,
+        high_res=high_res,
         stop_event=_CLI_STOP,
         max_rounds=getattr(args, "rounds", None),
         shard=shard,
@@ -871,6 +878,12 @@ def main(argv=None):
         "--continuous", action="store_true",
         help="run forever, picking scan strategies by their yield history "
              "(matscan-style) and rescanning due servers")
+    parser.add_argument(
+        "--high-res", "--hi-res", dest="high_res", action="store_true",
+        help="run the continuous loop in rescan-focused high-resolution "
+             "mode: rescan every round (like --rescan-every 1) and revisit "
+             "due servers every 15 minutes instead of the normal 2-hour+ "
+             "cadence")
     parser.add_argument(
         "--scan-duration", type=int, default=300, metavar="SECS",
         help="time box per scan round in --continuous (default: 300)")
@@ -937,6 +950,7 @@ def main(argv=None):
 
     if not args.sync and args.targets is None and not args.export \
             and args.init_db is None and not args.continuous \
+            and not args.high_res \
             and args.recheck_whitelist is None and args.set_whitelist is None \
             and args.rescan is None \
             and not args.download_db and not args.vacuum_db \
@@ -970,7 +984,7 @@ def main(argv=None):
             rc = cmd_set_whitelist(*args.set_whitelist) or rc
         if args.rescan is not None:
             rc = cmd_rescan(args.rescan) or rc
-        if args.continuous:
+        if args.continuous or args.high_res:
             rc = cmd_continuous(args) or rc
         if args.targets is not None:
             rc = cmd_scan(args) or rc
