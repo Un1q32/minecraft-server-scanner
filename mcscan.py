@@ -826,8 +826,10 @@ def cmd_continuous(args):
         shard=shard,
         seed=getattr(args, "scan_seed", None),
         base_ports=_parse_ports(getattr(args, "ports", "25565")),
+        # High-res mode is rescan-only, so registering for a discovery
+        # shard would reserve scan space it never uses.
         auto_shard=(not getattr(args, "no_auto_shard", False)
-                    and shard is None),
+                    and shard is None and not high_res),
         node_id=getattr(args, "node_id", None),
     )
 
@@ -881,9 +883,9 @@ def main(argv=None):
     parser.add_argument(
         "--high-res", "--hi-res", dest="high_res", action="store_true",
         help="run the continuous loop in rescan-focused high-resolution "
-             "mode: rescan every round (like --rescan-every 1) and revisit "
-             "due servers every 15 minutes instead of the normal 2-hour+ "
-             "cadence")
+             "mode: rescan every round (like --rescan-every 1), revisit "
+             "players every 2 minutes and recent servers every 15 minutes. "
+             "Does not register for automatic sharding")
     parser.add_argument(
         "--scan-duration", type=int, default=300, metavar="SECS",
         help="time box per scan round in --continuous (default: 300)")

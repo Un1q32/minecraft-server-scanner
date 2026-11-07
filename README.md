@@ -375,7 +375,9 @@ rescans every round), `--no-rescan` skips rescan rounds entirely, and
 `--rounds N` stops after N rounds (useful for testing). `--high-res`
 (`--hi-res`) is the rescan-focused variant: it implies continuous mode,
 uses `--rescan-every 1`, moves the player tier to 2 minutes and the recent
-tier to 15 minutes. The older tiers keep their normal cadence. The
+tier to 15 minutes. The older tiers keep their normal cadence. It does not
+register for automatic sharding, since rescan-only rounds do not use the
+discovery scan space; pass `--shard I/N` if you still want a fixed slice. The
 deep-port strategies need masscan and root; without them the Python
 backend skips rounds whose probe count exceeds its cap.
 
