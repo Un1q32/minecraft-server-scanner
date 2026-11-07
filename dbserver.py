@@ -615,7 +615,7 @@ def _history_count(value):
         return None
 
 
-def sanitize_history_row(raw, now=None):
+def sanitize_history_row(raw, now=None, cutoff=None):
     """Validate one uploaded sighting. Returns dict or None."""
     if not isinstance(raw, dict):
         return None
@@ -629,6 +629,8 @@ def sanitize_history_row(raw, now=None):
     now = now or _utcnow()
     if seen_at <= 0 or seen_at > now + 86400:
         return None
+    if cutoff is not None and seen_at < cutoff:
+        return None
     return {
         "ip_port": ip_port,
         "seen_at": seen_at,
@@ -638,7 +640,7 @@ def sanitize_history_row(raw, now=None):
     }
 
 
-def sanitize_player_event(raw, now=None):
+def sanitize_player_event(raw, now=None, cutoff=None):
     """Validate one uploaded player sighting. Returns dict or None."""
     if not isinstance(raw, dict):
         return None
@@ -653,6 +655,8 @@ def sanitize_player_event(raw, now=None):
         return None
     now = now or _utcnow()
     if seen_at <= 0 or seen_at > now + 86400:
+        return None
+    if cutoff is not None and seen_at < cutoff:
         return None
     return {"ip_port": ip_port, "player_name": name, "seen_at": seen_at}
 
@@ -1143,7 +1147,13 @@ def prune_database_history(db_path, force=False):
         with _db_lock:
             con = db_connect(db_path)
             try:
-                removed = db_format.prune_history(con)
+                if _last_history_prune == 0.0:
+                    # One-time cleanup of legacy high-resolution rows.
+                    stats = db_format.prune_activity(con)
+                    removed = (int(stats.get("removed_old", 0))
+                               + int(stats.get("thinned", 0)))
+                else:
+                    removed = db_format.prune_history(con)
                 con.commit()
             finally:
                 con.close()
@@ -1683,9 +1693,10 @@ class Handler(BaseHTTPRequestHandler):
             limit = max(1, min(limit, MAX_HISTORY_PER_RESPONSE))
             download = bool(payload.get("download", True))
             now = _utcnow()
+            cutoff = now - db_format.HISTORY_RETENTION_SECONDS
             history_by_key = {}
             for raw_row in history_in:
-                row = sanitize_history_row(raw_row, now)
+                row = sanitize_history_row(raw_row, now, cutoff)
                 if row is None:
                     continue
                 key = (row["ip_port"], row["seen_at"])
@@ -1704,28 +1715,62 @@ class Handler(BaseHTTPRequestHandler):
             # into the roster blob on the matching sighting.
             player_groups = {}
             for raw_row in players_in:
-                row = sanitize_player_event(raw_row, now)
+                row = sanitize_player_event(raw_row, now, cutoff)
                 if row is not None:
                     player_groups.setdefault(
                         (row["ip_port"], row["seen_at"]), []).append(
                             row["player_name"])
+            rejected_history = rejected_players = 0
             merged_history = merged_players = 0
+            try:
+                prune_database_history(self.server.db_path)
+            except Exception as exc:
+                print(f"history sync: prune failed: {exc}",
+                      file=sys.stderr, flush=True)
             with _db_lock:
                 con = db_connect(self.server.db_path)
                 try:
                     before = con.total_changes
-                    if history_values:
-                        con.executemany(
+                    for (ip_port, seen_at), vals in sorted(
+                            history_by_key.items()):
+                        online, maximum, players = vals
+                        exact = con.execute(
+                            "SELECT 1 FROM server_history"
+                            " WHERE ip_port=? AND seen_at=? LIMIT 1",
+                            (ip_port, seen_at)).fetchone()
+                        if exact:
+                            con.execute(
+                                "INSERT INTO server_history"
+                                " (ip_port, seen_at, players_online,"
+                                " max_players, players, synced)"
+                                " VALUES (?, ?, ?, ?, ?, 1)"
+                                " ON CONFLICT(ip_port, seen_at) DO UPDATE SET"
+                                " players=COALESCE(server_history.players,"
+                                " excluded.players)",
+                                (ip_port, seen_at, online, maximum, players))
+                            continue
+                        has_players = ((online or 0) > 0 or bool(players))
+                        gap = (db_format.ACTIVITY_PLAYER_GAP_SECONDS
+                               if has_players
+                               else db_format.ACTIVITY_EMPTY_GAP_SECONDS)
+                        near = con.execute(
+                            "SELECT 1 FROM server_history"
+                            " WHERE ip_port=? AND seen_at > ? AND seen_at < ?"
+                            " LIMIT 1",
+                            (ip_port, seen_at - gap,
+                             seen_at + gap)).fetchone()
+                        if near is not None:
+                            rejected_history += 1
+                            continue
+                        con.execute(
                             "INSERT INTO server_history"
                             " (ip_port, seen_at, players_online, max_players,"
-                            " players, synced) VALUES (?, ?, ?, ?, ?, 1)"
-                            " ON CONFLICT(ip_port, seen_at) DO UPDATE SET"
-                            " players=COALESCE(server_history.players,"
-                            " excluded.players)",
-                            history_values)
+                            " players, synced) VALUES (?, ?, ?, ?, ?, 1)",
+                            (ip_port, seen_at, online, maximum, players))
                     merged_history = con.total_changes - before
                     before = con.total_changes
-                    for (ip_port, seen_at), names in player_groups.items():
+                    for (ip_port, seen_at), names in sorted(
+                            player_groups.items()):
                         row = con.execute(
                             "SELECT players FROM server_history"
                             " WHERE ip_port=? AND seen_at=?",
@@ -1733,6 +1778,17 @@ class Handler(BaseHTTPRequestHandler):
                         merged = db_format.merge_player_blobs(
                             row[0] if row else None, names)
                         if row is None:
+                            near = con.execute(
+                                "SELECT 1 FROM server_history"
+                                " WHERE ip_port=? AND seen_at > ?"
+                                " AND seen_at < ? LIMIT 1",
+                                (ip_port,
+                                 seen_at - db_format.ACTIVITY_PLAYER_GAP_SECONDS,
+                                 seen_at + db_format.ACTIVITY_PLAYER_GAP_SECONDS)
+                            ).fetchone()
+                            if near is not None:
+                                rejected_players += 1
+                                continue
                             con.execute(
                                 "INSERT OR IGNORE INTO server_history"
                                 " (ip_port, seen_at, players_online,"
@@ -1778,6 +1834,8 @@ class Handler(BaseHTTPRequestHandler):
                 "player_seq": player_seq,
                 "merged_history": merged_history,
                 "merged_players": merged_players,
+                "rejected_history": rejected_history,
+                "rejected_players": rejected_players,
                 "has_history": True,
                 "now": _utcnow(),
             })

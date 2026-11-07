@@ -731,7 +731,11 @@ retained, except the newest sighting per server (for last-seen dates); the
 ever-seen names stay on `server_state.players_ever`.
 `mcscan.py --prune-activity` removes the >4-day rows and also thins points
 that are closer than the rescan resolution (5 minutes for sightings with
-players, 30 minutes for empty ones), then vacuums the file. The viewer JSON
+players, 30 minutes for empty ones), then vacuums the file. The shared
+server applies the same policy to uploads: it drops sightings older than
+4 days and rejects new points that would be denser than 5/30 minutes, so
+old or overly detailed history cannot be reintroduced by client syncs.
+The viewer JSON
 is capped at 5000 sighting points and 20000 player events; storage keeps
 only the retained rows. Upload indexes are partial (`WHERE synced=0`), so
 they shrink back to
