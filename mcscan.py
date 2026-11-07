@@ -941,7 +941,7 @@ def main(argv=None):
         "--high-res", "--hi-res", dest="high_res", action="store_true",
         help="run the continuous loop in rescan-focused high-resolution "
              "mode: rescan every round (like --rescan-every 1), revisit "
-             "players every 2 minutes and recent servers every 15 minutes. "
+             "players every 5 minutes and recent servers every 30 minutes. "
              "Does not register for automatic sharding")
     parser.add_argument(
         "--scan-duration", type=int, default=300, metavar="SECS",

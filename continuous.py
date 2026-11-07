@@ -113,8 +113,8 @@ RESCAN_TIERS = (
 )
 
 
-# --high-res tightens the player tier from 10 to 2 minutes and the recent
-# tier from 2 hours to 15 minutes.  The older tiers keep their normal
+# --high-res tightens the player tier from 10 to 5 minutes and the recent
+# tier from 2 hours to 30 minutes.  The older tiers keep their normal
 # cadence so ancient rows don't consume the rescan budget.  High-resolution
 # data is about the known addresses, so padded tiers never expand to /20
 # blocks here: each server is re-pinged on its own IP and port.
