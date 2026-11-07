@@ -48,8 +48,8 @@ public final class ServerDatabase {
 	private static final Path DB_FILE = CACHE_DIR.resolve("servers.db");
 	// Client-side guard against a broken or hostile endpoint streaming
 	// forever / filling the disk. The live DB is ~550 MB decompressed;
-	// 10 GiB leaves ample headroom for growth.
-	private static final long MAX_DOWNLOAD_BYTES = 10L * 1024 * 1024 * 1024;
+	// 6 GiB leaves ample headroom for growth.
+	private static final long MAX_DOWNLOAD_BYTES = 6L * 1024 * 1024 * 1024;
 	private static final String COLUMNS = String.join(", ",
 		"substr(ip_port, 1, 300) AS ip_port",
 		"substr(motd, 1, 1024) AS motd",
