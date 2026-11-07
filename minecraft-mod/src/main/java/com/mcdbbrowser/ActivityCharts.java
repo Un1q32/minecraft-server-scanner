@@ -111,7 +111,9 @@ final class ActivityCharts {
 			graphics.text(font, end, right - font.width(end), bottom + 6, DARK_GRAY);
 		}
 
-		int span = Math.max(1, (int) (t1 - t0));
+		// Keep the span fractional: truncating it to whole seconds made the
+		// last point of a short (sub-2s) view round past the array bound.
+		double span = Math.max(1.0, t1 - t0);
 		int pixels = Math.max(1, right - left);
 		int[] yAt = new int[pixels + 1];
 		boolean[] hasPoint = new boolean[pixels + 1];
@@ -121,6 +123,7 @@ final class ActivityCharts {
 				continue;
 			}
 			int px = left + (int) Math.round((point.seenAt() - t0) * pixels / span);
+			px = Math.max(left, Math.min(right, px));
 			tick[px - left] = true;
 			if (point.playersOnline() == null) {
 				continue;
@@ -183,7 +186,7 @@ final class ActivityCharts {
 				(x + x + w) / 2, y + h / 2, DARK_GRAY);
 			return;
 		}
-		int span = Math.max(1, (int) (t1 - t0));
+		double span = Math.max(1.0, t1 - t0);
 		int pixels = Math.max(1, right - left);
 		for (int row = 0; row < shown; row++) {
 			ServerDatabase.PlayerActivity player = sorted.get(row);
@@ -202,6 +205,7 @@ final class ActivityCharts {
 					continue;
 				}
 				int px = left + (int) Math.round((time - t0) * pixels / span);
+				px = Math.max(left, Math.min(right, px));
 				graphics.fill(px - 1, centerY - 1, px + 2, centerY + 2, COLORS[row % COLORS.length]);
 			}
 		}
