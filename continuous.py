@@ -65,6 +65,7 @@ DEFAULT_SCAN_DURATION = 300     # per-round time box (matscan: 5 min)
 DEFAULT_SYNC_EVERY = 300        # shared-DB sync cadence
 DEFAULT_RESCAN_EVERY = 2        # normal rounds between rescan rounds
 HIGH_RES_RESCAN_SPACING = 900   # --high-res: 15 minutes between rescans
+HIGH_RES_PLAYER_SPACING = 120   # --high-res: 2 minutes for servers with players
 RESCAN_PY_MAX = 100             # tiny port groups: ping directly, no masscan
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
@@ -112,12 +113,16 @@ RESCAN_TIERS = (
 )
 
 
-# --high-res tightens the recent tier from 2 hours to 15 minutes.  Servers
-# with players keep their 10-minute priority tier; the older tiers keep
-# their normal cadence so ancient rows don't consume the rescan budget.
+# --high-res tightens the player tier from 10 to 2 minutes and the recent
+# tier from 2 hours to 15 minutes.  The older tiers keep their normal
+# cadence so ancient rows don't consume the rescan budget.
+_HIGH_RES_OVERRIDES = {
+    "rescan-players": HIGH_RES_PLAYER_SPACING,
+    "rescan-1d": HIGH_RES_RESCAN_SPACING,
+}
 HIGH_RES_RESCAN_TIERS = tuple(
-    {**tier, "every": HIGH_RES_RESCAN_SPACING}
-    if tier["name"] == "rescan-1d" else tier
+    {**tier, "every": _HIGH_RES_OVERRIDES[tier["name"]]}
+    if tier["name"] in _HIGH_RES_OVERRIDES else tier
     for tier in RESCAN_TIERS
 )
 
@@ -1068,8 +1073,8 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                   else f" ports={','.join(str(p) for p in base_ports)}")
     rescan_note = (f"every {rescan_every} round(s)" if do_rescan else "off")
     if high_res and do_rescan:
-        rescan_note += (f" high-res ({HIGH_RES_RESCAN_SPACING // 60}m due"
-                        f" spacing)")
+        rescan_note += (f" high-res ({HIGH_RES_PLAYER_SPACING // 60}m player /"
+                        f" {HIGH_RES_RESCAN_SPACING // 60}m recent)")
     print(f"continuous mode: strategies={','.join(picker.enabled)} "
           f"rescan={rescan_note} scan_duration={scan_duration}s "
           f"rate={rate}pps wait={wait}s backend={backend}"

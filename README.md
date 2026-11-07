@@ -274,7 +274,7 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
-    python mcscan.py --high-res              # rescan-focused, 15-minute recent tier
+    python mcscan.py --high-res              # rescan-focused, 2-minute player tier
     python mcscan.py --recheck-whitelist 1.2.3.4:25565  # probe whitelist status
     python mcscan.py --rescan 1.2.3.4:25565  # re-ping, update local DB
 
@@ -337,8 +337,9 @@ with `slash0`.
 Rescan rounds revisit servers by age: a fast tier (every 10 minutes) for
 servers that currently have players online, then last pinged 2h-1d, 1-7d,
 7-30d, 30-365d, or over a year ago. `--high-res` (`--hi-res`) uses the same
-tiers but tightens the recent tier from 2 hours to 15 minutes, giving
-servers seen in the last day a high-resolution sighting history.
+tiers but tightens the player tier from 10 minutes to 2 minutes and the
+recent tier from 2 hours to 15 minutes, giving active servers a
+high-resolution sighting history.
 Older-with-25565 hosts are diluted
 into their `/20` so a rescan doesn't burst at known addresses; the
 Minecraft handshake, not the SYN sweep, dominates rescan time, so the
@@ -373,9 +374,8 @@ sets the rescan cadence (default 2, alternating normal/rescan; `1`
 rescans every round), `--no-rescan` skips rescan rounds entirely, and
 `--rounds N` stops after N rounds (useful for testing). `--high-res`
 (`--hi-res`) is the rescan-focused variant: it implies continuous mode,
-uses `--rescan-every 1`, and moves the recent tier from 2 hours to
-15 minutes. The 10-minute player tier and the older tiers keep their
-normal cadence. The
+uses `--rescan-every 1`, moves the player tier to 2 minutes and the recent
+tier to 15 minutes. The older tiers keep their normal cadence. The
 deep-port strategies need masscan and root; without them the Python
 backend skips rounds whose probe count exceeds its cap.
 
