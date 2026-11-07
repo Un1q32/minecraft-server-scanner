@@ -19,6 +19,11 @@ partial, so per-player rows dominated the database and duplicated the same
 names over and over.  Names are separated by ``\\x1f`` (a control character
 that filtered player names cannot contain).
 
+Format 5 keeps the format-4 schema.  The marker enables the 4-day activity
+retention policy and the shared server rejects sync uploads from older
+formats, so every node must update its scanner/database before syncing
+again.
+
 SQLite's ``PRAGMA user_version`` marks the format; older databases have 0
 and are migrated in place.
 """
@@ -30,7 +35,7 @@ import sqlite3
 import time
 import unicodedata
 
-CURRENT_FORMAT = 4
+CURRENT_FORMAT = 5
 BASE_FORMAT = 1
 STATE_TABLE = "server_state"
 SERVER_VIEW = "servers"
@@ -728,6 +733,8 @@ def detect_format(con: sqlite3.Connection) -> int:
         version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
     except Exception:
         version = 0
+    if version >= CURRENT_FORMAT:
+        return CURRENT_FORMAT
     if version >= 4:
         return 4
     if object_type(con, "server_history") == "table":
@@ -1028,6 +1035,12 @@ def _migrate_3_to_4(con: sqlite3.Connection) -> bool:
         raise
 
 
+def _migrate_4_to_5(con: sqlite3.Connection) -> bool:
+    """Format 5 marks the activity-retention policy; the schema is unchanged."""
+    con.execute("PRAGMA user_version=5")
+    return False
+
+
 def migrate(con: sqlite3.Connection) -> bool:
     """Upgrade the database to the current format in place."""
     changed = False
@@ -1035,8 +1048,10 @@ def migrate(con: sqlite3.Connection) -> bool:
         changed = _migrate_1_to_2(con) or changed
     if detect_format(con) < 3:
         changed = _migrate_2_to_3(con) or changed
-    if detect_format(con) < CURRENT_FORMAT:
+    if detect_format(con) < 4:
         changed = _migrate_3_to_4(con) or changed
+    if detect_format(con) < CURRENT_FORMAT:
+        changed = _migrate_4_to_5(con) or changed
     try:
         version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
     except Exception:

@@ -686,10 +686,15 @@ SQLite checkpoint can still make a main-file/WAL pair inconsistent.
 
 ## Database format
 
-`servers.db` and the shared DB use format 4, marked with
-`PRAGMA user_version=4`.
+`servers.db` and the shared DB use format 5, marked with
+`PRAGMA user_version=5`.
 
-Changes from format 3:
+Format 5 keeps the format-4 schema but enables the 4-day activity-retention
+policy. The shared server rejects `/api/sync` and `/api/history/sync`
+requests from older formats, so clients must update their scanner and
+download the new database before syncing again.
+
+Changes from format 3 (the format-4 schema):
 
 - `player_history` is gone. Each `server_history` row carries a `players`
   blob: sampled activity names separated by `\x1f`, sorted, deduplicated,
@@ -752,12 +757,14 @@ blob) and pages new shared rows back using rowid cursors stored in
 clients). The server row sync still sends first/last endpoints, so older
 clients keep working; newer clients fill in the full per-sighting history.
 
-Sync clients send `"format": 4` in `/api/sync`; a missing field means a
-format-1 client. The server converts rows at the sync boundary, so old
-clients can still sync against a format-4 server and new clients can sync
-against an old server. The conversion is per row and does not require a
-full-table pass. Old clients that upload separate player events have them
-folded into the roster blob on the matching sighting.
+Sync clients send `"format": 5` in `/api/sync` and `/api/history/sync`.
+A missing or older field is rejected with HTTP 409 and a message telling
+the client to update the scanner and run `mcscan.py --download-db`; old
+clients can no longer push history or download rows. The server still
+represents rows in the format-2 wire shape at the sync boundary, so the
+conversion remains per row. Old clients that upload separate player events
+have them folded into the roster blob on the matching sighting until they
+are upgraded.
 
 ## Minecraft mod (`minecraft-mod`)
 

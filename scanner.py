@@ -1488,9 +1488,15 @@ def _netdb_request(url, token, method="GET", payload=None, timeout=None,
         if exc.code == 429:
             raise ConnectionError("throttled: too many failed logins, wait a minute")
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:200]
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
         except Exception:
             detail = ""
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                detail = str(parsed["error"])
+        except Exception:
+            pass
         raise ConnectionError(f"HTTP {exc.code}{(': ' + detail) if detail else ''}")
 
 

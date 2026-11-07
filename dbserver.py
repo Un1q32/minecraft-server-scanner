@@ -49,7 +49,7 @@ JSON replies are zstd- or gzip-compressed when the request advertises them
 (zstd uses Python 3.14+ `compression.zstd`, else the `zstd` CLI when present;
 gzip is the fallback).
 
-* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "notes": M, "format": 3, "now": T}``
+* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "notes": M, "format": 5, "now": T}``
 * ``GET  /api/db``                   -> consistent compact SQLite snapshot
   (the whole database file, optionally zstd/gzip-compressed); the client
   derives row count/seq/format by opening it.  Used by
@@ -63,10 +63,10 @@ gzip is the fallback).
 
   Send ``"leave": true`` for an immediate clean-shutdown unregister.
 
-* ``POST /api/sync`` ``{"servers": [...], "since": <ts>, "format": 3}``
-  merges the upload, then returns rows with ``last_seen > since``. A
-  missing ``format`` means a format-1 client; rows are converted to that
-  client's schema and the reply reports ``"format": 2``::
+* ``POST /api/sync`` ``{"servers": [...], "since": <ts>, "format": 5}``
+  merges the upload, then returns rows with ``last_seen > since``. Formats
+  older than 5 are rejected with HTTP 409 so every node updates its
+  scanner/database before syncing again::
 
       {"servers": [...deltas...], "now": T, "merged": M, "total": N}
 
@@ -1292,6 +1292,23 @@ class Handler(BaseHTTPRequestHandler):
             remaining -= len(chunk)
         return b"".join(chunks)
 
+    def _require_sync_format(self, payload):
+        """Reject sync clients that predate the current DB format."""
+        try:
+            client_format = int(payload.get("format", 0) or 0)
+        except Exception:
+            client_format = 0
+        if client_format >= db_format.CURRENT_FORMAT:
+            return True
+        self._send_json(409, {
+            "error": (f"shared DB format {db_format.CURRENT_FORMAT} required; "
+                      "update the scanner and run 'mcscan.py "
+                      "--download-db' before syncing"),
+            "format": db_format.CURRENT_FORMAT,
+            "client_format": client_format,
+        })
+        return False
+
     def _require_auth(self, body):
         ip = _client_ip(self)
         if _throttled(ip):
@@ -1590,6 +1607,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(payload, dict):
             self._send_json(400, {"error": "invalid JSON"})
+            return
+        if (parsed.path in ("/api/sync", "/api/history/sync")
+                and not self._require_sync_format(payload)):
             return
         if parsed.path == "/api/continuous":
             node = str(payload.get("node", "") or "").strip()
