@@ -690,9 +690,11 @@ SQLite checkpoint can still make a main-file/WAL pair inconsistent.
 `PRAGMA user_version=5`.
 
 Format 5 keeps the format-4 schema but enables the 4-day activity-retention
-policy. The shared server rejects `/api/sync` and `/api/history/sync`
-requests from older formats, so clients must update their scanner and
-download the new database before syncing again.
+policy. Converting a format-4 database runs the activity prune as part of
+the migration (drop >4-day sightings, thin remaining points to 5/30
+minutes) and vacuums it. The shared server rejects `/api/sync` and
+`/api/history/sync` requests from older formats, so clients must update
+their scanner and download the new database before syncing again.
 
 Changes from format 3 (the format-4 schema):
 

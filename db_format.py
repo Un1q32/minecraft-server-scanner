@@ -1036,9 +1036,20 @@ def _migrate_3_to_4(con: sqlite3.Connection) -> bool:
 
 
 def _migrate_4_to_5(con: sqlite3.Connection) -> bool:
-    """Format 5 marks the activity-retention policy; the schema is unchanged."""
+    """Format 5 applies the activity-retention policy.
+
+    The schema is unchanged, but the conversion prunes sightings older than
+    4 days and thins the rest to the rescan resolution, then vacuums so the
+    one-time upgrade also reclaims the file space.
+    """
+    stats = prune_activity(con)
     con.execute("PRAGMA user_version=5")
-    return False
+    con.commit()
+    try:
+        con.execute("VACUUM")
+    except Exception:
+        pass
+    return bool(stats.get("removed_old") or stats.get("thinned"))
 
 
 def migrate(con: sqlite3.Connection) -> bool:
