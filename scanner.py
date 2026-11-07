@@ -225,6 +225,33 @@ MAX_VARINT_VALUE = 0x7FFFFFFF
 _CRACKED_CACHE_LOCK = threading.Lock()
 _WHITELIST_LOG_LOCK = threading.Lock()
 _SERVER_DB_LOCK = threading.Lock()
+HISTORY_PRUNE_INTERVAL = 3600
+_LAST_HISTORY_PRUNE = 0.0
+_HISTORY_PRUNE_LOCK = threading.Lock()
+
+
+def prune_old_history(force=False):
+    """Drop activity history beyond the retention window (hourly by default).
+
+    Seen names live on server_state.players_ever and are unaffected.
+    """
+    global _LAST_HISTORY_PRUNE
+    now = time.time()
+    if not force and now - _LAST_HISTORY_PRUNE < HISTORY_PRUNE_INTERVAL:
+        return 0
+    with _HISTORY_PRUNE_LOCK:
+        now = time.time()
+        if not force and now - _LAST_HISTORY_PRUNE < HISTORY_PRUNE_INTERVAL:
+            return 0
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                removed = db_format.prune_history(con)
+                con.commit()
+            finally:
+                con.close()
+        _LAST_HISTORY_PRUNE = time.time()
+        return removed
 _NOTES_DB_LOCK = threading.Lock()
 _SERVER_DB_INITIALIZED = set()
 
@@ -774,6 +801,10 @@ def record_server_result(result, source="scan"):
             con.close()
     if changed:
         _notify_server_db_tab()
+        try:
+            prune_old_history()
+        except Exception:
+            pass
 
 
 def record_server_results(results, source="scan"):
@@ -803,6 +834,10 @@ def record_server_results(results, source="scan"):
             con.close()
     if recorded:
         _notify_server_db_tab()
+        try:
+            prune_old_history()
+        except Exception:
+            pass
     return recorded
 
 

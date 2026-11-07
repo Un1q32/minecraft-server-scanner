@@ -125,7 +125,10 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
   players online, max players, and the sampled roster). The roster is one
   compact name blob per sighting rather than one row per player per scan,
   because the same names repeat across sightings and the sample is often
-  partial. This is what the viewers graph.
+  partial. This is what the viewers graph. Sightings older than 4 days are
+  pruned automatically, keeping the newest sighting per server so last-seen
+  dates and rescan tiers still work; the ever-seen name list
+  (`players_ever`) is kept forever.
   Older databases are converted once: their old `first_seen` becomes a
   sighting (with the every-seen names), and `last_seen` becomes another
   sighting carrying today's online count/roster. If both were the same
@@ -271,10 +274,11 @@ shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
     python mcscan.py --download-db           # replace local servers + notes DBs from the shared DB
     python mcscan.py --vacuum-db             # compact the local servers.db after index migrations
     python mcscan.py --dedupe                # merge same-host duplicate ports, then compact
+    python mcscan.py --prune-activity        # drop >4-day sightings and thin dense points
     python mcscan.py --scan 1.0.0.0/8 AS13335  # scan, print hits live, then sync
     python mcscan.py --export out.csv        # dump the full local DB as CSV
     python mcscan.py --continuous            # self-tuning forever scan
-    python mcscan.py --high-res              # rescan-focused, 2-minute player tier
+    python mcscan.py --high-res              # rescan-focused, 5-minute player tier
     python mcscan.py --recheck-whitelist 1.2.3.4:25565  # probe whitelist status
     python mcscan.py --rescan 1.2.3.4:25565  # re-ping, update local DB
 
@@ -337,8 +341,8 @@ with `slash0`.
 Rescan rounds revisit servers by age: a fast tier (every 10 minutes) for
 servers that currently have players online, then last pinged 2h-1d, 1-7d,
 7-30d, 30-365d, or over a year ago. `--high-res` (`--hi-res`) uses the same
-tiers but tightens the player tier from 10 minutes to 2 minutes and the
-recent tier from 2 hours to 15 minutes, giving active servers a
+tiers but tightens the player tier from 10 minutes to 5 minutes and the
+recent tier from 2 hours to 30 minutes, giving active servers a
 high-resolution sighting history.
 Older-with-25565 hosts are diluted
 into their `/20` so a rescan doesn't burst at known addresses; the
@@ -374,8 +378,8 @@ sets the rescan cadence (default 2, alternating normal/rescan; `1`
 rescans every round), `--no-rescan` skips rescan rounds entirely, and
 `--rounds N` stops after N rounds (useful for testing). `--high-res`
 (`--hi-res`) is the rescan-focused variant: it implies continuous mode,
-uses `--rescan-every 1`, moves the player tier to 2 minutes and the recent
-tier to 15 minutes. The older tiers keep their normal cadence. It also
+uses `--rescan-every 1`, moves the player tier to 5 minutes and the recent
+tier to 30 minutes. The older tiers keep their normal cadence. It also
 re-pings only the exact known IPs instead of diluting port-25565 hosts into
 `/20` blocks. It does not register for automatic sharding, since
 rescan-only rounds do not use the discovery scan space; pass `--shard I/N`
@@ -722,7 +726,12 @@ Existing local and server databases are converted once on startup, then
 `VACUUM`ed.
 
 Both local and shared databases have one history table: `server_history`
-(one row per sighting, including its roster blob). The viewer JSON is capped
+(one row per sighting, including its roster blob). Only the last 4 days are
+retained, except the newest sighting per server (for last-seen dates); the
+ever-seen names stay on `server_state.players_ever`.
+`mcscan.py --prune-activity` removes the >4-day rows and also thins points
+that are closer than the rescan resolution (5 minutes for sightings with
+players, 30 minutes for empty ones), then vacuums the file. The viewer JSON is capped
 at 5000 sighting points and 20000 player events while storage keeps every
 row. Upload indexes are partial (`WHERE synced=0`), so they shrink back to
 almost nothing after a sync; a partial

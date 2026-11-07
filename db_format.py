@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import unicodedata
 
 CURRENT_FORMAT = 4
@@ -323,6 +324,115 @@ def _insert_history(con, ip_port, seen_at, players_online, max_players,
         " (ip_port, seen_at, players_online, max_players, players, synced)"
         " VALUES (?, ?, ?, ?, ?, ?)",
         (ip_port, seen_at, players_online, max_players, players, synced))
+
+
+# Activity history retention and thinning.  Sighting rows power the
+# charts; players_ever lives in server_state and is never touched here.
+HISTORY_RETENTION_SECONDS = 4 * 86400
+ACTIVITY_PLAYER_GAP_SECONDS = 5 * 60
+ACTIVITY_EMPTY_GAP_SECONDS = 30 * 60
+
+
+def prune_history(con: sqlite3.Connection, max_age_seconds=HISTORY_RETENTION_SECONDS,
+                  now=None) -> int:
+    """Delete sightings older than the retention window.
+
+    The newest sighting per server is always kept, even when it is older
+    than the window, so last-seen dates survive for dormant servers and the
+    rescan tiers can still find them.  The seen-names roster
+    (``players_ever``) is stored on server_state and is not affected.
+    """
+    cutoff = (time.time() if now is None else float(now)) - max_age_seconds
+    cur = con.execute(
+        "DELETE FROM server_history"
+        " WHERE seen_at < ?"
+        "   AND EXISTS (SELECT 1 FROM server_history newer"
+        "               WHERE newer.ip_port = server_history.ip_port"
+        "                 AND newer.seen_at > server_history.seen_at)",
+        (cutoff,))
+    return max(0, int(cur.rowcount or 0))
+
+
+def prune_activity(con: sqlite3.Connection, max_age_seconds=HISTORY_RETENTION_SECONDS,
+                   player_gap_seconds=ACTIVITY_PLAYER_GAP_SECONDS,
+                   empty_gap_seconds=ACTIVITY_EMPTY_GAP_SECONDS,
+                   now=None) -> dict:
+    """Drop old sightings and thin the rest to the rescan resolution.
+
+    A sighting with sampled players is kept at most once per
+    ``player_gap_seconds``; an empty sighting once per
+    ``empty_gap_seconds``.  The first and newest sighting of every server
+    are always kept so first/last-seen and the latest activity survive.
+    ``prune_history`` keeps the newest row even when it is older than the
+    retention window.
+    Returns counts for old rows removed and rows thinned.
+    """
+    now = time.time() if now is None else float(now)
+    removed_old = prune_history(con, max_age_seconds, now)
+
+    con.execute("DROP TABLE IF EXISTS temp.history_prune_ids")
+    con.execute("CREATE TEMP TABLE history_prune_ids (rowid INTEGER PRIMARY KEY)")
+    rows = con.execute(
+        "SELECT rowid, ip_port, seen_at,"
+        " CASE WHEN players IS NOT NULL AND length(players) > 0"
+        "      THEN 1 ELSE 0 END"
+        " FROM server_history ORDER BY ip_port ASC, seen_at ASC")
+    pending = []
+    current_ip = None
+    last_kept = 0.0
+    last_was_deleted = False
+    batch = []
+
+    def flush_pending():
+        nonlocal pending, batch
+        if pending:
+            batch.extend(pending)
+            pending = []
+
+    def flush_batch():
+        nonlocal batch
+        if batch:
+            con.executemany(
+                "INSERT OR IGNORE INTO history_prune_ids(rowid) VALUES (?)",
+                ((rowid,) for rowid in batch))
+            batch = []
+
+    for rowid, ip, seen_at, has_players in rows:
+        if ip != current_ip:
+            # Keep the newest point of the previous server even when it
+            # falls inside the spacing window.
+            if last_was_deleted and pending:
+                pending.pop()
+            flush_pending()
+            flush_batch()
+            current_ip = ip
+            last_kept = float(seen_at or 0)
+            last_was_deleted = False
+            continue
+        gap = float(seen_at or 0) - last_kept
+        threshold = (player_gap_seconds if has_players
+                     else empty_gap_seconds)
+        if gap >= threshold:
+            flush_pending()
+            last_kept = float(seen_at or 0)
+            last_was_deleted = False
+        else:
+            pending.append(rowid)
+            last_was_deleted = True
+
+    if last_was_deleted and pending:
+        pending.pop()
+    flush_pending()
+    flush_batch()
+    rows.close()
+
+    con.execute(
+        "DELETE FROM server_history WHERE rowid IN"
+        " (SELECT rowid FROM history_prune_ids)")
+    thinned = int(con.execute(
+        "SELECT COUNT(*) FROM history_prune_ids").fetchone()[0] or 0)
+    con.execute("DROP TABLE IF EXISTS temp.history_prune_ids")
+    return {"removed_old": removed_old, "thinned": thinned}
 
 
 def name_list(value) -> list[str]:

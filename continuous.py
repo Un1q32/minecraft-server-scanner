@@ -64,8 +64,8 @@ SLEEP_SECS = 10                 # quiet gap between rounds (attribution)
 DEFAULT_SCAN_DURATION = 300     # per-round time box (matscan: 5 min)
 DEFAULT_SYNC_EVERY = 300        # shared-DB sync cadence
 DEFAULT_RESCAN_EVERY = 2        # normal rounds between rescan rounds
-HIGH_RES_RESCAN_SPACING = 900   # --high-res: 15 minutes between rescans
-HIGH_RES_PLAYER_SPACING = 120   # --high-res: 2 minutes for servers with players
+HIGH_RES_RESCAN_SPACING = 1800  # --high-res: 30 minutes between rescans
+HIGH_RES_PLAYER_SPACING = 300   # --high-res: 5 minutes for servers with players
 RESCAN_PY_MAX = 100             # tiny port groups: ping directly, no masscan
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
@@ -842,6 +842,10 @@ def _sync_now(url, token):
           f"history_uploaded={summary.get('history_uploaded', 0)} "
           f"history_downloaded={summary.get('history_downloaded', 0)} "
           f"player_events_uploaded={summary.get('player_events_uploaded', 0)}")
+    try:
+        scanner.prune_old_history()
+    except Exception:
+        pass
     return True
 
 

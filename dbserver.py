@@ -1088,6 +1088,14 @@ class ZstdSnapshotWriter:
             if self._stop.is_set():
                 break
             try:
+                try:
+                    removed = prune_database_history(self.db_path)
+                    if removed:
+                        print(f"web db snapshot: pruned {removed} old "
+                              f"sighting(s)", flush=True)
+                except Exception as exc:
+                    print(f"web db snapshot: history prune failed: {exc}",
+                          file=sys.stderr, flush=True)
                 source_state = db_zstd.db_state(self.db_path)
                 history_seq = self._history_seq()
                 before, after, seconds = db_zstd.snapshot_and_compress(
@@ -1111,6 +1119,36 @@ class ZstdSnapshotWriter:
                     self._last_error = msg
                     print(f"web db snapshot: {msg}", file=sys.stderr,
                           flush=True)
+
+
+HISTORY_PRUNE_INTERVAL = 3600
+_last_history_prune = 0.0
+_history_prune_lock = threading.Lock()
+
+
+def prune_database_history(db_path, force=False):
+    """Drop sighting history beyond the 4-day retention window.
+
+    Seen names live on server_state.players_ever and are untouched.  The
+    snapshot writer calls this hourly in the background.
+    """
+    global _last_history_prune
+    now = time.time()
+    if not force and now - _last_history_prune < HISTORY_PRUNE_INTERVAL:
+        return 0
+    with _history_prune_lock:
+        now = time.time()
+        if not force and now - _last_history_prune < HISTORY_PRUNE_INTERVAL:
+            return 0
+        with _db_lock:
+            con = db_connect(db_path)
+            try:
+                removed = db_format.prune_history(con)
+                con.commit()
+            finally:
+                con.close()
+        _last_history_prune = time.time()
+        return removed
 
 
 def dedupe_database(db_path):

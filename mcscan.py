@@ -18,6 +18,8 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --rescan IP:PORT ...    re-ping those servers, update local DB
   mcscan.py --scan 1.0.0.0/8 ...    scan, print hits live, then sync
   mcscan.py --export out.csv        dump the full local DB to CSV
+  mcscan.py --prune-activity        drop >4-day sightings, thin dense points,
+                                    then VACUUM to reclaim space
   mcscan.py --continuous            self-tuning forever scan (matscan-style;
                                     auto-shards against the shared DB)
   mcscan.py --high-res              rescan-focused continuous mode: rescan
@@ -41,6 +43,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import scanner
+import db_format
 
 DB_COLUMNS = (
     "ip_port", "host", "port", "motd", "players_online", "max_players",
@@ -254,6 +257,46 @@ def cmd_sync():
         print("notes sync not supported by this server; skipped.")
     if summary.get("notes_error"):
         print(f"warning: notes sync failed: {summary['notes_error']}")
+    try:
+        removed = scanner.prune_old_history()
+        if removed:
+            print(f"pruned {removed} old sighting(s) beyond the 4-day window")
+    except Exception as exc:
+        print(f"warning: could not prune old history: {exc}")
+    return 0
+
+
+def cmd_prune_activity():
+    """Prune and thin activity history, then compact servers.db."""
+    path = os.path.abspath(scanner.SERVERS_DB_FILE)
+    before = os.path.getsize(path) if os.path.isfile(path) else 0
+    try:
+        con = scanner._server_db_connect()
+    except Exception as exc:
+        print(f"error: could not open {path}: {exc}")
+        return 1
+    try:
+        try:
+            stats = db_format.prune_activity(con)
+            con.commit()
+            remaining = int(con.execute(
+                "SELECT COUNT(*) FROM server_history").fetchone()[0] or 0)
+            con.execute("VACUUM")
+        except Exception as exc:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            print(f"error: activity prune failed: {exc}")
+            return 1
+    finally:
+        con.close()
+    after = os.path.getsize(path) if os.path.isfile(path) else 0
+    print("activity prune: "
+          f"removed_old={stats.get('removed_old', 0)} "
+          f"thinned={stats.get('thinned', 0)} "
+          f"remaining={remaining} "
+          f"size={before / 1048576:.1f}MB -> {after / 1048576:.1f}MB")
     return 0
 
 
@@ -386,6 +429,10 @@ def cmd_rescan(ips):
 
     print(f"rescan complete. Responded: {len(results)}/{len(targets)}.",
           flush=True)
+    try:
+        scanner.prune_old_history()
+    except Exception:
+        pass
     return 0
 
 
@@ -780,6 +827,10 @@ def cmd_scan(args):
             print(f"sync failed (results are kept locally): {exc}")
     else:
         print("sync skipped (no URL/token in netdb.json).")
+    try:
+        scanner.prune_old_history()
+    except Exception:
+        pass
     return 0
 
 
@@ -858,6 +909,12 @@ def main(argv=None):
         help="merge same-host duplicate ports (same MOTD/version/protocol) "
              "and compact servers.db")
 
+    parser.add_argument(
+        "--prune-activity", "--prune-history", dest="prune_activity",
+        action="store_true",
+        help="delete sightings older than 4 days and thin remaining points "
+             "closer than 5 minutes (with players) or 30 minutes (empty), "
+             "then VACUUM to reclaim space; players_ever is kept")
     parser.add_argument(
         "--scan", nargs="+", metavar="TARGET", dest="targets",
         help="scan targets (same syntax as the GUI box): IPs, CIDRs, "
@@ -956,7 +1013,7 @@ def main(argv=None):
             and args.recheck_whitelist is None and args.set_whitelist is None \
             and args.rescan is None \
             and not args.download_db and not args.vacuum_db \
-            and not args.dedupe:
+            and not args.dedupe and not args.prune_activity:
         parser.print_help()
         return 2
     install_signal_handlers()
@@ -978,6 +1035,8 @@ def main(argv=None):
             rc = cmd_vacuum_db() or rc
         if args.dedupe:
             rc = cmd_dedupe() or rc
+        if args.prune_activity:
+            rc = cmd_prune_activity() or rc
         if args.sync:
             rc = cmd_sync() or rc
         if args.recheck_whitelist is not None:
