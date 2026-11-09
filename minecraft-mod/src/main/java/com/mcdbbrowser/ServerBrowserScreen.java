@@ -50,12 +50,18 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private static final long NOTICE_DURATION_MILLIS = 3000;
 
 	private static Query rememberedQuery = Query.DEFAULT;
+	private static double rememberedScrollOffset;
+	private static @Nullable String rememberedSelectedAddress;
+	private static Query rememberedPositionQuery = Query.DEFAULT;
 
 	private final Screen parent;
 	private Query query;
 	private final List<ServerDatabase.SortKey> sortKeys = new ArrayList<>(
 		List.of(new ServerDatabase.SortKey(ServerDatabase.Sort.LAST_SEEN, true)));
 	private @Nullable QueryResult result;
+	private double pendingScrollOffset;
+	private @Nullable String pendingSelectedAddress;
+	private boolean restorePositionPending;
 	private int ticksUntilSearch = -1;
 	private long queryGeneration;
 	private boolean loading;
@@ -106,6 +112,14 @@ public class ServerBrowserScreen extends DropdownScreen {
 	@Override
 	protected void init() {
 		WhitelistAutoUpdate.attach(this);
+		boolean sameQuery = this.query.equals(rememberedPositionQuery);
+		this.pendingScrollOffset = !sameQuery ? 0.0
+			: (this.list == null ? rememberedScrollOffset : this.list.scrollAmount());
+		ServerRecord previous = sameQuery && this.list != null
+			? this.list.selectedServer() : null;
+		this.pendingSelectedAddress = !sameQuery ? null
+			: (previous != null ? previous.address() : rememberedSelectedAddress);
+		this.restorePositionPending = sameQuery;
 		int paneWidth = Math.max(150, Math.min(280, this.width * 40 / 100));
 		int listWidth = Math.max(140, this.width - 2 * MARGIN - GAP - paneWidth);
 		paneWidth = this.width - 2 * MARGIN - GAP - listWidth;
@@ -138,6 +152,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		this.list.setX(MARGIN);
 		if (this.result != null) {
 			this.list.setRows(this.result.rows());
+			this.applyPendingListPosition();
 		}
 		this.activityPaneX = paneX;
 		this.activityPaneY = ACTIVITY_TOP;
@@ -320,8 +335,33 @@ public class ServerBrowserScreen extends DropdownScreen {
 					queryResult.rows().sort(ServerDatabase.comparator(this.sortKeys));
 				}
 				this.list.setRows(queryResult.rows());
+				this.applyPendingListPosition();
 			}
 		}));
+	}
+
+	private void applyPendingListPosition() {
+		if (!this.restorePositionPending || this.list == null) {
+			return;
+		}
+		this.restorePositionPending = false;
+		this.list.restorePosition(this.pendingScrollOffset, this.pendingSelectedAddress);
+	}
+
+	private void rememberListPosition() {
+		if (this.list == null) {
+			return;
+		}
+		rememberedScrollOffset = this.list.scrollAmount();
+		ServerRecord selected = this.list.selectedServer();
+		rememberedSelectedAddress = selected == null ? null : selected.address();
+		rememberedPositionQuery = this.query;
+	}
+
+	@Override
+	public void removed() {
+		this.rememberListPosition();
+		super.removed();
 	}
 
 	private static String describe(Throwable throwable) {
@@ -941,6 +981,20 @@ public class ServerBrowserScreen extends DropdownScreen {
 		@Override
 		public double scrollAmount() {
 			return this.scrollOffset;
+		}
+
+		void restorePosition(double scroll, @Nullable String selectedAddress) {
+			this.setScrollAmount(scroll);
+			int index = -1;
+			if (selectedAddress != null) {
+				for (int i = 0; i < this.rows.size(); i++) {
+					if (selectedAddress.equals(this.rows.get(i).address())) {
+						index = i;
+						break;
+					}
+				}
+			}
+			this.selectedIndex = index;
 		}
 
 		@Override
