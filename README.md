@@ -76,7 +76,8 @@ The result table has a CRACKED column. The status ping seeds a likely verdict fo
 - Supports whitelist checks during normal scans.
 - Scans the entire Ignore list for whitelist status.
 - Records whitelist probes in whitelist_scan.log.
-- Displays whitelist, not-whitelisted, unknown, authentication, timeout, and protocol-mismatch results.
+- Displays whitelisted, open, Velocity-proxy, unknown, authentication, timeout, and protocol-mismatch results.
+- Flags servers that reject direct joins because they sit behind a Velocity proxy as **Velocity** (the `velocity:player_info` login-plugin channel or a proxy kick), separate from open and whitelisted servers.
 
 ### Minecraft accounts and tokens
 
@@ -510,7 +511,7 @@ MOTD, version, whitelist and sampled player names.
     ip:1.2.3.                IP/port prefix
     version~1.21             contains
     cracked=yes              status text (matches cached/heuristic too)
-    whitelist=yes|no|unknown whitelist status
+    whitelist=yes|no|velocity|unknown whitelist status
     players>=10  max<100     numeric compare
     seen<7d  first>30d       time windows with s/m/h/d/w suffix
     names:Notch              player seen on the server

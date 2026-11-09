@@ -23,7 +23,7 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --continuous            self-tuning forever scan (matscan-style;
                                     auto-shards against the shared DB)
   mcscan.py --high-res              rescan-focused continuous mode: rescan
-                                    every round with 15-minute due spacing
+                                    every round with 5/30-minute due spacing
 
 Discovery only (status ping + player sample) unless --recheck-whitelist
 is used, which runs the same login probes as the GUI's Check Whitelist

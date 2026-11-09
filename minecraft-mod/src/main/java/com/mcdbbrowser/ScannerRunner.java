@@ -33,6 +33,8 @@ final class ScannerRunner {
 	private static final int WHITELIST_TIMEOUT_SECONDS = 300;
 	private static final int SYNC_TIMEOUT_SECONDS = 300;
 	private static final int MAX_STATUS_CHARS = 120;
+	private static final String CREDENTIALS_HINT =
+		"Set the shared DB URL and token in Settings > Shared DB Credentials";
 
 	private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(runnable -> {
 		Thread thread = new Thread(runnable, "MCDB Scanner");
@@ -117,6 +119,9 @@ final class ScannerRunner {
 
 	static CompletableFuture<Result> sync(Consumer<String> progress) {
 		return CompletableFuture.supplyAsync(() -> {
+			if (!BundledScanner.loadCredentials().configured()) {
+				return new Result(false, CREDENTIALS_HINT);
+			}
 			Result sync = runStep(List.of("--sync"), SYNC_TIMEOUT_SECONDS, progress);
 			return sync.ok() ? new Result(true, "Shared DB synced") : sync;
 		}, WORKER);
@@ -152,7 +157,12 @@ final class ScannerRunner {
 			}
 			String text = output.get(5, TimeUnit.SECONDS);
 			if (process.exitValue() != 0) {
-				return new Result(false, lastLine(text, "exit code " + process.exitValue()));
+				String message = lastLine(text, "exit code " + process.exitValue());
+				if (message.contains("netdb.json has no URL/token")
+						|| message.contains("--init-db")) {
+					message = CREDENTIALS_HINT;
+				}
+				return new Result(false, message);
 			}
 			return new Result(true, lastLine(text, "done"));
 		} catch (InterruptedException e) {
@@ -175,7 +185,12 @@ final class ScannerRunner {
 				if (line.isEmpty()) {
 					continue;
 				}
-				progress.accept(shorten(line));
+				if (line.contains("netdb.json has no URL/token")
+						|| line.contains("--init-db")) {
+					progress.accept(CREDENTIALS_HINT);
+				} else {
+					progress.accept(shorten(line));
+				}
 				tail.append(line).append('\n');
 				if (tail.length() > 4096) {
 					tail.delete(0, tail.length() - 4096);

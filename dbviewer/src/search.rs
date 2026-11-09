@@ -176,12 +176,13 @@ fn unquote(value: &str) -> String {
 }
 
 /// `whitelist=yes` and friends map to the status prefixes stored in the
-/// column ("Whitelisted: ...", "Not Whitelisted: ...", "Unknown: ..."),
-/// which plain text matching cannot express.
+/// column ("Whitelisted: ...", "Not Whitelisted: ...", "Velocity: ...",
+/// "Unknown: ..."), which plain text matching cannot express.
 fn whitelist_prefix(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "yes" | "true" | "whitelisted" => Some("Whitelisted:%"),
         "no" | "false" | "not whitelisted" => Some("Not Whitelisted:%"),
+        "velocity" | "proxy" => Some("Velocity:%"),
         "unknown" => Some("Unknown:%"),
         _ => None,
     }
@@ -381,6 +382,7 @@ mod tests {
         for (query, expected) in [
             ("whitelist=yes", "Whitelisted:%"),
             ("whitelist=no", "Not Whitelisted:%"),
+            ("whitelist=velocity", "Velocity:%"),
             ("whitelist=unknown", "Unknown:%"),
             ("whitelist:whitelisted", "Whitelisted:%"),
         ] {

@@ -941,7 +941,8 @@ public final class ServerDatabase {
 		ANY("Any", null),
 		OPEN("Open", "whitelist LIKE 'Not Whitelisted%'"),
 		WHITELISTED("Whitelisted", "whitelist LIKE 'Whitelisted%'"),
-		UNKNOWN("Unknown", "whitelist NOT LIKE 'Whitelisted%' AND whitelist NOT LIKE 'Not Whitelisted%'");
+		VELOCITY("Velocity", "whitelist LIKE 'Velocity%'"),
+		UNKNOWN("Unknown", "whitelist NOT LIKE 'Whitelisted%' AND whitelist NOT LIKE 'Not Whitelisted%' AND whitelist NOT LIKE 'Velocity%'");
 
 		private final String label;
 		private final @Nullable String condition;

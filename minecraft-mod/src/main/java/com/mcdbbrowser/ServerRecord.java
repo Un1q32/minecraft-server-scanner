@@ -64,7 +64,9 @@ public record ServerRecord(
 	}
 
 	public WhitelistState whitelistState() {
-		if (this.whitelist.startsWith("Not Whitelisted")) {
+		if (this.whitelist.startsWith("Velocity")) {
+			return WhitelistState.VELOCITY;
+		} else if (this.whitelist.startsWith("Not Whitelisted")) {
 			return WhitelistState.OPEN;
 		} else if (this.whitelist.startsWith("Whitelisted")) {
 			return WhitelistState.WHITELISTED;
@@ -108,6 +110,7 @@ public record ServerRecord(
 	public enum WhitelistState {
 		OPEN,
 		WHITELISTED,
+		VELOCITY,
 		UNKNOWN
 	}
 }

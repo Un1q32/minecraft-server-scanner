@@ -1077,6 +1077,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 					.append(switch (server.whitelistState()) {
 						case OPEN -> Component.literal("Open").withStyle(ChatFormatting.GREEN);
 						case WHITELISTED -> Component.literal("Whitelisted").withStyle(ChatFormatting.RED);
+						case VELOCITY -> Component.literal("Velocity").withStyle(ChatFormatting.AQUA);
 						case UNKNOWN -> Component.literal("Whitelist unknown").withStyle(ChatFormatting.DARK_GRAY);
 					});
 			}

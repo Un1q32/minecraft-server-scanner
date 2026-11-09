@@ -197,6 +197,7 @@ final class SearchQuery {
 		return switch (value.trim().toLowerCase(Locale.ROOT)) {
 			case "yes", "true", "whitelisted" -> "Whitelisted:%";
 			case "no", "false", "not whitelisted" -> "Not Whitelisted:%";
+			case "velocity", "proxy" -> "Velocity:%";
 			case "unknown" -> "Unknown:%";
 			default -> null;
 		};

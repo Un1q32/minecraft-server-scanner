@@ -5211,6 +5211,9 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                         reason = parse_disconnect_reason(buf, pos)
                         shown_reason = display_text(reason, 200)
                         low = reason.lower()
+                        if whitelist_velocity_message(reason):
+                            return False, append_mod_warning(
+                                f"proxy kick: {shown_reason}", mod_warning), "done"
                         if "whitelist" in low or "white list" in low or "not whitelisted" in low:
                             msg = f"WHITELISTED ({shown_reason})"
                             if (not mojang_used and not saw_encryption
@@ -5253,6 +5256,10 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                         loader, _d = detect_modloader_from_channel(channel)
                         if loader:
                             warn = append_mod_warning(warn, mod_warning_text(loader, channel))
+                        if whitelist_velocity_message(channel):
+                            msg = (f"login plugin request: {channel}; "
+                                   "direct joins are blocked by the proxy")
+                            return False, append_mod_warning(msg, warn), "done"
                         msg = f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)"
                         if not mojang_used and not saw_encryption:
                             msg += " [offline-mode]"
@@ -5303,6 +5310,18 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
             continue
         return result, message
 
+def whitelist_velocity_message(message):
+    """True for kicks/messages that identify a Velocity proxy backend."""
+    low = (message or "").lower()
+    return (
+        "velocity:player_info" in low
+        or "no data was forwarded by the proxy" in low
+        or "behind a velocity" in low
+        or "velocity proxy" in low
+        or "velocity forwarding" in low
+    )
+
+
 def whitelist_login_transient(message):
     """True for startup/maintenance/reconnect kicks, which prove nothing."""
     low = (message or "").lower()
@@ -5319,6 +5338,10 @@ def whitelist_login_showed_offline(message):
     timeouts, version mismatches, and startup/reconnect kicks never carry
     the marker."""
     if whitelist_login_transient(message):
+        return False
+    if whitelist_velocity_message(message):
+        # A Velocity backend being offline does not prove the public front is
+        # offline-mode, and direct joins are blocked by the proxy anyway.
         return False
     low = (message or "").lower()
     return ("[offline-mode" in low
@@ -5373,6 +5396,8 @@ def whitelist_result_label(result, message):
     else:
         base = "Unknown"
     detail = display_text(message or "")
+    if whitelist_velocity_message(message or detail):
+        base = "Velocity"
     if not detail:
         return base
     # Preserve modloader warnings (e.g. NeoForge) past the truncation limit.
@@ -5442,7 +5467,8 @@ def log_whitelist_probe(entry, result, message, account=None, scrub=None):
         if result is True:
             status = "WHITELIST"
         elif result is False:
-            status = "NOT_WHITELISTED"
+            status = ("VELOCITY" if whitelist_velocity_message(message)
+                      else "NOT_WHITELISTED")
         else:
             status = "UNKNOWN"
         body = redact_probe_names(minecraft_text_component_to_plain(message or ""),
