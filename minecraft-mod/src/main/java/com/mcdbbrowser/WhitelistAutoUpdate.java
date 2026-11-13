@@ -44,13 +44,19 @@ public final class WhitelistAutoUpdate {
 		}
 	}
 
-	/** The login/world connection was rejected; keep whitelist rejections only. */
+	/** The login/world connection was rejected; keep proxy/whitelist rejections. */
 	public static void onDisconnected(@Nullable Component reason) {
 		Pending attempt = takePending();
 		if (attempt == null) {
 			return;
 		}
 		String text = reason == null ? "" : reason.getString();
+		if (mentionsVelocity(text)) {
+			// A direct join to a Velocity backend is impossible. This is a
+			// real client observation, so replace an older open/unknown label.
+			evaluate(attempt.address, "Velocity: " + shorten(text), true);
+			return;
+		}
 		if (mentionsWhitelist(text)) {
 			evaluate(attempt.address, "Whitelisted: " + shorten(text));
 		}
@@ -61,11 +67,23 @@ public final class WhitelistAutoUpdate {
 		return lower.contains("whitelist") || lower.contains("white list") || lower.contains("white-list");
 	}
 
+	private static boolean mentionsVelocity(String text) {
+		String lower = text.toLowerCase(Locale.ROOT);
+		return lower.contains("velocity")
+			|| lower.contains("no data was forwarded by the proxy")
+			|| lower.contains("behind a velocity proxy");
+	}
+
 	private static void evaluate(String address, String label) {
-		// Only fill in rows that actually lack information. An explicit recheck
-		// remains authoritative when it already produced a verdict.
+		evaluate(address, label, false);
+	}
+
+	private static void evaluate(String address, String label, boolean force) {
+		// Only fill in rows that actually lack information unless this is a
+		// definitive proxy rejection. An explicit recheck otherwise remains
+		// authoritative when it already produced a verdict.
 		ServerDatabase.whitelistOf(address).whenComplete((existing, error) -> {
-			if (error != null || existing == null || !isUnknown(existing)) {
+			if (!force && (error != null || existing == null || !isUnknown(existing))) {
 				return;
 			}
 			apply(address, label);
