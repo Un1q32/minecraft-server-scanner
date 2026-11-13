@@ -804,7 +804,9 @@ def merge_row(con, row):
     # direction.  New rows still take the incoming value below.
     authoritative = db_format.source_is_cracked_verdict(
         row.get("last_source"))
-    if authoritative and incoming_newer:
+    if authoritative and (incoming_newer or row["cracked"] is None):
+        # An explicit checker may also clear a stale heuristic verdict even
+        # when its row timestamp is not newer (one-time cleanup uploads).
         cracked = row["cracked"]
     else:
         # Keep 0, 1, and the unset/NULL state.

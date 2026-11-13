@@ -1158,6 +1158,50 @@ def clean_spoofed_player_data(con: sqlite3.Connection):
         pass
 
 
+UNVERIFIED_CRACKED_CLEANUP_KEY = "unverified_cracked_cleanup_v1"
+
+
+def clear_unverified_cracked_once(con: sqlite3.Connection) -> int:
+    """Clear heuristic (non-authoritative) cracked verdicts once per database.
+
+    Status-sample heuristics used to write cracked=1 with last_source='scan'.
+    Those were never authoritative and produced false positives.  Explicit
+    cracked-checker rows (last_source='cracked') are left alone.
+    """
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS db_meta ("
+            " key TEXT PRIMARY KEY, value TEXT)")
+        if con.execute("SELECT 1 FROM db_meta WHERE key=? LIMIT 1",
+                       (UNVERIFIED_CRACKED_CLEANUP_KEY,)).fetchone():
+            return 0
+        columns = {str(row[1]) for row in
+                   con.execute("PRAGMA table_info(server_state)")}
+        if "cracked" not in columns or "last_source" not in columns:
+            return 0
+        updates = ["cracked=NULL", "last_source='cracked'"]
+        if "needs_sync" in columns:
+            updates.append("needs_sync=1")
+        if "seq" in columns:
+            updates.append(
+                "seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM server_state)")
+        cur = con.execute(
+            "UPDATE server_state SET " + ", ".join(updates)
+            + " WHERE cracked=1 AND (last_source IS NULL"
+            + " OR lower(trim(last_source)) != 'cracked')")
+        con.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value) VALUES (?, '1')",
+            (UNVERIFIED_CRACKED_CLEANUP_KEY,))
+        con.commit()
+        return max(0, int(cur.rowcount or 0))
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        return 0
+
+
 def ensure_format(con: sqlite3.Connection) -> int:
     migrate(con)
     fmt = detect_format(con)
@@ -1167,4 +1211,5 @@ def ensure_format(con: sqlite3.Connection) -> int:
         con.execute(f"PRAGMA user_version={CURRENT_FORMAT}")
         con.commit()
         clean_spoofed_player_data(con)
+        clear_unverified_cracked_once(con)
     return detect_format(con)
