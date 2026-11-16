@@ -125,6 +125,7 @@ Stdlib only -- no pip dependencies.
 """
 
 import argparse
+import contextlib
 import gzip
 import zlib
 try:
@@ -187,6 +188,8 @@ NOTES_SCHEMA = (
 )
 
 _db_lock = threading.Lock()
+DB_LOCK_WAIT = 60.0
+HANDLER_SOCKET_TIMEOUT = 300
 _continuous_lock = threading.Lock()
 _continuous_nodes = {}  # node id -> monotonic last heartbeat
 _nonce_lock = threading.Lock()
@@ -1227,8 +1230,18 @@ class PortDeduper:
                 break
 
 
+class NetDBHTTPServer(ThreadingHTTPServer):
+    """A larger listen backlog and bounded client sockets for long uptimes."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MCNetDB/1.0"
+    # Do not let a stalled upload/download hold a handler thread forever.
+    timeout = HANDLER_SOCKET_TIMEOUT
 
     def log_message(self, fmt, *args):
         try:
@@ -1274,6 +1287,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    @contextlib.contextmanager
+    def _db_guard(self, timeout=DB_LOCK_WAIT):
+        """Acquire the DB lock with a bound; send 503 instead of hanging."""
+        if not _db_lock.acquire(timeout=timeout):
+            self._send_json(503, {"error": "database busy; retry shortly"})
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _db_lock.release()
 
     def _read_body(self):
         try:
@@ -1413,7 +1438,9 @@ class Handler(BaseHTTPRequestHandler):
             # VACUUM INTO gives a consistent, compact snapshot (it reads
             # through the WAL) without the client doing row-by-row sync.
             history_seq = player_seq = 0
-            with _db_lock:
+            with self._db_guard() as locked:
+                if not locked:
+                    return
                 src = db_connect(db_path)
                 try:
                     try:
@@ -1534,7 +1561,9 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth(b""):
                 return
             if parsed.path == "/api/health":
-                with _db_lock:
+                with self._db_guard(5.0) as locked:
+                    if not locked:
+                        return
                     con = db_connect(self.server.db_path)
                     try:
                         n = con.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
@@ -1567,7 +1596,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 limit = MAX_SERVERS_PER_RESPONSE
             limit = max(1, min(limit, MAX_SERVERS_PER_RESPONSE))
-            with _db_lock:
+            with self._db_guard() as locked:
+                if not locked:
+                    return
                 con = db_connect(self.server.db_path)
                 try:
                     con.row_factory = sqlite3.Row
@@ -1642,7 +1673,9 @@ class Handler(BaseHTTPRequestHandler):
             merged = 0
             deleted = 0
             uploaded_ids = set()
-            with _db_lock:
+            with self._db_guard() as locked:
+                if not locked:
+                    return
                 con = notes_db_connect(self.server.notes_db_path)
                 try:
                     for raw_note in incoming:
@@ -1749,7 +1782,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 print(f"history sync: prune failed: {exc}",
                       file=sys.stderr, flush=True)
-            with _db_lock:
+            with self._db_guard() as locked:
+                if not locked:
+                    return
                 con = db_connect(self.server.db_path)
                 try:
                     before = con.total_changes
@@ -1885,7 +1920,9 @@ class Handler(BaseHTTPRequestHandler):
             page_limit = MAX_SERVERS_PER_RESPONSE
         page_limit = max(1, min(page_limit, MAX_SERVERS_PER_RESPONSE))
         merged = 0
-        with _db_lock:
+        with self._db_guard() as locked:
+            if not locked:
+                return
             con = db_connect(self.server.db_path)
             try:
                 for raw_row in incoming:
@@ -1978,6 +2015,14 @@ def main(argv=None):
     notes_db = (args.notes_db.strip() or
                 os.path.splitext(os.path.abspath(args.db))[0] + "-notes.sqlite3")
     init_notes_db(notes_db)
+    try:
+        removed = prune_database_history(os.path.abspath(args.db), force=True)
+        if removed:
+            print(f"startup history prune: {removed} old sighting(s)",
+                  flush=True)
+    except Exception as exc:
+        print(f"startup history prune failed: {exc}", file=sys.stderr,
+              flush=True)
     token, token_source = load_or_create_token(args.token_file, args.token or None)
     if token_source.endswith("(generated)"):
         print(f"Generated new shared token (saved to {args.token_file}, mode 0600):")
@@ -1993,7 +2038,7 @@ def main(argv=None):
     except OSError:
         pass
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = NetDBHTTPServer((args.host, args.port), Handler)
     server.db_path = os.path.abspath(args.db)
     server.notes_db_path = os.path.abspath(notes_db)
     server.shared_token = token
