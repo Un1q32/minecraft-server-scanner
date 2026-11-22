@@ -16,7 +16,8 @@ Runs two round categories forever:
 * **rescan** -- servers whose last successful ping is due, by age tier
   (2h-1d, 1-7d, 7-30d, 30-365d, >365d), plus a fast tier for servers
   that have players online right now.  One rescan round runs every
-  ``DEFAULT_RESCAN_EVERY`` rounds (``--rescan-every``).
+  ``DEFAULT_RESCAN_EVERY`` rounds (``--rescan-every``).  Servers marked
+  offline are deferred until a round with no online server due.
 
 After each normal round the strategy is scored like matscan:
 ``(new + 5*new_on_25565 + 0.1*revived) * 3600 / (seconds + 30)`` --
@@ -159,9 +160,13 @@ def _now():
 
 
 def _known_rows():
-    """Fresh rows for strategy/rescan selection. Never raises."""
+    """Fresh rows for strategy/rescan selection. Never raises.
+
+    Offline rows stay in the snapshot: rescan needs them as a last-resort
+    fallback, and revived-sighting classification must still see them.
+    """
     try:
-        return scanner.query_server_db() or []
+        return scanner.query_server_db(include_offline=True) or []
     except Exception as exc:
         print(f"warning: could not read local DB ({exc}); treating as empty")
         return []
@@ -296,17 +301,17 @@ STRATEGIES = {
 
 
 # --- rescan tiers ---------------------------------------------------------
-def rescan_targets(rows, tier):
-    """Due servers for one tier -> [(spec, port), ...].
+def _rescan_rows(rows, tier):
+    """Due rows for one tier, split into (online, offline) buckets.
 
-    Servers keep their own port (grouped by port before sweeping), and
-    padded tiers expand port-25565 hosts to their /20 -- matscan's trick
-    to avoid a tight burst at known addresses.
+    Each bucket keeps the tier's ordering; the caller decides how to use
+    the offline fallback.
     """
     now = _now()
     every = tier["every"]
     max_age = tier["max_age"]
-    picked = []
+    online = []
+    offline = []
     for row in rows:
         try:
             last = float(row.get("last_seen") or 0)
@@ -323,21 +328,28 @@ def rescan_targets(rows, tier):
                     continue
             except Exception:
                 continue
-        picked.append(row)
+        try:
+            is_online = int(row.get("online", 1) or 0) != 0
+        except Exception:
+            is_online = True
+        (online if is_online else offline).append(row)
 
-    picked.sort(key=lambda r: float(r.get("last_seen") or 0))
-    if tier.get("sort") == "random":
-        random.shuffle(picked)
-    limit = tier.get("limit")
-    if limit:
-        picked = picked[:int(limit)]
+    def order(bucket):
+        bucket.sort(key=lambda r: float(r.get("last_seen") or 0))
+        if tier.get("sort") == "random":
+            random.shuffle(bucket)
+        return bucket
 
+    return order(online), order(offline)
+
+
+def _rows_to_targets(rows, tier, pad=True):
     targets = []
-    for row in picked:
+    for row in rows:
         ip_port = str(row.get("ip_port", ""))
         ip = _host_of(ip_port)
         port = _port_of(ip_port)
-        if tier.get("padded") and port == 25565:
+        if pad and tier.get("padded") and port == 25565:
             try:
                 a, b, c, _ = (int(x) for x in ip.split("."))
             except Exception:
@@ -347,6 +359,40 @@ def rescan_targets(rows, tier):
         else:
             targets.append((ip, port))
     return targets
+
+
+def rescan_targets(rows, tier):
+    """Due servers for one tier -> [(spec, port), ...].
+
+    Online servers come first and offline servers only fill a leftover
+    limit, so an offline host never displaces a live one.  Padded tiers
+    expand port-25565 online hosts to their /20; offline fallbacks always
+    use the exact host address.
+    """
+    online, offline = _rescan_rows(rows, tier)
+    targets = _rows_to_targets(online, tier)
+    targets += _rows_to_targets(offline, tier, pad=False)
+    limit = tier.get("limit")
+    if limit:
+        targets = targets[:int(limit)]
+    return targets
+
+
+def rescan_targets_split(rows, tier):
+    """(online_targets, offline_targets) for the main rescan loop.
+
+    The loop spends its shared time budget on online targets first and only
+    falls back to offline servers when no online server is due at all.
+    """
+    online, offline = _rescan_rows(rows, tier)
+    online_targets = _rows_to_targets(online, tier)
+    offline_targets = _rows_to_targets(offline, tier, pad=False)
+    limit = tier.get("limit")
+    if limit:
+        limit = int(limit)
+        online_targets = online_targets[:limit]
+        offline_targets = offline_targets[:limit]
+    return online_targets, offline_targets
 
 
 # --- live round status ----------------------------------------------------
@@ -1227,25 +1273,51 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     _sync_now(url, token)
                     return 1
             else:
-                targets = []
-                seen_targets = set()
+                online_targets = []
+                offline_targets = []
+                seen_online = set()
+                seen_offline = set()
                 for tier in (HIGH_RES_RESCAN_TIERS if high_res
                              else RESCAN_TIERS):
                     try:
-                        picked = rescan_targets(before_rows, tier)
+                        due_online, due_offline = rescan_targets_split(
+                            before_rows, tier)
                     except Exception as exc:
                         print(f"  {tier['name']} failed: {exc}")
                         continue
-                    added = 0
-                    for spec, port in picked:
+                    added_online = 0
+                    for spec, port in due_online:
                         key = (spec, port)
-                        if key in seen_targets:
+                        if key in seen_online:
                             continue
-                        seen_targets.add(key)
-                        targets.append(key)
-                        added += 1
-                    if added:
-                        print(f"  {tier['name']}: {added} due")
+                        seen_online.add(key)
+                        online_targets.append(key)
+                        added_online += 1
+                    added_offline = 0
+                    for spec, port in due_offline:
+                        key = (spec, port)
+                        if key in seen_offline or key in seen_online:
+                            continue
+                        seen_offline.add(key)
+                        offline_targets.append(key)
+                        added_offline += 1
+                    if added_online or added_offline:
+                        note = ""
+                        if added_offline:
+                            note = f", {added_offline} offline deferred"
+                        print(f"  {tier['name']}: {added_online} due{note}")
+                # Offline servers are a last resort: only spend this round's
+                # budget on them when no online server is due at all.
+                if online_targets:
+                    targets = online_targets
+                    if offline_targets:
+                        print(f"  {len(offline_targets)} offline server(s) "
+                              f"deferred until no online rescan is due")
+                else:
+                    targets = offline_targets
+                    if targets:
+                        print(f"  no online servers due; checking "
+                              f"{len(targets)} offline server(s)")
                 if targets:
                     # Keep per-target ports: group by port for the sweep.
                     by_port = {}

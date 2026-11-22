@@ -352,6 +352,12 @@ extra hosts are nearly free. Ports with only a handful of servers are
 pinged directly instead of starting a separate masscan process, and the
 largest port group runs first.
 
+Offline servers are a last resort. They are collected as rescan
+candidates but never displace an online server: an offline host is only
+pinged (at its exact IP, without `/20` padding) when no online server is
+due in any tier for that round. If online work exists, the deferred
+offline count is printed instead.
+
 Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
 sweeps a random slice of the internet rather than all four billion
 addresses. `--ports` (e.g. `--ports 25565,25566,25600-25610`) sets the
