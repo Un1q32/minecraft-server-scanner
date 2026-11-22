@@ -471,7 +471,7 @@ Command-line options:
   `servers.db` in the current directory. A directory works too.
 - `--query EXPR` — initial search expression.
 - `--sort COL[:asc|desc]` — initial sort (`ip_port`, `motd`, `players`,
-  `version`, `cracked`, `whitelist`, `first_seen`, `last_seen`,
+  `version`, `cracked`, `whitelist`, `first_seen`, `last_seen`, `status`,
   `times_seen`). The direction defaults to ascending.
 
 You can also drag a `.db` file onto the window, or use **Open DB…** (Ctrl+O).
@@ -481,8 +481,9 @@ vertical scrollbar has its own column beside the table and the horizontal one
 its own strip below it, so both are easy to grab (and clicking anywhere on a
 bar jumps that way). The columns match
 the Python Servers tab — IP, MOTD, PLAYERS, VERSION, CRACKED, WHITELIST,
-ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN and TIMES SEEN (the Python
-tab also has a NOTES count column). Selecting a row draws its sighting
+ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN, STATUS and TIMES SEEN (the
+Python tab also has a NOTES count column). STATUS is **Online** when the
+last attempt answered and **Offline** when it timed out or was refused. Selecting a row draws its sighting
 history above the detail text: a player-count line with a tick for every
 time the server was seen, then one row per player showing when that player
 was sampled online. The initial window is the most recent 48 hours of data.
@@ -511,6 +512,7 @@ MOTD, version, whitelist and sampled player names.
     ip:1.2.3.                IP/port prefix
     version~1.21             contains
     cracked=yes              status text (matches cached/heuristic too)
+    status=online|offline    result of the last scan attempt
     whitelist=yes|no|velocity|unknown whitelist status
     players>=10  max<100     numeric compare
     seen<7d  first>30d       time windows with s/m/h/d/w suffix
@@ -687,10 +689,18 @@ SQLite checkpoint can still make a main-file/WAL pair inconsistent.
 
 ## Database format
 
-`servers.db` and the shared DB use format 5, marked with
-`PRAGMA user_version=5`.
+`servers.db` and the shared DB use format 6, marked with
+`PRAGMA user_version=6`.
 
-Format 5 keeps the format-4 schema but enables the 4-day activity-retention
+Format 6 keeps the format-5 schema and adds `server_state.online`: `1` when
+the most recent scan attempt reached the server, `0` when that attempt timed
+out, was refused, or otherwise failed. A row is only marked offline after a
+real attempt against that exact IP and port, so walking past a server in a
+masscan sweep does not turn it off; an explicit rescan, monitor cycle, or
+other handshake that fails does. Failed attempts still do not add history
+points or move `last_seen` (which remains the last successful sighting).
+
+Format 5 kept the format-4 schema but enabled the 4-day activity-retention
 policy. Converting a format-4 database runs the activity prune as part of
 the migration (drop >4-day sightings, thin remaining points to 5/30
 minutes) and vacuums it. The shared server rejects `/api/sync` and
@@ -760,7 +770,7 @@ blob) and pages new shared rows back using rowid cursors stored in
 clients). The server row sync still sends first/last endpoints, so older
 clients keep working; newer clients fill in the full per-sighting history.
 
-Sync clients send `"format": 5` in `/api/sync` and `/api/history/sync`.
+Sync clients send `"format": 6` in `/api/sync` and `/api/history/sync`.
 A missing or older field is rejected with HTTP 409 and a message telling
 the client to update the scanner and run `mcscan.py --download-db`; old
 clients can no longer push history or download rows. The server still

@@ -49,7 +49,7 @@ DB_COLUMNS = (
     "ip_port", "host", "port", "motd", "players_online", "max_players",
     "version", "protocol", "cracked", "whitelist", "first_seen",
     "last_seen", "times_seen", "last_source", "needs_sync",
-    "players_now", "players_ever",
+    "players_now", "players_ever", "online",
 )
 
 
@@ -419,7 +419,8 @@ def cmd_rescan(ips):
 
     try:
         results, _ = scanner.scan_servers_gui(
-            targets, on_result=on_result, on_progress=on_progress)
+            targets, on_result=on_result, on_progress=on_progress,
+            record_failures=True)
     except scanner.ScanStopped:
         print("rescan stopped.", flush=True)
         return 130

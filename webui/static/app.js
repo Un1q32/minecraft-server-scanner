@@ -12,6 +12,7 @@ const COLUMNS = [
   { key: "first_seen", label: "FIRST SEEN", width: 165 },
   { key: "last_seen", label: "LAST SEEN", width: 165 },
   { key: "times_seen", label: "TIMES SEEN", width: 90 },
+  { key: "status", label: "STATUS", width: 80 },
 ];
 
 const COLUMN_KEYS = COLUMNS.map((column) => column.key);
@@ -30,6 +31,8 @@ motd:"anarchy server"
 ip:1.2.3.
   IP / port prefix
 version~1.21   cracked=yes
+status:offline
+  last scan failed to connect
 players>=10    max<100
 seen<7d        first>30d
   time windows use s/m/h/d/w
@@ -117,6 +120,7 @@ function sortLabel(key) {
     times_seen: "times seen",
     online_names: "online names",
     seen_names: "seen names",
+    status: "status",
   }[key] || key;
 }
 

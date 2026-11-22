@@ -739,8 +739,8 @@ def _record_server_result_locked(con, result, source, now):
             "INSERT INTO server_state (ip_port, host, port, motd,"
             " players_online, max_players, version, protocol, cracked,"
             " needs_sync, times_seen, last_source, players_now,"
-            " players_ever)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
+            " players_ever, online)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, 1)",
             (ip_port, None, port, motd, online, maximum, version,
              protocol, cracked, source,
              _encode_player_list(sample_names if has_sample else []),
@@ -771,8 +771,8 @@ def _record_server_result_locked(con, result, source, now):
             "UPDATE server_state SET host=?, port=?, motd=?,"
             " players_online=?, max_players=?, version=?,"
             " protocol=COALESCE(?, protocol), cracked=?, needs_sync=1,"
-            " times_seen=?, last_source=?, players_now=?, players_ever=?"
-            " WHERE ip_port=?",
+            " times_seen=?, last_source=?, players_now=?, players_ever=?,"
+            " online=1 WHERE ip_port=?",
             (None, port, motd, online, maximum, version, protocol,
              keep_cracked, times_seen, source, now_json, ever_json,
              ip_port),
@@ -839,6 +839,44 @@ def record_server_results(results, source="scan"):
         except Exception:
             pass
     return recorded
+
+
+def record_server_failures(ip_ports):
+    """Mark known servers offline after a failed scan attempt.
+
+    Only existing rows are touched: scanning arbitrary internet addresses
+    must not create rows for every timeout.  Returns the number of rows
+    whose online flag actually changed.
+    """
+    _ensure_server_db()
+    ids = []
+    seen = set()
+    for raw in ip_ports or []:
+        ip = strict_ip_port(raw)
+        if not ip or ip in seen:
+            continue
+        seen.add(ip)
+        ids.append(ip)
+    if not ids:
+        return 0
+    changed = 0
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                cur = con.execute(
+                    f"UPDATE server_state SET online=0, needs_sync=1"
+                    f" WHERE ip_port IN ({marks}) AND online != 0", chunk)
+                changed += max(0, int(cur.rowcount or 0))
+            if changed:
+                con.commit()
+        finally:
+            con.close()
+    if changed:
+        _notify_server_db_tab()
+    return changed
 
 
 def update_server_cracked(ip_port, cracked_label, message=""):
@@ -1851,7 +1889,7 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 cur = con.execute("SELECT motd, players_online, max_players, version,"
                                   " protocol, cracked, whitelist, first_seen, last_seen,"
                                   " times_seen, last_source, needs_sync, players_now,"
-                                  " players_ever FROM servers WHERE ip_port=?",
+                                  " players_ever, online FROM servers WHERE ip_port=?",
                                   (ip_port,))
                 old = cur.fetchone()
                 if old is None:
@@ -1859,8 +1897,8 @@ def netdb_merge_remote(servers, upload_watermark=None):
                         "INSERT OR IGNORE INTO server_state (ip_port, host, port,"
                         " motd, players_online, max_players, version, protocol,"
                         " cracked, whitelist, times_seen, last_source,"
-                        " needs_sync, players_now, players_ever)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                        " needs_sync, players_now, players_ever, online)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                         (ip_port, None, port,
                          sanitize_motd(raw.get("motd", "")),
                          r_online, r_maximum,
@@ -1873,7 +1911,8 @@ def netdb_merge_remote(servers, upload_watermark=None):
                          max(1, r_times),
                          str(raw.get("last_source", "") or "netdb"),
                          _encode_player_list(r_now),
-                         _encode_player_list(r_ever)))
+                         _encode_player_list(r_ever),
+                         1 if raw.get("online", 1) else 0))
                     db_format.insert_range(
                         con, ip_port, r_first, r_last, r_online, r_maximum,
                         r_now, (), synced=1)
@@ -1888,7 +1927,8 @@ def netdb_merge_remote(servers, upload_watermark=None):
                         updated += 1
                     continue
                 (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
-                 o_first, o_last, o_times, o_src, o_dirty, o_now, o_ever) = old
+                 o_first, o_last, o_times, o_src, o_dirty, o_now, o_ever,
+                 o_online) = old
                 try:
                     o_first = float(o_first or 0)
                 except Exception:
@@ -1930,6 +1970,16 @@ def netdb_merge_remote(servers, upload_watermark=None):
                 else:
                     whitelist = o_wl or str(raw.get("whitelist", "") or "")
                 times_seen = max(o_times, r_times) + (1 if remote_newer else 0)
+                if "online" in raw:
+                    online_state = 1 if raw.get("online") else 0
+                else:
+                    # A format-5 server does not send the flag yet; keep the
+                    # local verdict instead of flipping every row online.
+                    try:
+                        online_state = (1 if o_online is None
+                                        else (0 if int(o_online) == 0 else 1))
+                    except Exception:
+                        online_state = 1
                 # Player lists: current roster follows the newer sighting; the
                 # ever-seen list is the union of both sides (capped).
                 now_names = r_now if remote_newer else _decode_player_list(o_now)
@@ -1950,11 +2000,11 @@ def netdb_merge_remote(servers, upload_watermark=None):
                     " players_online=?, max_players=?, version=?,"
                     " protocol=COALESCE(?, protocol), cracked=?, whitelist=?,"
                     " times_seen=?, last_source=?, needs_sync=?,"
-                    " players_now=?, players_ever=? WHERE ip_port=?",
+                    " players_now=?, players_ever=?, online=? WHERE ip_port=?",
                     (None, port, motd, online, maximum, version, protocol,
                      cracked, whitelist, times_seen, src, still_dirty,
                      _encode_player_list(now_names),
-                     _encode_player_list(ever_names), ip_port))
+                     _encode_player_list(ever_names), online_state, ip_port))
                 db_format.insert_range(
                     con, ip_port, r_first, r_last, r_online, r_maximum,
                     r_now, (), synced=1)
@@ -2502,8 +2552,8 @@ def netdb_replace_all(rows):
                     "INSERT OR REPLACE INTO server_state (ip_port, host, port,"
                     " motd, players_online, max_players, version, protocol,"
                     " cracked, whitelist, times_seen, last_source, needs_sync,"
-                    " players_now, players_ever)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    " players_now, players_ever, online)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                     (ip_port, None, port,
                      sanitize_motd(raw.get("motd", ""))[:MAX_MOTD_CHARS],
                      online, maximum,
@@ -2514,7 +2564,8 @@ def netdb_replace_all(rows):
                      times_seen,
                      str(raw.get("last_source", "") or "netdb")[:MAX_SOURCE_CHARS],
                      _encode_player_list(now_names),
-                     _encode_player_list(ever_names)),
+                     _encode_player_list(ever_names),
+                     1 if raw.get("online", 1) else 0),
                 )
                 db_format.insert_range(con, ip_port, first_seen, last_seen,
                                        online, maximum, now_names, (),
@@ -8096,7 +8147,7 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
 
 # GUI-friendly scan with streaming callbacks
 def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, login_probe=False,
-                     stop_event=None):
+                     stop_event=None, record_failures=False):
     filtered = [s for s in servers if not is_ignored(s)]
     results, online_lines = [], []
     total, done = len(filtered), 0
@@ -8130,14 +8181,22 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
             done_set, pending = wait(pending, timeout=0.25,
                                      return_when=FIRST_COMPLETED)
             fetched = []
+            failed = []
             for fut in done_set:
                 r = fut.result()
                 done += 1
                 fetched.append(r)
+                if r is None and record_failures:
+                    failed.append(futures[fut])
             completed = [r for r in fetched if r]
             if completed:
                 try:
                     record_server_results(completed, source="scan")
+                except Exception:
+                    pass
+            if failed:
+                try:
+                    record_server_failures(failed)
                 except Exception:
                     pass
 
@@ -10366,7 +10425,8 @@ class NetworkScanTab(QtBaseMixin, QWidget):
                             on_start=on_start,
                             on_result=on_result,
                             on_progress=on_progress,
-                            stop_event=stop_event
+                            stop_event=stop_event,
+                            record_failures=True,
                         )
                         if not alive():
                             go_idle()
@@ -10970,7 +11030,7 @@ class ServersTab(QWidget, QtBaseMixin):
 
     COLS = ("ip", "motd", "players", "version", "cracked", "whitelist",
             "online_names", "seen_names", "notes", "first_seen", "last_seen",
-            "times_seen")
+            "status", "times_seen")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -11053,7 +11113,8 @@ class ServersTab(QWidget, QtBaseMixin):
         widths = {"ip": 170, "motd": 260, "players": 90, "version": 120,
                   "cracked": 75, "whitelist": 180, "online_names": 200,
                   "seen_names": 200, "notes": 70,
-                  "first_seen": 165, "last_seen": 165, "times_seen": 90}
+                  "first_seen": 165, "last_seen": 165, "status": 80,
+                  "times_seen": 90}
         for i, c in enumerate(self.COLS):
             self.tree.setColumnWidth(i, widths.get(c, 150))
         self.tree.setSortingEnabled(True)
@@ -11070,6 +11131,7 @@ class ServersTab(QWidget, QtBaseMixin):
                 "notes": lambda v: int(str(v)) if str(v).isdigit() else 0,
                 "first_seen": _timestamp_display_key,
                 "last_seen": _timestamp_display_key,
+                "status": lambda v: 1 if str(v).lower() == "online" else 0,
                 "times_seen": lambda v: int(str(v)) if str(v).isdigit() else -1,
             })
         except Exception:
@@ -11200,6 +11262,7 @@ class ServersTab(QWidget, QtBaseMixin):
                 str(note_counts.get(e.get("ip_port", ""), "") or ""),
                 format_db_timestamp(e.get("first_seen", 0)),
                 format_db_timestamp(e.get("last_seen", 0)),
+                "Online" if int(e.get("online", 1) or 0) else "Offline",
                 display_text(e.get("times_seen", 1), 20),
             ))
         try:
@@ -11443,7 +11506,8 @@ class ServersTab(QWidget, QtBaseMixin):
 
         def work():
             try:
-                results, _ = scan_servers_gui(sel, on_progress=on_progress)
+                results, _ = scan_servers_gui(
+                    sel, on_progress=on_progress, record_failures=True)
                 msg = f"Rescan complete. Responded: {len(results)}."
                 self.after(0, lambda msg=msg: self._op_done(msg))
             except Exception as exc:
@@ -11882,7 +11946,7 @@ class ServerMonitorTab(QtBaseMixin, QWidget):
             return
         self.after(0, lambda: self._set_status(f"Pinging {len(ips)} server(s)..."))
         cycle_ts = time.time()
-        results, _ = scan_servers_gui(ips)
+        results, _ = scan_servers_gui(ips, record_failures=True)
         processed = set()
 
         if results:
@@ -12727,6 +12791,7 @@ class ShodanTab(QWidget, QtBaseMixin):
                     on_start=on_start,
                     on_result=on_result,
                     on_progress=on_progress,
+                    record_failures=True,
                 )
                 self.after(
                     0,
@@ -13398,7 +13463,8 @@ class JSONTab(QWidget, QtBaseMixin):
                     items,
                     on_start=on_start,
                     on_result=on_result,
-                    on_progress=on_progress
+                    on_progress=on_progress,
+                    record_failures=True,
                 )
                 self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
                 if only_cracked:

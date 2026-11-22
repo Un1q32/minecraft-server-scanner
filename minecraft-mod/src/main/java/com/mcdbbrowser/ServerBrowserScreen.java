@@ -1121,6 +1121,9 @@ public class ServerBrowserScreen extends DropdownScreen {
 				ServerRecord server = this.server;
 				this.playerCount = server.playersOnline() + "/" + server.maxPlayers();
 				this.motd = Component.literal(String.join(" ", server.motd().strip().lines().map(String::strip).toList()));
+				Component onlineTag = server.online() ? Component.empty()
+					: Component.empty().append(SEPARATOR)
+						.append(Component.literal("Offline").withStyle(ChatFormatting.DARK_RED));
 				this.details = Component.empty()
 					.append(Component.literal(font.plainSubstrByWidth(ChatFormatting.stripFormatting(server.version()), MAX_VERSION_WIDTH)).withStyle(ChatFormatting.GRAY))
 					.append(SEPARATOR)
@@ -1133,7 +1136,8 @@ public class ServerBrowserScreen extends DropdownScreen {
 						case WHITELISTED -> Component.literal("Whitelisted").withStyle(ChatFormatting.RED);
 						case VELOCITY -> Component.literal("Velocity").withStyle(ChatFormatting.AQUA);
 						case UNKNOWN -> Component.literal("Whitelist unknown").withStyle(ChatFormatting.DARK_GRAY);
-					});
+					})
+					.append(onlineTag);
 			}
 
 			@Override

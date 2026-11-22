@@ -134,6 +134,7 @@ fn selftest(args: &[String]) {
         ("first_seen", false),
         ("last_seen", true),
         ("times_seen", true),
+        ("status", true),
     ] {
         match db::load(&path, "") {
             Ok(mut loaded) => {

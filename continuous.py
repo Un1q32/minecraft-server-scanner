@@ -593,14 +593,21 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
         sweep_deadline = time.monotonic() + max(1, scan_duration)
         futures = set()
         futures_lock = threading.Lock()
+        failures = []
+        failures_lock = threading.Lock()
 
         def handshake(ip_port):
             if scanner.shutdown_requested():
                 return
             try:
-                emit(scanner.ping_server(ip_port))
+                result = scanner.ping_server(ip_port)
             except Exception:
-                pass
+                result = None
+            if result:
+                emit(result)
+                return
+            with failures_lock:
+                failures.append(ip_port)
 
         def on_open(ip_port):
             if (scanner.shutdown_requested() or stop_event.is_set()
@@ -660,6 +667,14 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 pool.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
+            # Open ports whose status handshake timed out/refused are still
+            # real scan attempts; keep their online flag accurate in one
+            # batched write instead of one statement per failure.
+            if failures:
+                try:
+                    scanner.record_server_failures(failures)
+                except Exception:
+                    pass
         return results
 
     # Python backend: expand and handshake.
@@ -703,7 +718,8 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
 
     try:
         scanner.scan_servers_gui(targets, on_result=on_result,
-                                 stop_event=_RoundDeadline())
+                                 stop_event=_RoundDeadline(),
+                                 record_failures=True)
     except scanner.ScanStopped:
         pass
     return results

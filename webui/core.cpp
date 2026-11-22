@@ -41,6 +41,7 @@ struct Row {
     double last_seen = 0.0;
     long long times_seen = 0;
     long long protocol = 0;
+    long long online = 1;
 };
 
 sqlite3 *g_db = nullptr;
@@ -482,6 +483,7 @@ SortKey sort_key(const Row &row, const std::string &column) {
     if (column == "seen_names") return lower_text(names_of(row.names_ever));
     if (column == "first_seen") return minute_key(row.first_seen);
     if (column == "times_seen") return row.times_seen;
+    if (column == "status") return row.online;
     return minute_key(row.last_seen);
 }
 
@@ -490,7 +492,7 @@ bool valid_sort_column(const std::string &column) {
            column == "version" || column == "cracked" || column == "whitelist" ||
            column == "online_names" || column == "seen_names" ||
            column == "first_seen" || column == "last_seen" ||
-           column == "times_seen";
+           column == "times_seen" || column == "status";
 }
 
 void sort_by_column(const std::string &column, bool desc) {
@@ -621,6 +623,13 @@ const char *text_column(const std::string &field) {
     if (field == "whitelist" || field == "wl") return "whitelist";
     if (field == "source") return "last_source";
     return nullptr;
+}
+
+long long online_value(const std::string &value) {
+    std::string v = lower_text(value);
+    if (v == "online" || v == "yes" || v == "true" || v == "1") return 1;
+    if (v == "offline" || v == "no" || v == "false" || v == "0") return 0;
+    return -1;
 }
 
 const char *numeric_column(const std::string &field) {
@@ -829,6 +838,15 @@ bool compile_search(const std::string &input, std::string &where_sql,
                 push_text(params, pattern);
                 clause = std::string("(") + col + (negated ? " NOT LIKE ? ESCAPE '\\'" : " LIKE ? ESCAPE '\\'") + ")";
             }
+        } else if (field == "status") {
+            long long want = online_value(value);
+            if (want < 0) {
+                error = "status needs online/offline (got \"" + value + "\")";
+                return false;
+            }
+            bool negated = op == "!=" || op == "!~";
+            push_int(params, want);
+            clause = std::string("(online ") + (negated ? "!= ?)" : "= ?)");
         } else if (const char *col = numeric_column(field)) {
             bool ok = false;
             clause = cmp_sql(op, col, value, params, ok);
@@ -1158,6 +1176,7 @@ std::string detail_text(const Row &row) {
     out += "Cracked:     " + (cracked.empty() ? std::string("-") : cracked) + "\n";
     std::string whitelist = clean_multiline(row.whitelist);
     out += "Whitelist:   " + (whitelist.empty() ? std::string("-") : whitelist) + "\n";
+    out += "Status:      " + std::string(row.online ? "Online" : "Offline") + "\n";
     out += "First seen:  " + timestamp_text(row.first_seen) + "\n";
     out += "Last seen:   " + timestamp_text(row.last_seen) + "\n\n";
     out += "Online now:  " + names_of(row.names_now) + "\n";
@@ -1232,7 +1251,8 @@ int mc_apply(const char *query) {
         col_or("whitelist", "''") + ", " + col_or("players_now", "'[]'") + ", " +
         col_or("players_ever", "'[]'") + ", " + col_or("first_seen", "0") + ", " +
         col_or("last_seen", "0") + ", " + col_or("times_seen", "0") + ", " +
-        col_or("protocol", "0") + " FROM servers " + where_sql +
+        col_or("online", "1") + ", " + col_or("protocol", "0") +
+        " FROM servers " + where_sql +
         " ORDER BY last_seen DESC";
 
     sqlite3_stmt *stmt = nullptr;
@@ -1268,7 +1288,8 @@ int mc_apply(const char *query) {
         row.first_seen = sqlite3_column_double(stmt, 9);
         row.last_seen = sqlite3_column_double(stmt, 10);
         row.times_seen = sqlite3_column_int64(stmt, 11);
-        row.protocol = sqlite3_column_int64(stmt, 12);
+        row.online = sqlite3_column_int64(stmt, 12);
+        row.protocol = sqlite3_column_int64(stmt, 13);
         rows.push_back(std::move(row));
     }
     if (step != SQLITE_DONE) {
@@ -1357,6 +1378,7 @@ const char *mc_cell(int index, int column) {
     case 8: g_scratch = timestamp_text(row.first_seen); break;
     case 9: g_scratch = timestamp_text(row.last_seen); break;
     case 10: g_scratch = std::to_string(row.times_seen); break;
+    case 11: g_scratch = row.online ? "Online" : "Offline"; break;
     default: break;
     }
     return g_scratch.c_str();

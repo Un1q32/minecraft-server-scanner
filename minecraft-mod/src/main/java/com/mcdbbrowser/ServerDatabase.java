@@ -65,12 +65,13 @@ public final class ServerDatabase {
 		"port",
 		"substr(last_source, 1, 300) AS last_source",
 		"substr(players_now, 1, 16384) AS players_now",
-		"substr(players_ever, 1, 65536) AS players_ever"
+		"substr(players_ever, 1, 65536) AS players_ever",
+		"online"
 	);
 	private static final String SERVERS_FROM = " FROM server_state s";
 	/** Every object the file may contain, compared against sqlite_schema exactly. See {@link #validateSchema}. */
 	private static final Set<SchemaObject> EXPECTED_SCHEMA = Set.of(
-		new SchemaObject("table", "server_state", "server_state", "CREATE TABLE \"server_state\" (ip_port TEXT PRIMARY KEY, host TEXT DEFAULT '', port INTEGER DEFAULT 25565, motd TEXT DEFAULT '', players_online INTEGER DEFAULT 0, max_players INTEGER DEFAULT 0, version TEXT DEFAULT '', protocol INTEGER, cracked INTEGER DEFAULT 0, whitelist TEXT DEFAULT '', times_seen INTEGER DEFAULT 1, last_source TEXT DEFAULT '', seq INTEGER DEFAULT 0, players_now TEXT, players_ever TEXT)"),
+		new SchemaObject("table", "server_state", "server_state", "CREATE TABLE \"server_state\" (ip_port TEXT PRIMARY KEY, host TEXT DEFAULT '', port INTEGER DEFAULT 25565, motd TEXT DEFAULT '', players_online INTEGER DEFAULT 0, max_players INTEGER DEFAULT 0, version TEXT DEFAULT '', protocol INTEGER, cracked INTEGER DEFAULT 0, whitelist TEXT DEFAULT '', times_seen INTEGER DEFAULT 1, last_source TEXT DEFAULT '', seq INTEGER DEFAULT 0, players_now TEXT, players_ever TEXT, online INTEGER DEFAULT 1)"),
 		new SchemaObject("index", "sqlite_autoindex_server_state_1", "server_state", null),
 		new SchemaObject("table", "server_history", "server_history", "CREATE TABLE server_history ( ip_port TEXT NOT NULL, seen_at REAL NOT NULL, players_online INTEGER, max_players INTEGER, synced INTEGER DEFAULT 0, players TEXT, PRIMARY KEY (ip_port, seen_at))"),
 		new SchemaObject("index", "sqlite_autoindex_server_history_1", "server_history", null),

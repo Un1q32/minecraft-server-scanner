@@ -35,7 +35,7 @@ import sqlite3
 import time
 import unicodedata
 
-CURRENT_FORMAT = 5
+CURRENT_FORMAT = 6
 BASE_FORMAT = 1
 STATE_TABLE = "server_state"
 SERVER_VIEW = "servers"
@@ -56,7 +56,8 @@ SERVER_STATE_SCHEMA = (
     " last_source TEXT DEFAULT '',"
     " needs_sync INTEGER DEFAULT 1,"
     " players_now TEXT,"
-    " players_ever TEXT"
+    " players_ever TEXT,"
+    " online INTEGER DEFAULT 1"
     ")"
 )
 
@@ -735,6 +736,8 @@ def detect_format(con: sqlite3.Connection) -> int:
         version = 0
     if version >= CURRENT_FORMAT:
         return CURRENT_FORMAT
+    if version >= 5:
+        return 5
     if version >= 4:
         return 4
     if object_type(con, "server_history") == "table":
@@ -1052,6 +1055,18 @@ def _migrate_4_to_5(con: sqlite3.Connection) -> bool:
     return bool(stats.get("removed_old") or stats.get("thinned"))
 
 
+def _migrate_5_to_6(con: sqlite3.Connection) -> bool:
+    """Format 6 adds the last-scan online flag."""
+    columns = {str(row[1]) for row in
+               con.execute("PRAGMA table_info(server_state)")}
+    if "online" not in columns:
+        con.execute("ALTER TABLE server_state"
+                    " ADD COLUMN online INTEGER DEFAULT 1")
+    con.execute("PRAGMA user_version=6")
+    con.commit()
+    return True
+
+
 def migrate(con: sqlite3.Connection) -> bool:
     """Upgrade the database to the current format in place."""
     changed = False
@@ -1061,8 +1076,10 @@ def migrate(con: sqlite3.Connection) -> bool:
         changed = _migrate_2_to_3(con) or changed
     if detect_format(con) < 4:
         changed = _migrate_3_to_4(con) or changed
-    if detect_format(con) < CURRENT_FORMAT:
+    if detect_format(con) < 5:
         changed = _migrate_4_to_5(con) or changed
+    if detect_format(con) < CURRENT_FORMAT:
+        changed = _migrate_5_to_6(con) or changed
     try:
         version = int(con.execute("PRAGMA user_version").fetchone()[0] or 0)
     except Exception:

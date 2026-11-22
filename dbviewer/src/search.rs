@@ -113,6 +113,14 @@ fn cracked_value(value: &str) -> Option<i64> {
     }
 }
 
+fn status_value(value: &str) -> Option<i64> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "online" | "yes" | "true" | "1" => Some(1),
+        "offline" | "no" | "false" | "0" => Some(0),
+        _ => None,
+    }
+}
+
 fn like_param(value: &str) -> String {
     // Escape LIKE wildcards so a search for "100%" is literal.
     let mut s = String::with_capacity(value.len() + 2);
@@ -302,6 +310,16 @@ pub fn compile(input: &str) -> Result<(String, Vec<Value>), String> {
                         format!("({col} {} ? ESCAPE '\\')",
                                 if negated { "NOT LIKE" } else { "LIKE" })
                     }
+                } else if f == "status" {
+                    let negated = matches!(op, "!=" | "!~");
+                    match status_value(&value) {
+                        Some(want) => {
+                            params.push(Value::Integer(want));
+                            format!("(online {} ?)", if negated { "!=" } else { "=" })
+                        }
+                        None => return Err(format!(
+                            "status needs online/offline (got {value:?})")),
+                    }
                 } else if let Some(col) = numeric_column(f) {
                     match cmp_sql(op, col, &value, &mut params) {
                         Some(c) => c,
@@ -324,7 +342,7 @@ pub fn compile(input: &str) -> Result<(String, Vec<Value>), String> {
                 } else {
                     return Err(format!(
                         "unknown field {f:?} (ip, motd, version, cracked, whitelist, \
-                         source, players, max, seen, first, times, protocol, names)"
+                         source, players, max, seen, first, times, protocol, names, status)"
                     ));
                 }
             }
@@ -459,5 +477,16 @@ mod tests {
             Value::Integer(v) => assert_eq!(*v, 0),
             _ => panic!("expected integer param"),
         }
+    }
+
+    #[test]
+    fn status_filters_the_last_scan_result() {
+        let (sql, params) = compile("status:offline").unwrap();
+        assert!(sql.contains("online = ?"));
+        match &params[0] {
+            Value::Integer(v) => assert_eq!(*v, 0),
+            _ => panic!("expected integer param"),
+        }
+        assert!(compile("status:maybe").is_err());
     }
 }

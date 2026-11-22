@@ -183,7 +183,7 @@ use std::time::Instant;
 use crate::job::JobHandle;
 
 /// Column order, matching the Python Servers tab.
-pub const COLUMNS: [&str; 11] = [
+pub const COLUMNS: [&str; 12] = [
     "ip_port",
     "motd",
     "players",
@@ -195,6 +195,7 @@ pub const COLUMNS: [&str; 11] = [
     "first_seen",
     "last_seen",
     "times_seen",
+    "status",
 ];
 
 #[derive(Default)]
@@ -671,6 +672,7 @@ impl qobject::ViewerModel {
             8 => crate::db::timestamp_text(row.first_seen),
             9 => crate::db::timestamp_text(row.last_seen),
             10 => row.times_seen.to_string(),
+            11 => if row.online != 0 { "Online".to_string() } else { "Offline".to_string() },
             _ => return QVariant::default(),
         };
         QVariant::from(&qs(&text))

@@ -106,6 +106,7 @@ fn sort_key(row: &Row, column: &str) -> SortKey {
         "seen_names" => SortKey::Text(crate::db::names_of(&row.names_ever).to_lowercase()),
         "first_seen" => SortKey::Time(minute_key(row.first_seen)),
         "times_seen" => SortKey::Number(row.times_seen),
+        "status" => SortKey::Number(row.online),
         _ => SortKey::Time(minute_key(row.last_seen)),
     }
 }
@@ -155,6 +156,7 @@ mod tests {
             first_seen: 0.0,
             last_seen,
             times_seen: 0,
+            online: 1,
         }
     }
 

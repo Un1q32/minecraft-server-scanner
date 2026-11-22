@@ -49,7 +49,7 @@ JSON replies are zstd- or gzip-compressed when the request advertises them
 (zstd uses Python 3.14+ `compression.zstd`, else the `zstd` CLI when present;
 gzip is the fallback).
 
-* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "notes": M, "format": 5, "now": T}``
+* ``GET  /api/health``               -> ``{"ok": true, "servers": N, "notes": M, "format": 6, "now": T}``
 * ``GET  /api/db``                   -> consistent compact SQLite snapshot
   (the whole database file, optionally zstd/gzip-compressed); the client
   derives row count/seq/format by opening it.  Used by
@@ -63,9 +63,9 @@ gzip is the fallback).
 
   Send ``"leave": true`` for an immediate clean-shutdown unregister.
 
-* ``POST /api/sync`` ``{"servers": [...], "since": <ts>, "format": 5}``
+* ``POST /api/sync`` ``{"servers": [...], "since": <ts>, "format": 6}``
   merges the upload, then returns rows with ``last_seen > since``. Formats
-  older than 5 are rejected with HTTP 409 so every node updates its
+  older than 6 are rejected with HTTP 409 so every node updates its
   scanner/database before syncing again::
 
       {"servers": [...deltas...], "now": T, "merged": M, "total": N}
@@ -737,6 +737,7 @@ def sanitize_row(raw):
         "last_source": _clamp_str(raw.get("last_source", ""), 64),
         "players_now": _clean_player_list(raw.get("players_now")),
         "players_ever": _clean_player_list(raw.get("players_ever")),
+        "online": 1 if raw.get("online", 1) else 0,
     }
 
 
@@ -745,7 +746,7 @@ def merge_row(con, row):
     cur = con.execute(
         "SELECT motd, players_online, max_players, version, protocol,"
         " cracked, whitelist, first_seen, last_seen, times_seen, last_source,"
-        " players_now, players_ever"
+        " players_now, players_ever, online"
         " FROM servers WHERE ip_port=?", (row["ip_port"],))
     old = cur.fetchone()
     if old is None:
@@ -753,8 +754,8 @@ def merge_row(con, row):
             "INSERT INTO server_state (ip_port, host, port, motd,"
             " players_online, max_players, version, protocol, cracked,"
             " whitelist, times_seen, last_source, players_now, players_ever,"
-            " seq)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " online, seq)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
             " (SELECT COALESCE(MAX(seq), 0) + 1 FROM server_state))",
             (row["ip_port"], None, row["port"], row["motd"],
              row["players_online"], row["max_players"], row["version"],
@@ -762,7 +763,7 @@ def merge_row(con, row):
              row["cracked"] if row["last_source"] == "cracked" else None,
              row["whitelist"],
              row["times_seen"], row["last_source"],
-             row["players_now"], row["players_ever"]))
+             row["players_now"], row["players_ever"], row["online"]))
         fallback_now = _utcnow()
         db_format.insert_range(
             con, row["ip_port"],
@@ -772,7 +773,7 @@ def merge_row(con, row):
             db_format.name_list(row["players_now"]), (), synced=1)
         return True
     (o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
-     o_first, o_last, o_times, o_src, o_now, o_ever) = old
+     o_first, o_last, o_times, o_src, o_now, o_ever, o_online) = old
     try:
         o_first = float(o_first or 0)
     except Exception:
@@ -830,20 +831,21 @@ def merge_row(con, row):
     now = row["players_now"] if incoming_newer else (o_now or None)
     ever = _merge_player_lists(
         _merge_player_lists(o_ever, o_now), _merge_player_lists(row["players_ever"], row["players_now"]))
+    online_state = row["online"]
     if (motd, online, maximum, version, protocol, cracked, whitelist,
-            first_seen, last_seen, times_seen, src, now, ever) == (
+            first_seen, last_seen, times_seen, src, now, ever, online_state) == (
             o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,
-            o_first, o_last, o_times, o_src, o_now, o_ever):
+            o_first, o_last, o_times, o_src, o_now, o_ever, o_online):
         return False
     con.execute(
         "UPDATE server_state SET host=?, port=?, motd=?, players_online=?,"
         " max_players=?, version=?, protocol=?, cracked=?, whitelist=?,"
         " times_seen=?, last_source=?, players_now=?, players_ever=?,"
-        " seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM server_state)"
+        " online=?, seq=(SELECT COALESCE(MAX(seq), 0) + 1 FROM server_state)"
         " WHERE ip_port=?",
         (None, row["port"], motd, online, maximum, version, protocol,
          cracked, whitelist, times_seen, src,
-         now, ever, row["ip_port"]))
+         now, ever, online_state, row["ip_port"]))
     db_format.insert_range(
         con, row["ip_port"], row["first_seen"], row["last_seen"],
         row["players_online"], row["max_players"],

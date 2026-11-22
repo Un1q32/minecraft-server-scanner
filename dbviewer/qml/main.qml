@@ -117,6 +117,7 @@ ApplicationWindow {
         ListElement { key: "first_seen";  display: "FIRST SEEN" }
         ListElement { key: "last_seen";   display: "LAST SEEN" }
         ListElement { key: "times_seen";  display: "TIMES SEEN" }
+        ListElement { key: "status";      display: "STATUS" }
     }
 
     /// FileDialog gives us a url; turn it into a path Rust/Python understand.

@@ -25,6 +25,7 @@ pub struct Row {
     pub first_seen: f64,
     pub last_seen: f64,
     pub times_seen: i64,
+    pub online: i64,
 }
 
 pub struct Note {
@@ -239,7 +240,7 @@ pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
 
     let (where_sql, params) = search::compile(query)?;
     let select = format!(
-        "SELECT ip_port, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM servers {} \
+        "SELECT ip_port, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM servers {} \
          ORDER BY last_seen DESC",
         col_or(&con, "motd", "''"),
         col_or(&con, "players_online", "0"),
@@ -252,6 +253,7 @@ pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
         col_or(&con, "first_seen", "0"),
         col_or(&con, "last_seen", "0"),
         col_or(&con, "times_seen", "0"),
+        col_or(&con, "online", "1"),
         where_sql,
     );
 
@@ -275,6 +277,7 @@ pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
             first_seen: row.get(9).unwrap_or(0.0),
             last_seen: row.get(10).unwrap_or(0.0),
             times_seen: row.get(11).unwrap_or(0),
+            online: row.get(12).unwrap_or(1),
         });
     }
 
@@ -625,6 +628,11 @@ pub fn detail(path: &str, row: &Row) -> Result<String, String> {
         out,
         "Whitelist:   {}",
         if whitelist.is_empty() { "-" } else { &whitelist }
+    );
+    let _ = writeln!(
+        out,
+        "Status:      {}",
+        if row.online != 0 { "Online" } else { "Offline" }
     );
     let _ = writeln!(out, "First seen:  {}", timestamp_text(first_seen));
     let _ = writeln!(out, "Last seen:   {}", timestamp_text(row.last_seen));
