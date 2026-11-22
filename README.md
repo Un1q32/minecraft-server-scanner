@@ -840,6 +840,13 @@ Build it with:
 
 The mod jar is written to `minecraft-mod/build/libs/`.
 
+Every push to any branch that changes the mod or its bundled Python
+sources builds the jar and publishes it as a GitHub Release tagged
+`build-<12-character commit SHA>`. Commits that touch unrelated files do
+not trigger a build. Pull requests build the jar without publishing; a
+manual workflow run publishes the current commit the same way. Re-running
+a commit replaces that release's jar.
+
 ## Text format
 
 The standard exported server line is:

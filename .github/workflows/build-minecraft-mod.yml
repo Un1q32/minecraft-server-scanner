@@ -1,7 +1,9 @@
-name: Build Minecraft mod
+name: Build and release Minecraft mod
 
 on:
   push:
+    branches:
+      - "**"
     paths:
       - "minecraft-mod/**"
       - "scanner.py"
@@ -18,15 +20,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: minecraft-mod-${{ github.workflow }}-${{ github.ref }}
+  group: minecraft-mod-${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build Fabric mod jar
+    name: Build and publish mod jar
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -50,10 +52,19 @@ jobs:
       - name: List built jars
         run: ls -lh build/libs
 
-      - name: Upload mod jar
-        uses: actions/upload-artifact@v7
-        with:
-          name: mcdb-browser-mod
-          path: minecraft-mod/build/libs/*.jar
-          if-no-files-found: error
-          retention-days: 14
+      - name: Publish build release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::12}"
+          TAG="build-${SHORT_SHA}"
+          ls build/libs/*.jar >/dev/null
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/libs/*.jar --clobber
+          else
+            gh release create "$TAG" build/libs/*.jar \
+              --title "MCDB Browser build ${SHORT_SHA}" \
+              --notes "Automated build of ${GITHUB_SHA} on ${GITHUB_REF_NAME}."
+          fi
