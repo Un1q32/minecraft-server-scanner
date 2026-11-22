@@ -383,11 +383,7 @@ cancelled instead of extending the round.
 `--strategies slash24a,slash32b` restricts the pool, `--rescan-every N`
 sets the rescan cadence (default 2, alternating normal/rescan; `1`
 rescans every round), `--no-rescan` skips rescan rounds entirely, and
-`--rounds N` stops after N rounds (useful for testing).
-`--no-offline-checks` (alias `--no-offline-tracking`) is an A/B
-performance switch: failed handshakes no longer write `online=0`, and
-rescan rounds never fall back to offline servers. Successful scans still
-set `online=1`, and viewers still hide or show rows normally. `--high-res`
+`--rounds N` stops after N rounds (useful for testing). `--high-res`
 (`--hi-res`) is the rescan-focused variant: it implies continuous mode,
 uses `--rescan-every 1`, moves the player tier to 5 minutes and the recent
 tier to 30 minutes. The older tiers keep their normal cadence. It also

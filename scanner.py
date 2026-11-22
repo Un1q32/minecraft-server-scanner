@@ -262,25 +262,6 @@ _SERVER_DB_INITIALIZED = set()
 # atexit hook joins those same threads again ("Exception ignored on
 # threading shutdown" / apparent hang).
 _SHUTDOWN = threading.Event()
-_OFFLINE_TRACKING = True
-
-
-def set_offline_tracking(enabled):
-    """Enable/disable failed-scan marking and offline rescan fallbacks.
-
-    This is a performance/AB switch: the schema keeps its online column and
-    successful scans still set online=1, but failures no longer write
-    online=0 and continuous rescan never falls back to offline servers.
-    """
-    global _OFFLINE_TRACKING
-    _OFFLINE_TRACKING = bool(enabled)
-
-
-def offline_tracking_enabled():
-    try:
-        return bool(_OFFLINE_TRACKING)
-    except Exception:
-        return True
 
 
 def request_shutdown():
@@ -867,8 +848,6 @@ def record_server_failures(ip_ports):
     must not create rows for every timeout.  Returns the number of rows
     whose online flag actually changed.
     """
-    if not offline_tracking_enabled():
-        return 0
     _ensure_server_db()
     ids = []
     seen = set()
@@ -8260,8 +8239,7 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
                 r = fut.result()
                 done += 1
                 fetched.append(r)
-                if (r is None and record_failures
-                        and offline_tracking_enabled()):
+                if r is None and record_failures:
                     failed.append(futures[fut])
             completed = [r for r in fetched if r]
             if completed:

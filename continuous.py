@@ -370,8 +370,6 @@ def rescan_targets(rows, tier):
     use the exact host address.
     """
     online, offline = _rescan_rows(rows, tier)
-    if not scanner.offline_tracking_enabled():
-        offline = []
     targets = _rows_to_targets(online, tier)
     targets += _rows_to_targets(offline, tier, pad=False)
     limit = tier.get("limit")
@@ -387,8 +385,6 @@ def rescan_targets_split(rows, tier):
     falls back to offline servers when no online server is due at all.
     """
     online, offline = _rescan_rows(rows, tier)
-    if not scanner.offline_tracking_enabled():
-        offline = []
     online_targets = _rows_to_targets(online, tier)
     offline_targets = _rows_to_targets(offline, tier, pad=False)
     limit = tier.get("limit")
@@ -656,9 +652,8 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
             if result:
                 emit(result)
                 return
-            if scanner.offline_tracking_enabled():
-                with failures_lock:
-                    failures.append(ip_port)
+            with failures_lock:
+                failures.append(ip_port)
 
         def on_open(ip_port):
             if (scanner.shutdown_requested() or stop_event.is_set()

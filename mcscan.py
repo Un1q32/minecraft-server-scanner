@@ -976,12 +976,6 @@ def main(argv=None):
         "--no-rescan", action="store_true",
         help="--continuous: skip rescan rounds entirely")
     parser.add_argument(
-        "--no-offline-checks", "--no-offline-tracking",
-        dest="no_offline_checks", action="store_true",
-        help="do not record failed handshakes as offline and do not fall "
-             "back to offline servers in rescan rounds (A/B performance "
-             "testing)")
-    parser.add_argument(
         "--rescan-every", type=int, default=None, metavar="N",
         help="--continuous: run one rescan round every N rounds "
              "(default: 2, alternating normal/rescan; 1 rescans every "
@@ -1026,11 +1020,6 @@ def main(argv=None):
         "--max-hosts", type=int, default=scanner.NETWORK_SCAN_MAX_HOSTS,
         help="Python-backend host cap (default: %(default)s)")
     args = parser.parse_args(argv)
-    if args.no_offline_checks:
-        scanner.set_offline_tracking(False)
-        print("offline checks disabled: failed scans will not mark servers "
-              "offline and rescan rounds will skip offline fallbacks",
-              flush=True)
 
     if not args.sync and args.targets is None and not args.export \
             and args.init_db is None and not args.continuous \
