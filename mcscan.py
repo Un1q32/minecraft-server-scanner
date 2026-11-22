@@ -257,6 +257,15 @@ def cmd_sync():
         print("notes sync not supported by this server; skipped.")
     if summary.get("notes_error"):
         print(f"warning: notes sync failed: {summary['notes_error']}")
+    dedupe = summary.get("dedupe") or {}
+    if dedupe.get("removed_state") or dedupe.get("removed_history"):
+        before = dedupe.get("before_bytes", 0) / (1024 * 1024)
+        after = dedupe.get("after_bytes", 0) / (1024 * 1024)
+        print(f"dedupe: {dedupe.get('removed_state', 0)} duplicate server row(s), "
+              f"{dedupe.get('removed_history', 0)} history row(s); "
+              f"{before:.1f} MB -> {after:.1f} MB")
+    if summary.get("dedupe_error"):
+        print(f"warning: local dedupe/compaction failed: {summary['dedupe_error']}")
     try:
         removed = scanner.prune_old_history()
         if removed:

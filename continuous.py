@@ -904,6 +904,13 @@ def _sync_now(url, token):
           f"history_uploaded={summary.get('history_uploaded', 0)} "
           f"history_downloaded={summary.get('history_downloaded', 0)} "
           f"player_events_uploaded={summary.get('player_events_uploaded', 0)}")
+    dedupe = summary.get("dedupe") or {}
+    if dedupe.get("removed_state") or dedupe.get("removed_history"):
+        before = dedupe.get("before_bytes", 0) / (1024 * 1024)
+        after = dedupe.get("after_bytes", 0) / (1024 * 1024)
+        print(f"  deduped: {dedupe.get('removed_state', 0)} stale port row(s), "
+              f"{dedupe.get('removed_history', 0)} history row(s); "
+              f"{before:.0f} MB -> {after:.0f} MB")
     try:
         scanner.prune_old_history()
     except Exception:

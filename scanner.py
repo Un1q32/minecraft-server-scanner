@@ -1235,6 +1235,16 @@ def deduplicate_local_db(vacuum=True, mark_dirty=True):
                       flush=True)
             finally:
                 con.close()
+    elif vacuum:
+        # History pruning frees pages continuously. Reclaim them when they
+        # are a meaningful fraction of the file, even if no state row went
+        # away in this pass.
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                db_format.vacuum_if_bloated(con)
+            finally:
+                con.close()
     try:
         after = os.path.getsize(path)
     except OSError:
@@ -1380,6 +1390,8 @@ NETDB_MAX_HISTORY_UPLOAD = 5000 if NETDB_LOW_MEMORY else 50000
 NETDB_MAX_PLAYER_UPLOAD = 10000 if NETDB_LOW_MEMORY else 100000
 NETDB_HISTORY_PAGE = 5000 if NETDB_LOW_MEMORY else 100000
 NETDB_SERVER_PAGE = 5000 if NETDB_LOW_MEMORY else 50000
+DEDUPE_INTERVAL = 3600.0
+_LAST_DEDUPE = 0.0
 # Matches dbserver.py's MAX_SERVERS_PER_RESPONSE: one /api/sync reply carries
 # at most this many rows, so big first-sync downloads page through it.
 NETDB_PAGE_SIZE = NETDB_SERVER_PAGE
@@ -2590,6 +2602,26 @@ def netdb_replace_all(rows):
     return inserted
 
 
+def dedupe_and_compact(force=False):
+    """Apply the shared DB's port-dedupe rule locally, then reclaim space.
+
+    The server merges same-host duplicate ports (one host answering the same
+    MOTD/version/protocol on many ports) and vacuums the result.  A client
+    that only ever upserts rows keeps those deleted ports forever, which
+    bloats the file and makes rescan tiers think the duplicate ports are
+    overdue.  Running the same rule after a sync converges the local DB.
+    """
+    global _LAST_DEDUPE
+    if NETDB_LOW_MEMORY and not force:
+        return {"skipped": "low-memory"}
+    now = time.time()
+    if not force and now - _LAST_DEDUPE < DEDUPE_INTERVAL:
+        return {}
+    stats = deduplicate_local_db(vacuum=True, mark_dirty=True)
+    _LAST_DEDUPE = time.time()
+    return stats
+
+
 def netdb_sync_once(url, token, timeout=None, history_download=True,
                     notes_download=True):
     """Bidirectional sync, no row caps. Returns summary dict. Raises ConnectionError.
@@ -2759,6 +2791,12 @@ def netdb_sync_once(url, token, timeout=None, history_download=True,
             url, token, timeout=timeout, download=notes_download))
     except Exception as exc:
         summary["notes_error"] = str(exc)
+    try:
+        dedupe = dedupe_and_compact()
+        if dedupe:
+            summary["dedupe"] = dedupe
+    except Exception as exc:
+        summary["dedupe_error"] = str(exc)
     return summary
 
 def _canonical_note_id(value):

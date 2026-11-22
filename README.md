@@ -792,6 +792,13 @@ conversion remains per row. Old clients that upload separate player events
 have them folded into the roster blob on the matching sighting until they
 are upgraded.
 
+After merging, a client applies the same same-host port-dedupe rule as the
+shared server and vacuums when duplicate rows were removed. The shared
+server deletes merged duplicate ports, so an upsert-only client would
+otherwise keep them forever: the file grows with dead rows and free pages,
+and rescan tiers keep treating those stale ports as overdue. The cleanup is
+throttled to once an hour; `mcscan.py --dedupe` forces it immediately.
+
 ## Minecraft mod (`minecraft-mod`)
 
 A Fabric client mod adds a **Server DB** button to the multiplayer screen and
