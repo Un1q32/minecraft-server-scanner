@@ -1095,6 +1095,26 @@ def query_server_db(search="", limit=None, include_offline=False):
             con.close()
 
 
+def query_server_db_rescan():
+    """Slim projection for continuous rescan selection.
+
+    The full rows carry large player rosters and other viewer-only fields.
+    Rescan only needs age, port/player counts, and identity for dedupe, so
+    avoid loading the blobs (important on Raspberry Pi-class nodes).
+    """
+    _ensure_server_db()
+    import sqlite3
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            return [dict(r) for r in con.execute(
+                "SELECT ip_port, motd, version, protocol, players_online,"
+                " online, last_seen FROM servers")]
+        finally:
+            con.close()
+
+
 def delete_servers_from_db(ip_ports):
     _ensure_server_db()
     if not ip_ports:

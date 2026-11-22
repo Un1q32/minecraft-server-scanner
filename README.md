@@ -356,7 +356,10 @@ Offline servers are a last resort. They are collected as rescan
 candidates but never displace an online server: an offline host is only
 pinged (at its exact IP, without `/20` padding) when no online server is
 due in any tier for that round. If online work exists, the deferred
-offline count is printed instead.
+offline count is printed instead. Rescan rounds load only the columns they
+need (skipping player roster blobs) and leave exclude carving to masscan,
+so target preparation stays short on Pi-class nodes. The round prints row
+load, target selection, and per-port sweep timings.
 
 Every scan is time-boxed by `--scan-duration` (default 300s), so `slash0`
 sweeps a random slice of the internet rather than all four billion

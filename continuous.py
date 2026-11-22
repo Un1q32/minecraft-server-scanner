@@ -159,13 +159,16 @@ def _now():
     return time.time()
 
 
-def _known_rows():
+def _known_rows(slim=False):
     """Fresh rows for strategy/rescan selection. Never raises.
 
     Offline rows stay in the snapshot: rescan needs them as a last-resort
     fallback, and revived-sighting classification must still see them.
+    ``slim`` skips large viewer-only columns for rescan rounds.
     """
     try:
+        if slim:
+            return scanner.query_server_db_rescan() or []
         return scanner.query_server_db(include_offline=True) or []
     except Exception as exc:
         print(f"warning: could not read local DB ({exc}); treating as empty")
@@ -606,15 +609,22 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
     messages through the live status bar when one is active.
     """
     _log = log or print
-    ranges = _carve(ranges)
-    if not ranges:
-        return []
-    est = _estimate_probes(ranges, ports)
     use_masscan = (backend in ("auto", "masscan")
                    and scanner.is_masscan_available())
-    if not use_masscan:
-        if backend == "masscan":
-            raise FileNotFoundError("masscan binary not found")
+    if backend == "masscan" and not use_masscan:
+        raise FileNotFoundError("masscan binary not found")
+    if use_masscan:
+        # masscan gets --excludefile and skips excluded hosts itself; carving
+        # tens of thousands of rescan specs in Python was a major startup
+        # delay on slow nodes.  The per-hit emit filter is a second guard.
+        if not ranges:
+            return []
+        est = 0
+    else:
+        ranges = _carve(ranges)
+        if not ranges:
+            return []
+        est = _estimate_probes(ranges, ports)
         if est > PY_MAX_PROBES:
             _log(f"  skipping: ~{est:,} probes is too much for the Python "
                  f"backend (install masscan or use --backend masscan)")
@@ -1228,7 +1238,13 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
             if shard_manager:
                 for message in shard_manager.drain_messages():
                     print(f"  {message}", flush=True)
-            before_rows = _known_rows()
+            prep_started = time.time()
+            if body == "rescan":
+                print("  loading rescan candidates...", flush=True)
+            before_rows = _known_rows(slim=(body == "rescan"))
+            if body == "rescan":
+                print(f"  loaded {len(before_rows)} server(s) in "
+                      f"{time.time() - prep_started:.1f}s", flush=True)
             before = {}
             for row in before_rows:
                 try:
@@ -1284,6 +1300,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     _sync_now(url, token)
                     return 1
             else:
+                select_started = time.time()
                 online_targets = []
                 offline_targets = []
                 seen_online = set()
@@ -1317,6 +1334,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                         if added_offline:
                             note = f", {added_offline} offline deferred"
                         print(f"  {tier['name']}: {added_online} due{note}")
+                print(f"  selected {len(online_targets)} online / "
+                      f"{len(offline_targets)} offline target(s) in "
+                      f"{time.time() - select_started:.1f}s", flush=True)
                 # Offline servers are a last resort: only spend this round's
                 # budget on them when no online server is due at all.
                 if online_targets:
@@ -1363,6 +1383,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                             direct = (len(specs) <= RESCAN_PY_MAX
                                       and _estimate_probes(specs, [port])
                                       <= RESCAN_PY_MAX)
+                            print(f"  port {port}: {len(specs)} target(s) "
+                                  f"({'python' if direct else 'masscan'})...",
+                                  flush=True)
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note,
