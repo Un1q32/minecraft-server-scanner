@@ -720,6 +720,12 @@ def sanitize_row(raw):
         times_seen = max(1, int(raw.get("times_seen", 1)))
     except Exception:
         times_seen = 1
+    online_flag = 1 if raw.get("online", 1) else 0
+    players_now = _clean_player_list(raw.get("players_now"))
+    if online_flag == 0:
+        # An offline row has no live players or roster.
+        online = 0
+        players_now = None
     return {
         "ip_port": ip_port,
         "host": None,
@@ -735,9 +741,9 @@ def sanitize_row(raw):
         "last_seen": last_seen,
         "times_seen": min(times_seen, 1000000000),
         "last_source": _clamp_str(raw.get("last_source", ""), 64),
-        "players_now": _clean_player_list(raw.get("players_now")),
+        "players_now": players_now,
         "players_ever": _clean_player_list(raw.get("players_ever")),
-        "online": 1 if raw.get("online", 1) else 0,
+        "online": online_flag,
     }
 
 
@@ -832,6 +838,9 @@ def merge_row(con, row):
     ever = _merge_player_lists(
         _merge_player_lists(o_ever, o_now), _merge_player_lists(row["players_ever"], row["players_now"]))
     online_state = row["online"]
+    if online_state == 0:
+        online = 0
+        now = None
     if (motd, online, maximum, version, protocol, cracked, whitelist,
             first_seen, last_seen, times_seen, src, now, ever, online_state) == (
             o_motd, o_on, o_max, o_ver, o_proto, o_cracked, o_wl,

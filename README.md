@@ -713,7 +713,9 @@ the most recent scan attempt reached the server, `0` when that attempt timed
 out, was refused, or otherwise failed. A row is only marked offline after a
 real attempt against that exact IP and port, so walking past a server in a
 masscan sweep does not turn it off; an explicit rescan, monitor cycle, or
-other handshake that fails does. Failed attempts still do not add history
+other handshake that fails does. Failed attempts also zero
+`players_online` and clear `players_now`, so an offline row does not keep
+advertising players; `players_ever` is kept. They still do not add history
 points or move `last_seen` (which remains the last successful sighting).
 
 Format 5 kept the format-4 schema but enabled the 4-day activity-retention

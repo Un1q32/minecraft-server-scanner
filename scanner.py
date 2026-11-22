@@ -879,9 +879,11 @@ def record_server_results(results, source="scan"):
 def record_server_failures(ip_ports):
     """Mark known servers offline after a failed scan attempt.
 
-    Only existing rows are touched: scanning arbitrary internet addresses
-    must not create rows for every timeout.  Returns the number of rows
-    whose online flag actually changed.
+    Also zeroes the live player count and clears the current roster so an
+    offline row does not keep advertising players.  The ever-seen roster
+    and history are unchanged.  Only existing rows are touched: scanning
+    arbitrary internet addresses must not create rows for every timeout.
+    Returns the number of rows updated.
     """
     _ensure_server_db()
     ids = []
@@ -902,8 +904,12 @@ def record_server_failures(ip_ports):
                 chunk = ids[start:start + 500]
                 marks = ",".join("?" * len(chunk))
                 cur = con.execute(
-                    f"UPDATE server_state SET online=0, needs_sync=1"
-                    f" WHERE ip_port IN ({marks}) AND online != 0", chunk)
+                    f"UPDATE server_state SET online=0, players_online=0,"
+                    f" players_now=NULL, needs_sync=1"
+                    f" WHERE ip_port IN ({marks})"
+                    f" AND (online != 0 OR players_online != 0"
+                    f"      OR (players_now IS NOT NULL"
+                    f"          AND players_now NOT IN ('', '[]')))", chunk)
                 changed += max(0, int(cur.rowcount or 0))
             if changed:
                 con.commit()
@@ -2065,9 +2071,15 @@ def netdb_merge_remote(servers, upload_watermark=None):
                                         else (0 if int(o_online) == 0 else 1))
                     except Exception:
                         online_state = 1
+                # An offline row has no live players, even when its last
+                # successful timestamp is older than the local one.
+                if online_state == 0:
+                    online = 0
                 # Player lists: current roster follows the newer sighting; the
                 # ever-seen list is the union of both sides (capped).
-                now_names = r_now if remote_newer else _decode_player_list(o_now)
+                now_names = ([] if online_state == 0 else
+                             (r_now if remote_newer
+                              else _decode_player_list(o_now)))
                 ever_names = _merge_player_lists(
                     _merge_player_lists(o_ever, o_now), _merge_player_lists(r_ever, r_now))
                 # Keep the row dirty if it changed locally after we collected
