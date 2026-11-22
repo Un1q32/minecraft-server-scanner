@@ -536,7 +536,7 @@ public final class ServerDatabase {
 		if (!search.where().isEmpty()) {
 			where.add(search.where().substring("WHERE ".length()));
 		}
-		Stream.of(query.players(), query.auth(), query.whitelist())
+		Stream.of(query.online(), query.players(), query.auth(), query.whitelist())
 			.map(Filter::condition)
 			.filter(Objects::nonNull)
 			.forEach(where::add);
@@ -964,23 +964,51 @@ public final class ServerDatabase {
 		}
 	}
 
-	public record Query(String search, PlayersFilter players, AuthFilter auth, WhitelistFilter whitelist) {
-		public static final Query DEFAULT = new Query("", PlayersFilter.ANY, AuthFilter.ANY, WhitelistFilter.ANY);
+	public enum OnlineFilter implements Filter {
+		ONLINE("Online", "online != 0"),
+		ALL("All", null),
+		OFFLINE("Offline", "online = 0");
+
+		private final String label;
+		private final @Nullable String condition;
+
+		OnlineFilter(String label, @Nullable String condition) {
+			this.label = label;
+			this.condition = condition;
+		}
+
+		@Override
+		public String label() {
+			return this.label;
+		}
+
+		@Override
+		public @Nullable String condition() {
+			return this.condition;
+		}
+	}
+
+	public record Query(String search, OnlineFilter online, PlayersFilter players, AuthFilter auth, WhitelistFilter whitelist) {
+		public static final Query DEFAULT = new Query("", OnlineFilter.ONLINE, PlayersFilter.ANY, AuthFilter.ANY, WhitelistFilter.ANY);
 
 		public Query withSearch(String search) {
-			return new Query(search, this.players, this.auth, this.whitelist);
+			return new Query(search, this.online, this.players, this.auth, this.whitelist);
+		}
+
+		public Query withOnline(OnlineFilter online) {
+			return new Query(this.search, online, this.players, this.auth, this.whitelist);
 		}
 
 		public Query withPlayers(PlayersFilter players) {
-			return new Query(this.search, players, this.auth, this.whitelist);
+			return new Query(this.search, this.online, players, this.auth, this.whitelist);
 		}
 
 		public Query withAuth(AuthFilter auth) {
-			return new Query(this.search, this.players, auth, this.whitelist);
+			return new Query(this.search, this.online, this.players, auth, this.whitelist);
 		}
 
 		public Query withWhitelist(WhitelistFilter whitelist) {
-			return new Query(this.search, this.players, this.auth, whitelist);
+			return new Query(this.search, this.online, this.players, this.auth, whitelist);
 		}
 	}
 

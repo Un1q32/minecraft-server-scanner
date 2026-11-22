@@ -1020,26 +1020,32 @@ def update_server_whitelist(ip_port, whitelist_label):
     _notify_server_db_tab()
 
 
-def query_server_db(search="", limit=None):
-    _ensure_server_db()
+def query_server_db(search="", limit=None, include_offline=False):
     """Return list of dicts newest-first, filtered by ip/motd/version substring.
 
+    Offline servers are hidden by default; include_offline=True returns them.
     limit=None (default) returns everything: the history DB is uncapped.
     """
+    _ensure_server_db()
     import sqlite3
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
             con.row_factory = sqlite3.Row
+            clauses = []
+            args: tuple = ()
             if search:
                 like = f"%{search}%"
-                base = ("SELECT * FROM servers WHERE ip_port LIKE ? OR motd LIKE ?"
-                        " OR version LIKE ? OR players_now LIKE ?"
-                        " OR players_ever LIKE ? ORDER BY last_seen DESC")
-                args: tuple = (like, like, like, like, like)
-            else:
-                base = "SELECT * FROM servers ORDER BY last_seen DESC"
-                args = ()
+                clauses.append("(ip_port LIKE ? OR motd LIKE ?"
+                               " OR version LIKE ? OR players_now LIKE ?"
+                               " OR players_ever LIKE ?)")
+                args = (like, like, like, like, like)
+            if not include_offline:
+                clauses.append("online != 0")
+            base = "SELECT * FROM servers"
+            if clauses:
+                base += " WHERE " + " AND ".join(clauses)
+            base += " ORDER BY last_seen DESC"
             if limit:
                 try:
                     limit = max(1, int(limit))
@@ -11036,6 +11042,7 @@ class ServersTab(QWidget, QtBaseMixin):
         super().__init__(parent)
         self._entries = []  # list[dict] from query_server_db
         self._refresh_pending = False
+        self.show_offline = False  # offline servers are hidden by default
         self._sync_note = ""   # last shared-DB sync summary, kept in the status
         self._op_note = ""     # last rescan/recheck summary, kept in the status
         self._op_active = False  # a rescan/recheck is running (ticks own the status)
@@ -11059,6 +11066,10 @@ class ServersTab(QWidget, QtBaseMixin):
         btn_search = QPushButton("Search")
         btn_search.clicked.connect(self.refresh_from_db)
         bar.addWidget(btn_search)
+        self.show_offline_check = QCheckBox("Show offline")
+        self.show_offline_check.setChecked(self.show_offline)
+        self.show_offline_check.toggled.connect(self._set_show_offline)
+        bar.addWidget(self.show_offline_check)
         btn_refresh = QPushButton("Refresh")
         btn_refresh.clicked.connect(self.refresh_from_db)
         bar.addWidget(btn_refresh)
@@ -11198,6 +11209,18 @@ class ServersTab(QWidget, QtBaseMixin):
         except Exception:
             self._refresh_pending = False
 
+    def _set_show_offline(self, checked):
+        self.show_offline = bool(checked)
+        self._apply_status_column_visibility()
+        self.refresh_from_db()
+
+    def _apply_status_column_visibility(self):
+        try:
+            index = self.COLS.index("status")
+            self.tree.setColumnHidden(index, not self.show_offline)
+        except Exception:
+            pass
+
     def refresh_from_db(self):
         self._refresh_pending = False
         q = ""
@@ -11206,9 +11229,12 @@ class ServersTab(QWidget, QtBaseMixin):
         except Exception:
             pass
 
-        def work(query=q):
+        include_offline = bool(self.show_offline)
+
+        def work(query=q, include_offline=include_offline):
             try:
-                entries = query_server_db(query)
+                entries = query_server_db(query,
+                                          include_offline=include_offline)
             except Exception as exc:
                 err = str(exc)
                 self.after(0, lambda err=err: self.set_status(f"DB load failed: {err}"))
@@ -11220,6 +11246,7 @@ class ServersTab(QWidget, QtBaseMixin):
 
     def _populate(self, entries):
         self._entries = entries
+        self._apply_status_column_visibility()
         try:
             note_counts = query_notes_counts()
         except Exception:

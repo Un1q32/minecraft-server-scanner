@@ -450,7 +450,7 @@ def _csv_cell(value):
 def cmd_export(path):
     """Dump the full local DB to CSV. Returns exit code."""
     try:
-        entries = scanner.query_server_db()
+        entries = scanner.query_server_db(include_offline=True)
     except Exception as exc:
         print(f"error: could not read local DB: {exc}")
         return 1

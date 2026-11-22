@@ -43,6 +43,7 @@ pub mod qobject {
         #[qproperty(QString, job_log)]
         #[qproperty(QString, sort_column)]
         #[qproperty(bool, sort_desc)]
+        #[qproperty(bool, show_offline)]
         type ViewerModel = super::ViewerModelRust;
 
         /// DB path from the command line (or `servers.db` in the cwd).
@@ -73,6 +74,11 @@ pub mod qobject {
         /// Re-run the query and sorting against the open database.
         #[qinvokable]
         fn apply(self: Pin<&mut ViewerModel>, query: QString) -> QString;
+
+        /// Show/hide rows whose last scan failed, then reload.
+        #[qinvokable]
+        #[cxx_name = "toggleOffline"]
+        fn toggle_offline(self: Pin<&mut ViewerModel>, show: bool) -> QString;
 
         /// Add/toggle a column in the sort stack (last click is primary).
         #[qinvokable]
@@ -212,6 +218,7 @@ pub struct ViewerModelRust {
     job_log: QString,
     sort_column: QString,
     sort_desc: bool,
+    show_offline: bool,
 
     // Plain state, not exposed as Qt properties.
     query: String,
@@ -269,6 +276,14 @@ impl qobject::ViewerModel {
             let mut rust = self.as_mut().rust_mut();
             rust.query = query.to_string();
         }
+        self.as_mut().reload()
+    }
+
+    pub fn toggle_offline(mut self: Pin<&mut Self>, show: bool) -> QString {
+        if self.rust().show_offline == show {
+            return QString::default();
+        }
+        self.as_mut().set_show_offline(show);
         self.as_mut().reload()
     }
 
@@ -592,12 +607,13 @@ impl qobject::ViewerModel {
 
     /// Fetch rows for the current query and sort them in memory.
     fn reload(mut self: Pin<&mut Self>) -> QString {
-        let (path, query, sort_keys) = {
+        let (path, query, sort_keys, show_offline) = {
             let rust = self.rust();
             (
                 rust.db_path.to_string(),
                 rust.query.clone(),
                 rust.sort_keys.clone(),
+                rust.show_offline,
             )
         };
         if path.is_empty() {
@@ -605,7 +621,7 @@ impl qobject::ViewerModel {
         }
 
         let started = Instant::now();
-        match crate::db::load(&path, &query) {
+        match crate::db::load(&path, &query, show_offline) {
             Ok(loaded) => {
                 let total = loaded.total.min(i32::MAX as i64) as i32;
                 let mut rows = loaded.rows;
@@ -649,7 +665,12 @@ impl qobject::ViewerModel {
     }
 
     pub fn column_count(&self, _parent: &QModelIndex) -> i32 {
-        COLUMNS.len() as i32
+        // STATUS is redundant while every visible row is online.
+        if self.rust().show_offline {
+            COLUMNS.len() as i32
+        } else {
+            (COLUMNS.len() - 1) as i32
+        }
     }
 
     pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {

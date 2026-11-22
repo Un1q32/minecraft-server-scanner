@@ -483,7 +483,13 @@ bar jumps that way). The columns match
 the Python Servers tab — IP, MOTD, PLAYERS, VERSION, CRACKED, WHITELIST,
 ONLINE NAMES, SEEN NAMES, FIRST SEEN, LAST SEEN, STATUS and TIMES SEEN (the
 Python tab also has a NOTES count column). STATUS is **Online** when the
-last attempt answered and **Offline** when it timed out or was refused. Selecting a row draws its sighting
+last attempt answered and **Offline** when it timed out or was refused.
+
+All viewers hide offline servers by default. Tick **Show offline** in the
+Python, dbviewer, or web toolbar to include them; the Fabric mod has a
+**Status** filter that defaults to **Online** (choose **All** or
+**Offline** to see the rest). The STATUS column is hidden while offline
+rows are hidden, because every visible row is then online. Selecting a row draws its sighting
 history above the detail text: a player-count line with a tick for every
 time the server was seen, then one row per player showing when that player
 was sampled online. The initial window is the most recent 48 hours of data.
@@ -513,6 +519,7 @@ MOTD, version, whitelist and sampled player names.
     version~1.21             contains
     cracked=yes              status text (matches cached/heuristic too)
     status=online|offline    result of the last scan attempt
+                             (enable Show offline to see status=offline)
     whitelist=yes|no|velocity|unknown whitelist status
     players>=10  max<100     numeric compare
     seen<7d  first>30d       time windows with s/m/h/d/w suffix

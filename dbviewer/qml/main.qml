@@ -52,7 +52,7 @@ ApplicationWindow {
 
     // Same widths as the Python Servers tab.
     readonly property var defaultWidths: [
-        170, 260, 90, 120, 75, 180, 200, 200, 165, 165, 90
+        170, 260, 90, 120, 75, 180, 200, 200, 165, 165, 90, 80
     ]
 
     QtObject {
@@ -686,6 +686,21 @@ ApplicationWindow {
         clearSelection()
     }
 
+    /// STATUS is only shown when offline rows are visible.
+    function updateHeaderColumns() {
+        if (viewer.show_offline) {
+            if (headerModel.count === defaultWidths.length - 1) {
+                headerModel.append({ key: "status", display: "STATUS" })
+                table.setColumnWidth(defaultWidths.length - 1,
+                                     defaultWidths[defaultWidths.length - 1])
+            }
+        } else {
+            while (headerModel.count > defaultWidths.length - 1)
+                headerModel.remove(headerModel.count - 1)
+        }
+        window.recalculateColumnsWidth()
+    }
+
     function recalculateColumnsWidth() {
         var total = 0
         for (var c = 0; c < table.columns; ++c) {
@@ -865,7 +880,8 @@ ApplicationWindow {
         searchField.text = viewer.defaultQuery()
         if (viewer.open(viewer.defaultPath()).length === 0)
             window.applySearch()
-        for (var c = 0; c < defaultWidths.length; ++c)
+        window.updateHeaderColumns()
+        for (var c = 0; c < Math.min(defaultWidths.length, table.columns); ++c)
             table.setColumnWidth(c, defaultWidths[c])
         window.recalculateColumnsWidth()
         detailView.text = helpText
@@ -898,6 +914,18 @@ ApplicationWindow {
                 SquareButton {
                     text: "Open DB…"
                     onClicked: fileDialog.open()
+                }
+
+                CheckBox {
+                    id: showOfflineCheck
+                    text: "Show offline"
+                    checked: viewer.show_offline
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Include servers whose last scan failed to connect"
+                    onToggled: {
+                        viewer.toggleOffline(checked)
+                        window.updateHeaderColumns()
+                    }
                 }
 
                 TextField {

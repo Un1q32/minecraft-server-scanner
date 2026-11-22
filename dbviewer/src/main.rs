@@ -61,7 +61,7 @@ fn selftest(args: &[String]) {
 
     println!("db: {path}");
     let started = Instant::now();
-    match db::load(&path, "") {
+    match db::load(&path, "", true) {
         Ok(loaded) => {
             println!(
                 "all rows: {} of {} loaded in {} ms",
@@ -105,7 +105,7 @@ fn selftest(args: &[String]) {
         "names:Notch",
         "version~1.21",
     ] {
-        match db::load(&path, query) {
+        match db::load(&path, query, true) {
             Ok(loaded) => {
                 let sample = loaded
                     .rows
@@ -136,7 +136,7 @@ fn selftest(args: &[String]) {
         ("times_seen", true),
         ("status", true),
     ] {
-        match db::load(&path, "") {
+        match db::load(&path, "", true) {
             Ok(mut loaded) => {
                 let started = Instant::now();
                 sort::sort_rows(&mut loaded.rows, column, desc);

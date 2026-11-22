@@ -74,6 +74,19 @@ button:disabled {
   color: var(--field-text);
 }
 
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.toggle input {
+  margin: 0;
+  padding: 0;
+}
+
 .status {
   flex: 0 0 auto;
   margin-left: 6px;

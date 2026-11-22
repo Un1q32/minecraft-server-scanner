@@ -227,7 +227,7 @@ pub fn timestamp_text(epoch: f64) -> String {
 
 /// Load every row matching `query` in the same order the Python GUI uses
 /// (`last_seen DESC`). Sorting is done in memory with Python-compatible keys.
-pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
+pub fn load(path: &str, query: &str, include_offline: bool) -> Result<Loaded, String> {
     if path.trim().is_empty() {
         return Err("no database selected".into());
     }
@@ -238,7 +238,16 @@ pub fn load(path: &str, query: &str) -> Result<Loaded, String> {
         .query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0))
         .unwrap_or(0);
 
-    let (where_sql, params) = search::compile(query)?;
+    let (mut where_sql, params) = search::compile(query)?;
+    if !include_offline {
+        let online = col_or(&con, "online", "1");
+        let filter = format!("({online} != 0)");
+        where_sql = if where_sql.trim().is_empty() {
+            format!("WHERE {filter}")
+        } else {
+            format!("{where_sql} AND {filter}")
+        };
+    }
     let select = format!(
         "SELECT ip_port, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM servers {} \
          ORDER BY last_seen DESC",
@@ -699,6 +708,37 @@ mod tests {
     fn names_are_cleaned() {
         let names = names_of(r#"["alice", "b\u0000ob", "\u001b[31mcarol"]"#);
         assert_eq!(names, "alice, bob, [31mcarol");
+    }
+
+    #[test]
+    fn offline_rows_are_hidden_by_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbviewer-online-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.db");
+        let con = Connection::open(&path).unwrap();
+        con.execute(
+            "CREATE TABLE servers (ip_port TEXT, online INTEGER, last_seen REAL)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO servers VALUES ('1.2.3.4:25565', 1, 200.0),              ('1.2.3.5:25565', 0, 100.0)",
+            [],
+        )
+        .unwrap();
+        drop(con);
+        let path = path.to_str().unwrap();
+
+        let online = load(path, "", false).unwrap();
+        assert_eq!(online.total, 2);
+        assert_eq!(online.rows.len(), 1);
+        assert_eq!(online.rows[0].ip, "1.2.3.4:25565");
+
+        let all = load(path, "", true).unwrap();
+        assert_eq!(all.rows.len(), 2);
+        assert_eq!(all.rows.iter().filter(|row| row.online == 0).count(), 1);
     }
 
     #[test]

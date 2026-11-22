@@ -16,6 +16,14 @@ const COLUMNS = [
 ];
 
 const COLUMN_KEYS = COLUMNS.map((column) => column.key);
+let showOffline = false;
+
+function visibleColumns() {
+  // When offline servers are hidden, the STATUS column is redundant.
+  return showOffline
+    ? COLUMNS
+    : COLUMNS.filter((column) => column.key !== "status");
+}
 const ROW_HEIGHT = 22;
 const SEARCH_DELAY = 300;
 const DEFAULT_HISTORY_WINDOW = 48 * 3600;
@@ -50,6 +58,7 @@ const statusEl = document.getElementById("status");
 const gridScroll = document.getElementById("gridScroll");
 const grid = document.getElementById("grid");
 const headerRow = document.getElementById("headerRow");
+const showOfflineEl = document.getElementById("showOffline");
 const bodyEl = document.getElementById("body");
 const rowsEl = document.getElementById("rows");
 const detailEl = document.getElementById("detail");
@@ -169,9 +178,10 @@ function saveWidths() {
 }
 
 function setColumns() {
-  const spec = COLUMNS.map((column) => `${column.width}px`).join(" ");
+  const columns = visibleColumns();
+  const spec = columns.map((column) => `${column.width}px`).join(" ");
   grid.style.setProperty("--cols", spec);
-  grid.style.width = `${COLUMNS.reduce((sum, column) => sum + column.width, 0)}px`;
+  grid.style.width = `${columns.reduce((sum, column) => sum + column.width, 0)}px`;
 }
 
 function relayout() {
@@ -886,8 +896,9 @@ new ResizeObserver((entries) => {
 
 function buildHeader() {
   headerRow.replaceChildren();
-  for (let i = 0; i < COLUMNS.length; i += 1) {
-    const column = COLUMNS[i];
+  const columns = visibleColumns();
+  for (let i = 0; i < columns.length; i += 1) {
+    const column = columns[i];
     const cell = document.createElement("div");
     cell.className = "hcell";
     cell.dataset.key = column.key;
@@ -918,11 +929,12 @@ function beginResize(event) {
   event.preventDefault();
   event.stopPropagation();
   const index = Number(event.currentTarget.dataset.index);
-  if (!Number.isInteger(index) || index < 0 || index >= COLUMNS.length) {
+  const columns = visibleColumns();
+  if (!Number.isInteger(index) || index < 0 || index >= columns.length) {
     return;
   }
   const startX = event.clientX;
-  const startWidth = COLUMNS[index].width;
+  const startWidth = columns[index].width;
   document.body.classList.add("resizing");
 
   function move(moveEvent) {
@@ -983,7 +995,8 @@ function renderRows() {
     }
     element.dataset.row = String(row);
     element.style.top = `${row * ROW_HEIGHT}px`;
-    for (let column = 0; column < COLUMNS.length; column += 1) {
+    const columns = visibleColumns();
+    for (let column = 0; column < columns.length; column += 1) {
       const cell = document.createElement("div");
       cell.className = "cell";
       cell.textContent = mc.cell(row, column);
@@ -1099,7 +1112,7 @@ function applySearch(prefix = "") {
   }
   const query = searchInput.value;
   const started = performance.now();
-  const count = mc.apply(query);
+  const count = mc.apply(query, showOffline ? 1 : 0);
   if (count < 0) {
     setStatus(`Search error: ${mc.error()}`);
     return;
@@ -1243,7 +1256,7 @@ async function loadDatabase() {
   if (mc.open("/servers.db") !== 0) {
     throw new Error(mc.error() || "could not open database");
   }
-  const count = mc.apply("");
+  const count = mc.apply("", showOffline ? 1 : 0);
   if (count < 0) {
     throw new Error(mc.error() || "could not read database");
   }
@@ -1272,6 +1285,13 @@ async function refreshDatabase() {
 }
 
 refreshBtn.addEventListener("click", refreshDatabase);
+
+showOfflineEl.addEventListener("change", () => {
+  showOffline = showOfflineEl.checked;
+  buildHeader();
+  setColumns();
+  applySearch();
+});
 
 // -------------------------------------------------------------------- boot
 
@@ -1318,7 +1338,7 @@ async function boot() {
     mc = {
       open: core.cwrap("mc_open", "number", ["string"]),
       close: core.cwrap("mc_close", null, []),
-      apply: core.cwrap("mc_apply", "number", ["string"]),
+      apply: core.cwrap("mc_apply", "number", ["string", "number"]),
       sort: core.cwrap("mc_sort", "number", ["string"]),
       count: core.cwrap("mc_count", "number", []),
       total: core.cwrap("mc_total", "number", []),

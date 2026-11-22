@@ -10,6 +10,9 @@
   <header class="toolbar">
     <input id="search" type="text" spellcheck="false" autocomplete="off"
            placeholder="Search…  e.g. motd:anarchy players&gt;=10 seen&lt;7d -cracked:yes">
+    <label class="toggle" title="Include servers whose last scan failed to connect">
+      <input id="showOffline" type="checkbox"> Show offline
+    </label>
     <button id="copyBtn" type="button">Copy IP(s)</button>
     <button id="refreshBtn" type="button">Refresh</button>
     <span id="status" class="status">Loading…</span>
@@ -44,8 +47,8 @@
     </aside>
   </main>
 
-  <script src="core.js?v=10"></script>
-  <script src="fzstd.js?v=10"></script>
-  <script src="app.js?v=10"></script>
+  <script src="core.js?v=11"></script>
+  <script src="fzstd.js?v=11"></script>
+  <script src="app.js?v=11"></script>
 </body>
 </html>

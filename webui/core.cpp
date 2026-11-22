@@ -1231,7 +1231,7 @@ void mc_close(void) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-int mc_apply(const char *query) {
+int mc_apply(const char *query, int show_offline) {
     g_error.clear();
     if (!g_db) {
         g_error = "database not open";
@@ -1242,6 +1242,13 @@ int mc_apply(const char *query) {
     std::vector<Param> params;
     if (!compile_search(query ? query : "", where_sql, params, g_error)) {
         return -1;
+    }
+    if (!show_offline) {
+        std::string online = col_or("online", "1");
+        std::string filter = "(" + online + " != 0)";
+        where_sql = where_sql.empty()
+            ? "WHERE " + filter
+            : where_sql + " AND " + filter;
     }
 
     std::string select =

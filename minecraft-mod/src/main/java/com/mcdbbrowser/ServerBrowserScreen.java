@@ -140,12 +140,14 @@ public class ServerBrowserScreen extends DropdownScreen {
 			directionArrow(this.primaryDescending()), button -> this.toggleDirection())
 			.bounds(paneX + sortWidth + GAP, SEARCH_ROW_Y, ROW_HEIGHT, ROW_HEIGHT).build());
 
-		int filterWidth = Math.max(52, (leftWidth - 2 * GAP) / 3);
-		this.addRenderableWidget(new Dropdown<>(MARGIN, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Players", ServerDatabase.PlayersFilter.values(), this.query.players(),
+		int filterWidth = Math.max(48, (leftWidth - 3 * GAP) / 4);
+		this.addRenderableWidget(new Dropdown<>(MARGIN, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Status", ServerDatabase.OnlineFilter.values(), this.query.online(),
+			online -> this.setQuery(this.query.withOnline(online))));
+		this.addRenderableWidget(new Dropdown<>(MARGIN + filterWidth + GAP, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Players", ServerDatabase.PlayersFilter.values(), this.query.players(),
 			players -> this.setQuery(this.query.withPlayers(players))));
-		this.addRenderableWidget(new Dropdown<>(MARGIN + filterWidth + GAP, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Auth", ServerDatabase.AuthFilter.values(), this.query.auth(),
+		this.addRenderableWidget(new Dropdown<>(MARGIN + 2 * (filterWidth + GAP), FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Auth", ServerDatabase.AuthFilter.values(), this.query.auth(),
 			auth -> this.setQuery(this.query.withAuth(auth))));
-		this.addRenderableWidget(new Dropdown<>(MARGIN + 2 * (filterWidth + GAP), FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Whitelist", ServerDatabase.WhitelistFilter.values(), this.query.whitelist(),
+		this.addRenderableWidget(new Dropdown<>(MARGIN + 3 * (filterWidth + GAP), FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Whitelist", ServerDatabase.WhitelistFilter.values(), this.query.whitelist(),
 			whitelist -> this.setQuery(this.query.withWhitelist(whitelist))));
 
 		this.list = this.addRenderableWidget(new ServerListWidget(listWidth, this.height - FOOTER_HEIGHT - LIST_TOP, LIST_TOP));
