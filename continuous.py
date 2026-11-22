@@ -1383,9 +1383,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                             direct = (len(specs) <= RESCAN_PY_MAX
                                       and _estimate_probes(specs, [port])
                                       <= RESCAN_PY_MAX)
-                            print(f"  port {port}: {len(specs)} target(s) "
-                                  f"({'python' if direct else 'masscan'})...",
-                                  flush=True)
+                            status.note(
+                                f"  port {port}: {len(specs)} target(s) "
+                                f"({'python' if direct else 'masscan'})...")
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note,
