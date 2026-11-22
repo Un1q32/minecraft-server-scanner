@@ -258,12 +258,16 @@ def cmd_sync():
     if summary.get("notes_error"):
         print(f"warning: notes sync failed: {summary['notes_error']}")
     dedupe = summary.get("dedupe") or {}
-    if dedupe.get("removed_state") or dedupe.get("removed_history"):
+    activity_removed = (dedupe.get("activity_removed_old", 0)
+                        + dedupe.get("activity_thinned", 0))
+    if (dedupe.get("removed_state") or dedupe.get("removed_history")
+            or activity_removed):
         before = dedupe.get("before_bytes", 0) / (1024 * 1024)
         after = dedupe.get("after_bytes", 0) / (1024 * 1024)
-        print(f"dedupe: {dedupe.get('removed_state', 0)} duplicate server row(s), "
-              f"{dedupe.get('removed_history', 0)} history row(s); "
-              f"{before:.1f} MB -> {after:.1f} MB")
+        print(f"maintenance: {dedupe.get('removed_state', 0)} duplicate "
+              f"server row(s), {dedupe.get('removed_history', 0)} duplicate "
+              f"history row(s), {activity_removed} activity row(s) "
+              f"old/thinned; {before:.1f} MB -> {after:.1f} MB")
     if summary.get("dedupe_error"):
         print(f"warning: local dedupe/compaction failed: {summary['dedupe_error']}")
     try:

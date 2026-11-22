@@ -910,11 +910,15 @@ def _sync_now(url, token):
           f"history_downloaded={summary.get('history_downloaded', 0)} "
           f"player_events_uploaded={summary.get('player_events_uploaded', 0)}")
     dedupe = summary.get("dedupe") or {}
-    if dedupe.get("removed_state") or dedupe.get("removed_history"):
+    activity_removed = (dedupe.get("activity_removed_old", 0)
+                        + dedupe.get("activity_thinned", 0))
+    if (dedupe.get("removed_state") or dedupe.get("removed_history")
+            or activity_removed):
         before = dedupe.get("before_bytes", 0) / (1024 * 1024)
         after = dedupe.get("after_bytes", 0) / (1024 * 1024)
-        print(f"  deduped: {dedupe.get('removed_state', 0)} stale port row(s), "
-              f"{dedupe.get('removed_history', 0)} history row(s); "
+        print(f"  maintenance: {dedupe.get('removed_state', 0)} stale port row(s), "
+              f"{dedupe.get('removed_history', 0)} duplicate history row(s), "
+              f"{activity_removed} activity row(s) old/thinned; "
               f"{before:.0f} MB -> {after:.0f} MB")
     try:
         scanner.prune_old_history()

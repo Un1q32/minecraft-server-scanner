@@ -1223,12 +1223,14 @@ def query_server_notes(ip_port, include_deleted=False):
             con.close()
 
 
-def deduplicate_local_db(vacuum=True, mark_dirty=True):
+def deduplicate_local_db(vacuum=True, mark_dirty=True, activity=False):
     """Merge same-host duplicate ports in the local servers.db.
 
     Returns the db_format stats plus before/after file sizes.  ``mark_dirty``
     makes the merged representative upload on the next sync; downloaded
-    snapshots should pass False so they stay clean.
+    snapshots should pass False so they stay clean.  ``activity`` also applies
+    the shared 4-day retention and 5/30-minute thinning so the local history
+    matches what the server actually stores.
     """
     init_server_db()
     path = os.path.abspath(SERVERS_DB_FILE)
@@ -1240,13 +1242,20 @@ def deduplicate_local_db(vacuum=True, mark_dirty=True):
         con = _server_db_connect()
         try:
             stats = db_format.deduplicate_ports(con, mark_dirty=mark_dirty)
+            if activity:
+                activity_stats = db_format.prune_activity(con)
+                stats.update({f"activity_{key}": value
+                              for key, value in activity_stats.items()})
             con.commit()
         except Exception:
             con.rollback()
             raise
         finally:
             con.close()
-    if vacuum and stats.get("removed_state"):
+    removed = (stats.get("removed_state", 0)
+               or stats.get("activity_removed_old", 0)
+               or stats.get("activity_thinned", 0))
+    if vacuum and removed:
         with _SERVER_DB_LOCK:
             con = _server_db_connect()
             try:
@@ -2638,7 +2647,7 @@ def dedupe_and_compact(force=False):
     now = time.time()
     if not force and now - _LAST_DEDUPE < DEDUPE_INTERVAL:
         return {}
-    stats = deduplicate_local_db(vacuum=True, mark_dirty=True)
+    stats = deduplicate_local_db(vacuum=True, mark_dirty=True, activity=True)
     _LAST_DEDUPE = time.time()
     return stats
 

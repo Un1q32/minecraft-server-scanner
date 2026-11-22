@@ -796,12 +796,16 @@ conversion remains per row. Old clients that upload separate player events
 have them folded into the roster blob on the matching sighting until they
 are upgraded.
 
-After merging, a client applies the same same-host port-dedupe rule as the
-shared server and vacuums when duplicate rows were removed. The shared
-server deletes merged duplicate ports, so an upsert-only client would
-otherwise keep them forever: the file grows with dead rows and free pages,
-and rescan tiers keep treating those stale ports as overdue. The cleanup is
-throttled to once an hour; `mcscan.py --dedupe` forces it immediately.
+After merging, a client applies the server's maintenance rules locally:
+the same-host port-dedupe, 4-day retention, and 5/30-minute activity
+thinning, then vacuums when rows were removed. The shared server deletes
+merged duplicate ports and rejects over-dense history, so an upsert-only
+client would otherwise keep dead rows and local high-resolution points
+forever: the file grows with dead rows and free pages, rescan tiers keep
+treating stale ports as overdue, and the local DB stays larger than the
+server's compact snapshot. The cleanup is throttled to once an hour;
+`mcscan.py --dedupe` or `--prune-activity` forces the individual steps
+immediately.
 
 ## Minecraft mod (`minecraft-mod`)
 
