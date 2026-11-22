@@ -514,6 +514,24 @@ def deduplicate_ports(con, min_ports=DEDUPE_MIN_PORTS, mark_dirty=True):
     has_needs_sync = "needs_sync" in columns
     has_seq = "seq" in columns
 
+    # Cheap precheck: the full pass materializes every state row in Python.
+    # On a clean DB there are no same-host/signature groups at all, so avoid
+    # that scan (important on Raspberry Pi-class hardware).
+    try:
+        candidates = con.execute(
+            f"SELECT COUNT(*) FROM ("
+            f" SELECT 1 FROM {table}"
+            f" GROUP BY substr(ip_port, 1, instr(ip_port, ':') - 1),"
+            f" lower(trim(COALESCE(motd, ''))),"
+            f" lower(trim(COALESCE(version, ''))),"
+            f" COALESCE(CAST(protocol AS INTEGER), -1)"
+            f" HAVING COUNT(*) >= ?)", (int(min_ports),)).fetchone()[0]
+    except Exception:
+        candidates = None
+    if candidates == 0:
+        return {"groups": 0, "removed_state": 0, "removed_history": 0,
+                "inserted_history": 0}
+
     old_factory = con.row_factory
     con.row_factory = sqlite3.Row
     try:

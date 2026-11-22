@@ -234,7 +234,7 @@ def cmd_sync():
             return rc
     print(f"syncing shared DB at {url} ...")
     try:
-        summary = scanner.netdb_sync_once(url, token)
+        summary = scanner.netdb_sync_once(url, token, verbose=True)
     except Exception as exc:
         print(f"sync failed: {exc}")
         return 1
@@ -310,6 +310,9 @@ def cmd_prune_activity():
           f"thinned={stats.get('thinned', 0)} "
           f"remaining={remaining} "
           f"size={before / 1048576:.1f}MB -> {after / 1048576:.1f}MB")
+    # This is the expensive half of the automatic pass; don't make the next
+    # --sync repeat it immediately.
+    scanner.mark_maintenance_run()
     return 0
 
 

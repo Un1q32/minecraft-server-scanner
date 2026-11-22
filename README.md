@@ -799,9 +799,12 @@ merged duplicate ports and rejects over-dense history, so an upsert-only
 client would otherwise keep dead rows and local high-resolution points
 forever: the file grows with dead rows and free pages, rescan tiers keep
 treating stale ports as overdue, and the local DB stays larger than the
-server's compact snapshot. The cleanup is throttled to once an hour;
-`mcscan.py --dedupe` or `--prune-activity` forces the individual steps
-immediately.
+server's compact snapshot. The cleanup is limited to once every six hours
+and the timestamp is stored in `db_meta`, so separate `mcscan.py --sync`
+invocations honor it too. `mcscan.py --dedupe` or `--prune-activity`
+forces the individual steps immediately. `--sync` prints a line for each
+phase (server upload, server download, history, local maintenance) with
+elapsed seconds, so a slow step is visible instead of looking hung.
 
 ## Minecraft mod (`minecraft-mod`)
 

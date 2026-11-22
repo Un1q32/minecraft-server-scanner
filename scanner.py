@@ -254,6 +254,9 @@ def prune_old_history(force=False):
         return removed
 _NOTES_DB_LOCK = threading.Lock()
 _SERVER_DB_INITIALIZED = set()
+BOGON_CLEANUP_KEY = "bogon_cleanup_v1"
+MAINTENANCE_INTERVAL = 6 * 3600
+MAINTENANCE_META_KEY = "sync_maintenance_at"
 
 # Cooperative shutdown. Ctrl+C / SIGTERM / window close sets this so that
 # (a) probes bail between steps instead of finishing every queued target,
@@ -650,21 +653,53 @@ def init_server_db():
             _SERVER_DB_INITIALIZED.add(os.path.abspath(SERVERS_DB_FILE))
             # One-time cleanup: bogons (loopback/LAN test servers) are no
             # longer persisted, so drop any rows from before this rule
-            # (the sync-import filter keeps them from coming back).
+            # (the sync-import filter keeps them from coming back).  This
+            # walks every server row, so remember that it is done instead
+            # of repeating it on each startup (a Pi 4 spent ~10s here).
             try:
-                cur = con.execute("SELECT ip_port FROM server_state")
-                drop = []
-                for (ip_port,) in cur:
-                    try:
-                        if _is_bogon_ip(get_ip_only(ip_port or "")):
-                            drop.append((ip_port,))
-                    except Exception:
-                        continue
-                if drop:
-                    con.executemany(
-                        "DELETE FROM server_state WHERE ip_port=?", drop)
-                    con.executemany(
-                        "DELETE FROM server_history WHERE ip_port=?", drop)
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS db_meta ("
+                    " key TEXT PRIMARY KEY, value TEXT)")
+                done = con.execute(
+                    "SELECT 1 FROM db_meta WHERE key=? LIMIT 1",
+                    (BOGON_CLEANUP_KEY,)).fetchone()
+                if not done:
+                    # Cheap SQL prefilter first: a full Python pass over
+                    # ~250k rows costs ~10s on a Pi 4.  This selects only
+                    # addresses in a bogon-looking range (with a few broad
+                    # prefixes such as 172.*); the exact check below handles
+                    # the handful of matches.
+                    cur = con.execute(
+                        "SELECT ip_port FROM server_state WHERE"
+                        " ip_port LIKE '0.%' OR ip_port LIKE '10.%'"
+                        " OR ip_port LIKE '127.%'"
+                        " OR ip_port LIKE '169.254.%'"
+                        " OR ip_port LIKE '172.%'"
+                        " OR ip_port LIKE '192.0.0.%'"
+                        " OR ip_port LIKE '192.0.2.%'"
+                        " OR ip_port LIKE '192.88.99.%'"
+                        " OR ip_port LIKE '192.168.%'"
+                        " OR ip_port LIKE '198.18.%'"
+                        " OR ip_port LIKE '198.19.%'"
+                        " OR ip_port LIKE '198.51.100.%'"
+                        " OR ip_port LIKE '203.0.113.%'"
+                        " OR CAST(substr(ip_port, 1,"
+                        "      instr(ip_port, '.') - 1) AS INTEGER) >= 224")
+                    drop = []
+                    for (ip_port,) in cur:
+                        try:
+                            if _is_bogon_ip(get_ip_only(ip_port or "")):
+                                drop.append((ip_port,))
+                        except Exception:
+                            continue
+                    if drop:
+                        con.executemany(
+                            "DELETE FROM server_state WHERE ip_port=?", drop)
+                        con.executemany(
+                            "DELETE FROM server_history WHERE ip_port=?", drop)
+                    con.execute(
+                        "INSERT OR REPLACE INTO db_meta (key, value)"
+                        " VALUES (?, '1')", (BOGON_CLEANUP_KEY,))
                     con.commit()
             except Exception:
                 pass
@@ -1217,9 +1252,15 @@ def deduplicate_local_db(vacuum=True, mark_dirty=True, activity=False):
         before = os.path.getsize(path)
     except OSError:
         before = 0
+    history_before = 0
     with _SERVER_DB_LOCK:
         con = _server_db_connect()
         try:
+            try:
+                history_before = int(con.execute(
+                    "SELECT COUNT(*) FROM server_history").fetchone()[0] or 0)
+            except Exception:
+                history_before = 0
             stats = db_format.deduplicate_ports(con, mark_dirty=mark_dirty)
             if activity:
                 activity_stats = db_format.prune_activity(con)
@@ -1232,26 +1273,25 @@ def deduplicate_local_db(vacuum=True, mark_dirty=True, activity=False):
         finally:
             con.close()
     removed = (stats.get("removed_state", 0)
-               or stats.get("activity_removed_old", 0)
-               or stats.get("activity_thinned", 0))
-    if vacuum and removed:
+               + stats.get("removed_history", 0)
+               + stats.get("activity_removed_old", 0)
+               + stats.get("activity_thinned", 0))
+    # A large fraction of removed rows leaves many partially empty b-tree
+    # pages that never reach the freelist, so VACUUM explicitly.  Otherwise
+    # only compact when the freelist is actually bloated; an unconditional
+    # VACUUM after every small prune is slow and wears out SD cards.
+    big_cleanup = removed >= max(20000, history_before // 10)
+    if vacuum:
         with _SERVER_DB_LOCK:
             con = _server_db_connect()
             try:
-                con.execute("VACUUM")
+                if big_cleanup:
+                    con.execute("VACUUM")
+                else:
+                    db_format.vacuum_if_bloated(con)
             except Exception as exc:
                 print(f"warning: could not compact servers.db: {exc}",
                       flush=True)
-            finally:
-                con.close()
-    elif vacuum:
-        # History pruning frees pages continuously. Reclaim them when they
-        # are a meaningful fraction of the file, even if no state row went
-        # away in this pass.
-        with _SERVER_DB_LOCK:
-            con = _server_db_connect()
-            try:
-                db_format.vacuum_if_bloated(con)
             finally:
                 con.close()
     try:
@@ -1399,8 +1439,6 @@ NETDB_MAX_HISTORY_UPLOAD = 5000 if NETDB_LOW_MEMORY else 50000
 NETDB_MAX_PLAYER_UPLOAD = 10000 if NETDB_LOW_MEMORY else 100000
 NETDB_HISTORY_PAGE = 5000 if NETDB_LOW_MEMORY else 100000
 NETDB_SERVER_PAGE = 5000 if NETDB_LOW_MEMORY else 50000
-DEDUPE_INTERVAL = 3600.0
-_LAST_DEDUPE = 0.0
 # Matches dbserver.py's MAX_SERVERS_PER_RESPONSE: one /api/sync reply carries
 # at most this many rows, so big first-sync downloads page through it.
 NETDB_PAGE_SIZE = NETDB_SERVER_PAGE
@@ -2611,28 +2649,74 @@ def netdb_replace_all(rows):
     return inserted
 
 
-def dedupe_and_compact(force=False):
-    """Apply the shared DB's port-dedupe rule locally, then reclaim space.
+def _maintenance_due(force=False):
+    if force:
+        return True
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS db_meta ("
+                    " key TEXT PRIMARY KEY, value TEXT)")
+                row = con.execute(
+                    "SELECT value FROM db_meta WHERE key=? LIMIT 1",
+                    (MAINTENANCE_META_KEY,)).fetchone()
+                if not row:
+                    return True
+                return (time.time() - float(row[0])) >= MAINTENANCE_INTERVAL
+            finally:
+                con.close()
+    except Exception:
+        return True
 
-    The server merges same-host duplicate ports (one host answering the same
-    MOTD/version/protocol on many ports) and vacuums the result.  A client
-    that only ever upserts rows keeps those deleted ports forever, which
-    bloats the file and makes rescan tiers think the duplicate ports are
-    overdue.  Running the same rule after a sync converges the local DB.
+
+def mark_maintenance_run():
+    """Record that the full local maintenance pass completed."""
+    try:
+        with _SERVER_DB_LOCK:
+            con = _server_db_connect()
+            try:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS db_meta ("
+                    " key TEXT PRIMARY KEY, value TEXT)")
+                con.execute(
+                    "INSERT OR REPLACE INTO db_meta (key, value)"
+                    " VALUES (?, ?)", (MAINTENANCE_META_KEY, str(time.time())))
+                con.commit()
+            finally:
+                con.close()
+    except Exception:
+        pass
+
+
+def dedupe_and_compact(force=False, verbose=False):
+    """Apply the shared DB's maintenance rules locally, then reclaim space.
+
+    The server merges same-host duplicate ports, retains four days of
+    history, and thins sightings to 5/30 minutes.  A client that only
+    upserts keeps deleted ports and local high-resolution points forever,
+    which bloats the file, makes rescan tiers treat stale ports as overdue,
+    and leaves the local DB larger than the server snapshot.  The pass is
+    limited to once per MAINTENANCE_INTERVAL (tracked in db_meta, so separate
+    mcscan --sync processes honor it too).
     """
-    global _LAST_DEDUPE
     if NETDB_LOW_MEMORY and not force:
         return {"skipped": "low-memory"}
-    now = time.time()
-    if not force and now - _LAST_DEDUPE < DEDUPE_INTERVAL:
+    if not _maintenance_due(force):
+        if verbose:
+            print("  local maintenance: not due", flush=True)
         return {}
+    if verbose:
+        print("  local maintenance: dedupe, retention, thinning, vacuum "
+              "(this can take a minute on slow storage)...", flush=True)
     stats = deduplicate_local_db(vacuum=True, mark_dirty=True, activity=True)
-    _LAST_DEDUPE = time.time()
+    mark_maintenance_run()
     return stats
 
 
 def netdb_sync_once(url, token, timeout=None, history_download=True,
-                    notes_download=True):
+                    notes_download=True, verbose=False):
     """Bidirectional sync, no row caps. Returns summary dict. Raises ConnectionError.
 
     Uploads loop in NETDB_MAX_UPLOAD batches until no dirty rows remain;
@@ -2680,6 +2764,7 @@ def netdb_sync_once(url, token, timeout=None, history_download=True,
                               compress=compress_requests)
 
     # --- upload: batch until clean (flags of uncollected rows stay set) ---
+    phase_started = time.time()
     uploaded = 0
     merged_on_server = 0
     last_watermark = None
@@ -2699,8 +2784,12 @@ def netdb_sync_once(url, token, timeout=None, history_download=True,
         uploaded += len(dirty_rows)
         if len(dirty_rows) < NETDB_MAX_UPLOAD:
             break
+    if verbose:
+        print(f"  server upload complete: {uploaded} row(s) in "
+              f"{time.time() - phase_started:.1f}s", flush=True)
 
     # --- download: page until drained (empty upload, advancing cursor) ---
+    phase_started = time.time()
     # Preferred: seq cursor (unique per change, immune to old-timestamp
     # stragglers and boundary ties). Legacy servers without has_seq fall
     # back to the timestamp cursor with ip dedup. since_seq is always sent;
@@ -2783,29 +2872,47 @@ def netdb_sync_once(url, token, timeout=None, history_download=True,
     # ...then merge what the others found.
     inserted, updated = netdb_merge_remote(remote_all, last_watermark)
     netdb_save_config(url, token, now, new_seq if use_seq else last_seq)
+    if verbose:
+        print(f"  server download complete: {len(remote_all)} row(s) "
+              f"(inserted {inserted}, updated {updated}) in "
+              f"{time.time() - phase_started:.1f}s", flush=True)
     summary = {"uploaded": uploaded,
                "merged_on_server": merged_on_server,
                "downloaded": len(remote_all),
                "inserted": inserted, "updated": updated,
                "total_remote": total_remote,
                "now": now}
+    phase_started = time.time()
     try:
         summary.update(netdb_sync_history(
             url, token, timeout=timeout, compress=compress_requests,
             download=history_download))
+        if verbose:
+            print(f"  history sync complete: uploaded="
+                  f"{summary.get('history_uploaded', 0)} downloaded="
+                  f"{summary.get('history_downloaded', 0)} in "
+                  f"{time.time() - phase_started:.1f}s", flush=True)
     except Exception as exc:
         summary["history_error"] = str(exc)
+        if verbose:
+            print(f"  history sync failed: {exc}", flush=True)
     try:
         summary.update(netdb_notes_sync_once(
             url, token, timeout=timeout, download=notes_download))
     except Exception as exc:
         summary["notes_error"] = str(exc)
+    phase_started = time.time()
     try:
-        dedupe = dedupe_and_compact()
+        dedupe = dedupe_and_compact(verbose=verbose)
         if dedupe:
             summary["dedupe"] = dedupe
+        if verbose and dedupe:
+            print(f"  local maintenance complete in "
+                  f"{time.time() - phase_started:.1f}s", flush=True)
     except Exception as exc:
         summary["dedupe_error"] = str(exc)
+        if verbose:
+            print(f"  local maintenance failed: {exc}", flush=True)
     return summary
 
 def _canonical_note_id(value):
