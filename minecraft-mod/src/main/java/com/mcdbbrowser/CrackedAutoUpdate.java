@@ -6,7 +6,9 @@ import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl;
 import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.network.Connection;
 import org.jspecify.annotations.Nullable;
 
@@ -31,11 +33,12 @@ public final class CrackedAutoUpdate {
 
 	/** The client reached the world; inspect the live connection. */
 	public static void onJoined(ClientPacketListener handler) {
-		Boolean encrypted = encrypted(handler);
+		Connection connection = handler.getConnection();
+		Boolean encrypted = encrypted(connection);
 		if (encrypted == null) {
 			return;
 		}
-		String address = serverAddress(handler);
+		String address = serverAddress(connection, handler.getServerData());
 		if (address == null || address.isBlank()) {
 			return;
 		}
@@ -43,27 +46,43 @@ public final class CrackedAutoUpdate {
 		apply(address, encrypted ? "No" : "Yes");
 	}
 
-	private static @Nullable String serverAddress(ClientPacketListener handler) {
+	/**
+	 * A login can prove online mode even when the server then rejects us
+	 * (for example a whitelist kick). Encryption is installed as soon as the
+	 * server sends its Encryption Request.
+	 */
+	public static void onLoginDisconnect(ClientHandshakePacketListenerImpl handler) {
+		Connection connection = field(handler, "connection", Connection.class);
+		if (connection == null) {
+			return;
+		}
+		Boolean encrypted = encrypted(connection);
+		if (!Boolean.TRUE.equals(encrypted)) {
+			return;
+		}
+		ServerData data = field(handler, "serverData", ServerData.class);
+		String address = serverAddress(connection, data);
+		if (address == null || address.isBlank()) {
+			return;
+		}
+		McdbBrowserClient.LOGGER.info("mcdb cracked login: {} encrypted=true", address);
+		apply(address, "No");
+	}
+
+	private static @Nullable String serverAddress(Connection connection, @Nullable ServerData data) {
 		try {
-			Connection connection = handler.getConnection();
 			SocketAddress remote = connection.getRemoteAddress();
 			if (remote instanceof InetSocketAddress inet && inet.getAddress() != null) {
 				return inet.getAddress().getHostAddress() + ":" + inet.getPort();
 			}
 		} catch (Exception ignored) {
 		}
-		try {
-			var data = handler.getServerData();
-			return data == null || data.ip.isBlank() ? null : data.ip;
-		} catch (Exception ignored) {
-			return null;
-		}
+		return data == null || data.ip.isBlank() ? null : data.ip;
 	}
 
 	/** True when the connection pipeline has encryption handlers installed. */
-	private static @Nullable Boolean encrypted(ClientPacketListener handler) {
+	private static @Nullable Boolean encrypted(Connection connection) {
 		try {
-			Connection connection = handler.getConnection();
 			Field channelField = Connection.class.getDeclaredField("channel");
 			channelField.setAccessible(true);
 			Object value = channelField.get(connection);
@@ -73,6 +92,23 @@ public final class CrackedAutoUpdate {
 			}
 		} catch (Exception e) {
 			McdbBrowserClient.LOGGER.debug("Could not inspect connection encryption", e);
+		}
+		return null;
+	}
+
+	private static <T> @Nullable T field(Object target, String name, Class<T> type) {
+		Class<?> current = target.getClass();
+		while (current != null) {
+			try {
+				Field field = current.getDeclaredField(name);
+				field.setAccessible(true);
+				Object value = field.get(target);
+				return type.isInstance(value) ? type.cast(value) : null;
+			} catch (NoSuchFieldException e) {
+				current = current.getSuperclass();
+			} catch (Exception e) {
+				return null;
+			}
 		}
 		return null;
 	}

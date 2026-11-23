@@ -2,6 +2,7 @@ package com.mcdbbrowser;
 
 import java.util.List;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.networking.v1.ClientLoginConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.fabricmc.fabric.api.client.screen.v1.Screens;
@@ -30,6 +31,8 @@ public class McdbBrowserClient implements ClientModInitializer {
 			WhitelistAutoUpdate.onJoined();
 			CrackedAutoUpdate.onJoined(handler);
 		});
+		ClientLoginConnectionEvents.DISCONNECT.register(
+			(handler, client) -> CrackedAutoUpdate.onLoginDisconnect(handler));
 
 		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
 			if (screen instanceof PauseScreen pauseScreen) {
