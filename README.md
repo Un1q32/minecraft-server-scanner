@@ -842,8 +842,10 @@ required on the machine.
   `mcscan.py --sync`
 - Sync DB: `mcscan.py --sync`
 
-After a successful command the mod reloads the shared database. Settings
-contains the Python command and a **Shared DB Credentials** menu for the URL
+The filter row includes **Notes** with `Any`, `No notes`, and `Has notes`.
+Choose **No notes** to hide servers already joined/annotated. Whitelist and
+sync commands reload the shared database; Rescan refreshes only the selected
+row. Settings contains the Python command and a **Shared DB Credentials** menu for the URL
 and token; those are written to the extracted scanner's `netdb.json`, so no
 command-line setup is needed. For advanced setups a scanner directory can
 still be set in `config/mcdbbrowser.json`, but it is not required.

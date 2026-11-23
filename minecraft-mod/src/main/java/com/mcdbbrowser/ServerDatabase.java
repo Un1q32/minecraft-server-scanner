@@ -554,6 +554,11 @@ public final class ServerDatabase {
 			}
 		}
 		rows = deduplicatePorts(rows);
+		if (query.notes() != NotesFilter.ANY) {
+			Set<String> noted = NotesDatabase.notedAddressesNow();
+			boolean wantNotes = query.notes() == NotesFilter.NOTED;
+			rows.removeIf(row -> noted.contains(row.address()) != wantNotes);
+		}
 		// SQLite is already native, but letting it compute derived columns and
 		// then sorting Java records keeps sort changes entirely in memory.
 		rows.sort(comparator(sortKeys));
@@ -964,6 +969,23 @@ public final class ServerDatabase {
 		}
 	}
 
+	public enum NotesFilter implements Labeled {
+		ANY("Any"),
+		UNNOTED("No notes"),
+		NOTED("Has notes");
+
+		private final String label;
+
+		NotesFilter(String label) {
+			this.label = label;
+		}
+
+		@Override
+		public String label() {
+			return this.label;
+		}
+	}
+
 	public enum OnlineFilter implements Filter {
 		ONLINE("Online", "online != 0"),
 		ALL("All", null),
@@ -988,27 +1010,33 @@ public final class ServerDatabase {
 		}
 	}
 
-	public record Query(String search, OnlineFilter online, PlayersFilter players, AuthFilter auth, WhitelistFilter whitelist) {
-		public static final Query DEFAULT = new Query("", OnlineFilter.ONLINE, PlayersFilter.ANY, AuthFilter.ANY, WhitelistFilter.ANY);
+	public record Query(String search, OnlineFilter online, PlayersFilter players, AuthFilter auth,
+			WhitelistFilter whitelist, NotesFilter notes) {
+		public static final Query DEFAULT = new Query("", OnlineFilter.ONLINE, PlayersFilter.ANY,
+			AuthFilter.ANY, WhitelistFilter.ANY, NotesFilter.ANY);
 
 		public Query withSearch(String search) {
-			return new Query(search, this.online, this.players, this.auth, this.whitelist);
+			return new Query(search, this.online, this.players, this.auth, this.whitelist, this.notes);
 		}
 
 		public Query withOnline(OnlineFilter online) {
-			return new Query(this.search, online, this.players, this.auth, this.whitelist);
+			return new Query(this.search, online, this.players, this.auth, this.whitelist, this.notes);
 		}
 
 		public Query withPlayers(PlayersFilter players) {
-			return new Query(this.search, this.online, players, this.auth, this.whitelist);
+			return new Query(this.search, this.online, players, this.auth, this.whitelist, this.notes);
 		}
 
 		public Query withAuth(AuthFilter auth) {
-			return new Query(this.search, this.online, this.players, auth, this.whitelist);
+			return new Query(this.search, this.online, this.players, auth, this.whitelist, this.notes);
 		}
 
 		public Query withWhitelist(WhitelistFilter whitelist) {
-			return new Query(this.search, this.online, this.players, this.auth, whitelist);
+			return new Query(this.search, this.online, this.players, this.auth, whitelist, this.notes);
+		}
+
+		public Query withNotes(NotesFilter notes) {
+			return new Query(this.search, this.online, this.players, this.auth, this.whitelist, notes);
 		}
 	}
 

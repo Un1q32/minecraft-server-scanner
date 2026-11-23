@@ -140,7 +140,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 			directionArrow(this.primaryDescending()), button -> this.toggleDirection())
 			.bounds(paneX + sortWidth + GAP, SEARCH_ROW_Y, ROW_HEIGHT, ROW_HEIGHT).build());
 
-		int filterWidth = Math.max(48, (leftWidth - 3 * GAP) / 4);
+		int filterWidth = Math.max(44, (leftWidth - 4 * GAP) / 5);
 		this.addRenderableWidget(new Dropdown<>(MARGIN, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Status", ServerDatabase.OnlineFilter.values(), this.query.online(),
 			online -> this.setQuery(this.query.withOnline(online))));
 		this.addRenderableWidget(new Dropdown<>(MARGIN + filterWidth + GAP, FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Players", ServerDatabase.PlayersFilter.values(), this.query.players(),
@@ -149,6 +149,8 @@ public class ServerBrowserScreen extends DropdownScreen {
 			auth -> this.setQuery(this.query.withAuth(auth))));
 		this.addRenderableWidget(new Dropdown<>(MARGIN + 3 * (filterWidth + GAP), FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Whitelist", ServerDatabase.WhitelistFilter.values(), this.query.whitelist(),
 			whitelist -> this.setQuery(this.query.withWhitelist(whitelist))));
+		this.addRenderableWidget(new Dropdown<>(MARGIN + 4 * (filterWidth + GAP), FILTER_ROW_Y, filterWidth, ROW_HEIGHT, "Notes", ServerDatabase.NotesFilter.values(), this.query.notes(),
+			notes -> this.setQuery(this.query.withNotes(notes))));
 
 		this.list = this.addRenderableWidget(new ServerListWidget(listWidth, this.height - FOOTER_HEIGHT - LIST_TOP, LIST_TOP));
 		this.list.setX(MARGIN);
@@ -386,6 +388,9 @@ public class ServerBrowserScreen extends DropdownScreen {
 		super.added();
 		// Reload after returning from the notes viewer, since notes may have changed.
 		this.notesAddress = null;
+		if (this.query.notes() != ServerDatabase.NotesFilter.ANY && !this.loading) {
+			this.runQuery();
+		}
 	}
 
 	private void updateActivitySelection() {

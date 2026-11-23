@@ -9,7 +9,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -63,6 +65,22 @@ final class NotesDatabase {
 				throw new CompletionException(e);
 			}
 		}, WORKER);
+	}
+
+	/** Addresses with at least one active note, for the list filter. */
+	static Set<String> notedAddressesNow() {
+		Set<String> addresses = new HashSet<>();
+		try (Connection connection = open();
+			 PreparedStatement statement = connection.prepareStatement(
+				 "SELECT DISTINCT ip_port FROM notes WHERE text IS NOT NULL");
+			 ResultSet rs = statement.executeQuery()) {
+			while (rs.next()) {
+				addresses.add(rs.getString(1));
+			}
+		} catch (SQLException e) {
+			McdbBrowserClient.LOGGER.warn("Could not read noted addresses", e);
+		}
+		return addresses;
 	}
 
 	static CompletableFuture<Note> add(String ipPort, String text) {
