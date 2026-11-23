@@ -134,6 +134,7 @@ except Exception:
 import hashlib
 import uuid
 import zlib
+_CRYPTO_BACKEND = None
 try:
     from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -151,9 +152,61 @@ try:
             return _CFB8(iv)
         return modes.CFB8(iv)
 
-    _CRYPTO_AVAILABLE = True
+    _CRYPTO_BACKEND = "cryptography"
 except Exception:
-    _CRYPTO_AVAILABLE = False
+    # PyPy does not get a working cryptography wheel on every release
+    # (PyO3/PyPy ABI mismatches). PyCryptodome ships a PyPy wheel and
+    # provides the same RSA PKCS#1 v1.5 and AES-CFB8 pieces used here.
+    try:
+        from Crypto.Cipher import AES as _PyAES
+        from Crypto.Cipher import PKCS1_v1_5 as _PyPKCS1
+        from Crypto.PublicKey import RSA as _PyRSA
+        _CRYPTO_BACKEND = "pycryptodome"
+    except Exception:
+        _CRYPTO_BACKEND = None
+_CRYPTO_AVAILABLE = _CRYPTO_BACKEND is not None
+
+
+class _UpdateWrapper:
+    """Expose PyCryptodome's encrypt/decrypt as .update(), like cryptography."""
+    def __init__(self, fn):
+        self._fn = fn
+
+    def update(self, data):
+        return self._fn(data)
+
+
+def _make_cfb8_pair(key, iv):
+    """(encryptor, decryptor) for AES-CFB8 with either crypto backend."""
+    if _CRYPTO_BACKEND == "cryptography":
+        decryptor = Cipher(
+            algorithms.AES(key), _cfb8(iv), backend=default_backend()
+        ).decryptor()
+        encryptor = Cipher(
+            algorithms.AES(key), _cfb8(iv), backend=default_backend()
+        ).encryptor()
+        return encryptor, decryptor
+    if _CRYPTO_BACKEND == "pycryptodome":
+        enc = _PyAES.new(key, _PyAES.MODE_CFB, iv=iv, segment_size=8)
+        dec = _PyAES.new(key, _PyAES.MODE_CFB, iv=iv, segment_size=8)
+        return _UpdateWrapper(enc.encrypt), _UpdateWrapper(dec.decrypt)
+    raise RuntimeError("cryptography or pycryptodome is required")
+
+
+def _load_rsa_public_key(der):
+    if _CRYPTO_BACKEND == "cryptography":
+        return load_der_public_key(der, backend=default_backend())
+    if _CRYPTO_BACKEND == "pycryptodome":
+        return _PyRSA.import_key(der)
+    raise RuntimeError("cryptography or pycryptodome is required")
+
+
+def _rsa_encrypt(public_key, data):
+    if _CRYPTO_BACKEND == "cryptography":
+        return public_key.encrypt(data, rsa_padding.PKCS1v15())
+    if _CRYPTO_BACKEND == "pycryptodome":
+        return _PyPKCS1.new(public_key).encrypt(data)
+    raise RuntimeError("cryptography or pycryptodome is required")
 
 SHODAN_KEY_PATH = os.path.join(os.getcwd(), "shodan_key.txt")
 SERVERS_DB_FILE = "servers.db"
@@ -4844,18 +4897,9 @@ def read_mc_string_from_bytes(buf, pos):
 
 class EncryptedSocket:
     def __init__(self, sock, shared_secret):
-        backend = default_backend()
         self.sock = sock
-        self.decryptor = Cipher(
-            algorithms.AES(shared_secret),
-            _cfb8(shared_secret),
-            backend=backend
-        ).decryptor()
-        self.encryptor = Cipher(
-            algorithms.AES(shared_secret),
-            _cfb8(shared_secret),
-            backend=backend
-        ).encryptor()
+        self.encryptor, self.decryptor = _make_cfb8_pair(
+            shared_secret, shared_secret)
 
     def recv(self, length):
         data = self.sock.recv(length)
@@ -5415,9 +5459,11 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                             _throttle_online_whitelist_probe(account)
                             break
                         if not _CRYPTO_AVAILABLE:
-                            return None, append_mod_warning("cryptography package is not available", mod_warning), "done"
+                            return None, append_mod_warning(
+                                "cryptography or pycryptodome package is not available",
+                                mod_warning), "done"
                         _throttle_online_whitelist_probe(account)
-                        public_key = load_der_public_key(public_key_bytes, backend=default_backend())
+                        public_key = _load_rsa_public_key(public_key_bytes)
                         shared_secret = os.urandom(16)
                         server_hash = minecraft_sha1_hexdigest(
                             server_id.encode("ascii", errors="ignore"),
@@ -5440,8 +5486,8 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                                 return None, f"Mojang sessionserver rate limited join ({exc})", "retry_rate"
                             return None, append_mod_warning(f"Auth/session failed before server login ({exc})", mod_warning), "done"
                         mojang_used = True
-                        encrypted_secret = public_key.encrypt(shared_secret, rsa_padding.PKCS1v15())
-                        encrypted_token = public_key.encrypt(verify_token, rsa_padding.PKCS1v15())
+                        encrypted_secret = _rsa_encrypt(public_key, shared_secret)
+                        encrypted_token = _rsa_encrypt(public_key, verify_token)
                         response = varint_encode(0x01)
                         response += varint_encode(len(encrypted_secret)) + encrypted_secret
                         response += varint_encode(len(encrypted_token)) + encrypted_token

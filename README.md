@@ -249,7 +249,9 @@ be reconfigured when a scanner joins or leaves.
 - Python 3.10 or newer.
 - PySide6 for the Qt GUI (`pip install PySide6`).
 - A valid Shodan API key for Shodan searches (optional; the shodan package itself is optional too — `pip install shodan` only if you use that tab).
-- The cryptography package for authenticated whitelist probes.
+- The cryptography package for authenticated whitelist probes. PyPy can use
+  `pycryptodome` instead (`pypy3 -m pip install pycryptodome`); it provides
+  the RSA and AES-CFB8 pieces the whitelist probe needs.
 - Network access for Shodan, Minecraft status probes, account services, and ASN prefix lookup.
 - Optional: masscan for fast Network Scan discovery (requires root/Administrator + Npcap on Windows). Without it, the scanner falls back to the Python backend.
 
@@ -268,7 +270,13 @@ servers — `import scanner` falls back to inert UI stubs when PySide6 is
 absent, and every CLI path below avoids them. Target syntax is identical
 to the GUI's Network Scan box (IPs, CIDRs, `start-end` ranges, ASNs,
 hostnames). Run it from the same working directory as the GUI so it
-shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`:
+shares `servers.db`, `netdb.json`, `exclude.conf`, and `ignore.txt`.
+
+The CLI can run under PyPy; install `pycryptodome` for authenticated
+whitelist probes. The Qt GUI itself still requires CPython, because
+PySide6 does not support PyPy. If PyPy's sqlite3 rejects a fresh database
+migration, create or migrate that database with CPython first.
+
 
     python mcscan.py --init-db URL TOKEN    # save shared-DB creds to netdb.json
     python mcscan.py --sync                  # sync shared DB (auto-full-download if local DB is missing)
