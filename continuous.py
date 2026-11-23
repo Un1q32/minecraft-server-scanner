@@ -68,6 +68,7 @@ DEFAULT_RESCAN_EVERY = 2        # normal rounds between rescan rounds
 HIGH_RES_RESCAN_SPACING = 1800  # --high-res: 30 minutes between rescans
 HIGH_RES_PLAYER_SPACING = 300   # --high-res: 5 minutes for servers with players
 RESCAN_PY_MAX = 100             # tiny port groups: ping directly, no masscan
+RESCAN_LOG_MIN_TARGETS = 20     # suppress per-port noise for tiny groups
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
 REVIVED_AFTER = 7 * 86400       # unseen this long -> a find is a "revival"
@@ -1355,6 +1356,10 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     for spec, port in targets:
                         by_port.setdefault(port, []).append(spec)
                     status.start(f"round {rounds} rescan")
+                    if len(by_port) > 1:
+                        status.note(
+                            f"  sweeping {len(targets)} target(s) across "
+                            f"{len(by_port)} port group(s)...")
                     # This is one round, not one round per port.  Without a
                     # shared deadline a node with 40 known ports ran 40 x
                     # (scan_duration/2) = 6000s at the default settings.
@@ -1383,9 +1388,10 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                             direct = (len(specs) <= RESCAN_PY_MAX
                                       and _estimate_probes(specs, [port])
                                       <= RESCAN_PY_MAX)
-                            status.note(
-                                f"  port {port}: {len(specs)} target(s) "
-                                f"({'python' if direct else 'masscan'})...")
+                            if not direct or len(specs) >= RESCAN_LOG_MIN_TARGETS:
+                                status.note(
+                                    f"  port {port}: {len(specs)} target(s) "
+                                    f"({'python' if direct else 'masscan'})...")
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note,
