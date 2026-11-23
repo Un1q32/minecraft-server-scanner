@@ -734,9 +734,12 @@ ApplicationWindow {
     function runAction(action) {
         jobDialog.validationMessage = ""
         jobDialog.actionTitle = action === "sync" ? "Database sync"
-                              : action === "rescan" ? "Server rescan" : "Whitelist check"
+                              : action === "rescan" ? "Server rescan"
+                              : action === "cracked" ? "Cracked check"
+                              : "Whitelist check"
         var error = action === "sync" ? viewer.startSync()
                   : action === "rescan" ? viewer.startRescan(window.selectedIps().join(","))
+                  : action === "cracked" ? viewer.startRecheckCracked(window.selectedIps().join(","))
                   : viewer.startRecheck(window.selectedIps().join(","))
         jobDialog.autoShown = false
         if (error.length === 0) {
@@ -974,6 +977,14 @@ ApplicationWindow {
                     text: viewer.busy ? "Working…" : "Sync DB"
                     enabled: !viewer.busy && viewer.db_path.length > 0
                     onClicked: window.runAction("sync")
+                }
+
+                SquareButton {
+                    text: viewer.busy ? "Working…" : "Recheck cracked"
+                    enabled: !viewer.busy && viewer.db_path.length > 0
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Probe the minimal login handshake to set cracked/online mode"
+                    onClicked: window.runAction("cracked")
                 }
 
                 SquareButton {

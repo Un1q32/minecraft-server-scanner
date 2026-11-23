@@ -65,7 +65,7 @@ When masscan reports insufficient privileges and `sudo` is available (Linux/macO
 
 #### Cracked column
 
-The result table has a CRACKED column. The status ping seeds a likely verdict for a newly seen server (a sampled player's UUID matching the offline-mode UUID for its name), but it never overwrites an existing verdict: an online-mode proxy can expose offline UUIDs while still requiring Mojang auth. A click on `Check Cracked` login-probes selected rows for confirmation (`Yes`, `No`, `Unknown`; previously seen servers show `Yes (cached)` from `known_cracked_servers.json`). A blank cell means unset/unknown; a transient whitelist kick such as "server starting, please reconnect" unsets it instead of guessing. A whitelist or login-plugin kick before encryption is treated as unknown rather than cracked, because online-mode proxies can reject at that stage too. The `Check Cracked` button is the only way a scan changes an existing value. The column is sortable. Older databases may contain heuristic cracked guesses written by status pings; on startup those non-authoritative `cracked=1` rows are reset once to unknown (explicit checker verdicts are kept), so old false positives stop showing as **Cracked**.
+The result table has a CRACKED column. The status ping seeds a likely verdict for a newly seen server (a sampled player's UUID matching the offline-mode UUID for its name), but it never overwrites an existing verdict: an online-mode proxy can expose offline UUIDs while still requiring Mojang auth. A click on `Check Cracked` login-probes selected rows for confirmation (`Yes`, `No`, `Unknown`; previously seen servers show `Yes (cached)` from `known_cracked_servers.json`). A blank cell means unset/unknown; a transient whitelist kick such as "server starting, please reconnect" unsets it instead of guessing. A whitelist or login-plugin kick before encryption is treated as unknown rather than cracked, because online-mode proxies can reject at that stage too. A status scan never changes an existing value; only an explicit cracked probe does (`Check Cracked`, the CLI `--recheck-cracked`, the Rust viewer's **Recheck cracked**, or continuous mode's bounded auto-recheck), and all of them use the same minimal login handshake. The column is sortable. Older databases may contain heuristic cracked guesses written by status pings; on startup those non-authoritative `cracked=1` rows are reset once to unknown (explicit checker verdicts are kept), so old false positives stop showing as **Cracked**.
 
 ### Whitelist verification
 
@@ -289,20 +289,31 @@ migration, create or migrate that database with CPython first.
     python mcscan.py --continuous            # self-tuning forever scan
     python mcscan.py --high-res              # rescan-focused, 5-minute player tier
     python mcscan.py --recheck-whitelist 1.2.3.4:25565  # probe whitelist status
+    python mcscan.py --recheck-cracked 1.2.3.4:25565    # probe cracked/online mode
     python mcscan.py --rescan 1.2.3.4:25565  # re-ping, update local DB
 
 Useful flags: `--backend {auto,masscan,minescan,python}` (default `auto`,
 masscan first like the GUI), `--ports 25565,25566`, `--rate`, `--wait`,
-`--max-hosts`. Discovery only (status ping + player sample), except
-`--recheck-whitelist`, which runs the same login probes as the GUI's
-Check Whitelist button. Cracked login probes stay in the GUI. Like the
-GUI, masscan needs
+`--max-hosts`. Discovery only (status ping + player sample), except the
+explicit login probes: `--recheck-whitelist` uses the same whitelist login
+as the GUI's Check Whitelist button, and `--recheck-cracked` uses the
+minimal login handshake described below. Like the GUI, masscan needs
 raw-socket privileges: run as root, rely on passwordless sudo for the
 automatic retry, or pick another backend. Ctrl-C stops a running scan
 and keeps results found so far — it abandons queued probes rather than
 waiting for them, skips the end-of-scan sync, and a second Ctrl-C forces
 an immediate exit. The GUI behaves the same (closing the window also
 stops in-flight scans).
+
+`--recheck-cracked` uses the smallest handshake that yields a definitive
+answer: Handshake → Login Start with an offline name → read the login
+response. An Encryption Request proves online mode (`No`), and Login
+Success without encryption proves cracked/offline mode (`Yes`). A whitelist,
+plugin, throttle, or version kick before encryption is inconclusive
+(`Unknown`) and leaves the stored verdict untouched; timeouts are also
+ignored. Both definitive results update `servers.db` and keep
+`known_cracked_servers.json` consistent (a disproven cracked cache entry is
+removed). The stored protocol is reused, so no status ping is needed.
 
 `--download-db` asks the shared server for direct SQLite snapshots
 (`GET /api/db` and `/api/notes/db`, compacted with `VACUUM INTO`) and
@@ -396,7 +407,14 @@ cancelled instead of extending the round.
 `--strategies slash24a,slash32b` restricts the pool, `--rescan-every N`
 sets the rescan cadence (default 2, alternating normal/rescan; `1`
 rescans every round), `--no-rescan` skips rescan rounds entirely, and
-`--rounds N` stops after N rounds (useful for testing). `--high-res`
+`--rounds N` stops after N rounds (useful for testing). After every round
+the loop also probes a bounded batch of online servers whose cracked state
+is still unknown (`cracked IS NULL`), using the same minimal login
+handshake as `--recheck-cracked`; only definitive `Yes`/`No` results are
+saved and a host that stays inconclusive is not retried for six hours.
+The batch is 100 servers per round and can be tuned with
+`--cracked-recheck N` (`0` disables it) or turned off entirely with
+`--no-cracked-recheck`. `--high-res`
 (`--hi-res`) is the rescan-focused variant: it implies continuous mode,
 uses `--rescan-every 1`, moves the player tier to 5 minutes and the recent
 tier to 30 minutes. The older tiers keep their normal cadence. It also
@@ -465,8 +483,9 @@ shared DB has tens of thousands of rows. `dbviewer/` is a small Rust + Qt 6
 read-only, exposes the rows through a `QAbstractTableModel`, and lets Qt's
 `TableView` ask for just the visible cells. There is no masscan sweep in
 the viewer, but **Rescan** re-pings the selected rows and updates the local
-DB, **Sync DB** runs `mcscan.py --sync`, and **Recheck whitelist** runs the
-same login probes as the GUI for the selected rows.
+DB, **Sync DB** runs `mcscan.py --sync`, **Recheck cracked** runs the
+minimal login handshake for the selected rows, and **Recheck whitelist**
+runs the same whitelist login probes as the GUI.
 
 On a 113k-row database, the release build opens the whole table in about
 80–110 ms; searches take 45–90 ms and sorting is in memory (a few ms to
@@ -582,6 +601,19 @@ response from one buffered read. Results are written to SQLite in
 batches and the User Log tab refresh is coalesced to at most every two
 seconds, so large rescans spend their time on the network instead of one
 commit per server.
+
+### Recheck cracked
+
+Select one or more rows and click **Recheck cracked**. The viewer runs
+
+    <python> mcscan.py --recheck-cracked IP:PORT ...
+
+in the database's directory and reloads the table when it finishes. This
+is the minimal login handshake, not a status ping: Encryption Request marks
+the row **No**, Login Success without encryption marks it **Yes**, and a
+whitelist/plugin/throttle kick or timeout stays **Unknown** and leaves the
+existing value alone. Definitive verdicts update `servers.db` and the
+cracked cache.
 
 ### Recheck whitelist
 

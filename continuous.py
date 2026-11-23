@@ -81,6 +81,8 @@ STATUS_LOG_INTERVAL = 15.0      # redraw cadence when output is piped
 SHARD_HEARTBEAT = 10.0          # auto-shard heartbeat interval (seconds)
 SHARD_TIMEOUT = 8.0             # per-heartbeat HTTP timeout (seconds)
 NODE_ID_FILE = "continuous_node_id"
+DEFAULT_CRACKED_RECHECK_BATCH = 100  # unknown-mode probes per round
+CRACKED_RECHECK_TTL = 6 * 3600       # do not retry the same unknown host sooner
 
 STRATEGY_NAMES = (
     "slash0", "slash16a", "slash16b",
@@ -1130,12 +1132,75 @@ class ShardManager:
         ).start()
 
 
+def recheck_unknown_cracked(batch=DEFAULT_CRACKED_RECHECK_BATCH,
+                            attempted=None, stop_event=None, log=print):
+    """Probe a bounded batch of online servers with an unknown cracked state.
+
+    Only definitive verdicts are persisted (``recheck_cracked_ips`` leaves
+    inconclusive timeouts/kicks untouched).  ``attempted`` maps ip:port to a
+    monotonic timestamp so a host that keeps timing out is not probed every
+    round.  Returns the probe result tuples.
+    """
+    try:
+        batch = int(batch)
+    except Exception:
+        batch = 0
+    if batch <= 0:
+        return []
+    if attempted is None:
+        attempted = {}
+    now = time.monotonic()
+    if attempted:
+        for ip, stamp in list(attempted.items()):
+            if now - stamp > CRACKED_RECHECK_TTL:
+                attempted.pop(ip, None)
+    # Sample randomly so a small per-round budget eventually covers the
+    # whole unknown backlog instead of re-probing the same newest rows.
+    try:
+        candidates = scanner.query_unknown_cracked(
+            limit=max(batch * 4, batch), randomize=True)
+    except Exception as exc:
+        log(f"  cracked recheck: query failed: {exc}")
+        return []
+    picked = []
+    for row in candidates:
+        ip = row.get("ip_port") or ""
+        if not ip or ip in attempted:
+            continue
+        picked.append(row)
+        if len(picked) >= batch:
+            break
+    if not picked:
+        return []
+    log(f"  cracked recheck: probing {len(picked)} unknown server(s)...")
+
+    def progress(_done, _total, ip, _result, _message):
+        attempted[ip] = time.monotonic()
+
+    try:
+        results = scanner.recheck_cracked_ips(
+            picked, progress_cb=progress, stop_event=stop_event)
+    except Exception as exc:
+        log(f"  cracked recheck failed: {exc}")
+        return []
+    for ip, _result, _message in results:
+        attempted[ip] = time.monotonic()
+    cracked = sum(1 for _ip, result, _message in results if result is True)
+    online = sum(1 for _ip, result, _message in results if result is False)
+    unknown = len(results) - cracked - online
+    log(f"  cracked recheck: {cracked} cracked, {online} online-mode, "
+        f"{unknown} inconclusive")
+    return results
+
+
 def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                    sync_every=DEFAULT_SYNC_EVERY, state_path="strategies.json",
                    backend="auto", strategies=None, do_rescan=True,
                    rescan_every=None, high_res=False,
                    stop_event=None, max_rounds=None, shard=None, seed=None,
-                   base_ports=None, auto_shard=False, node_id=None):
+                   base_ports=None, auto_shard=False, node_id=None,
+                   cracked_recheck=True,
+                   cracked_recheck_batch=DEFAULT_CRACKED_RECHECK_BATCH):
     """The forever loop. Returns a process exit code."""
     base_ports = _base_ports(base_ports)
     if rescan_every is None:
@@ -1185,6 +1250,9 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
           f"rescan={rescan_note} scan_duration={scan_duration}s "
           f"rate={rate}pps wait={wait}s backend={backend}"
           f"{ports_note}{shard_note}")
+    print(f"cracked recheck: "
+          + (f"{max(0, int(cracked_recheck_batch))} unknown server(s)/round"
+             if cracked_recheck else "off"))
     print(f"shared-DB sync every {sync_every}s "
           f"({'enabled' if url and token else 'skipped: no netdb.json'})")
     if shard_manager:
@@ -1196,6 +1264,7 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
     # Auto degrades to Python after a privilege/binary failure so a daemon
     # never dies just because it isn't running as root.
     state = {"backend": backend}
+    cracked_attempted = {}
 
     def do_round(ranges, ports, duration=None, on_hit=None, log=None,
                  backend=None):
@@ -1463,6 +1532,14 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                               * 3600.0 / (elapsed + 30.0))
                 print(f"  score for {name}: {score}")
                 picker.update(name, score)
+
+            if cracked_recheck and not stop_event.is_set():
+                try:
+                    recheck_unknown_cracked(
+                        cracked_recheck_batch, attempted=cracked_attempted,
+                        stop_event=stop_event, log=print)
+                except Exception as exc:
+                    print(f"  cracked recheck failed: {exc}")
 
             now = _now()
             if (sync_every and not stop_event.is_set()

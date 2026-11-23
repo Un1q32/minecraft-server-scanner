@@ -133,6 +133,11 @@ pub mod qobject {
         #[cxx_name = "startRecheck"]
         fn start_recheck(self: Pin<&mut ViewerModel>, ips: QString) -> QString;
 
+        /// Recheck cracked/online mode for a comma-separated list of ip:port.
+        #[qinvokable]
+        #[cxx_name = "startRecheckCracked"]
+        fn start_recheck_cracked(self: Pin<&mut ViewerModel>, ips: QString) -> QString;
+
         /// Re-ping a comma-separated list of ip:port and update the local DB.
         #[qinvokable]
         #[cxx_name = "startRescan"]
@@ -493,6 +498,29 @@ impl qobject::ViewerModel {
         self.as_mut().start_job(
             args,
             &format!("rechecking whitelist for {count} server(s)..."),
+        )
+    }
+
+    pub fn start_recheck_cracked(mut self: Pin<&mut Self>, ips: QString) -> QString {
+        let ips: Vec<String> = ips
+            .to_string()
+            .split(',')
+            .map(str::trim)
+            .filter(|ip| !ip.is_empty())
+            .map(str::to_string)
+            .collect();
+        if ips.is_empty() {
+            let message = "Select one or more server rows first, then click Recheck cracked.";
+            self.as_mut().set_status(qs(message));
+            self.as_mut().set_job_log(qs(message));
+            return qs(message);
+        }
+        let count = ips.len();
+        let mut args = vec!["--recheck-cracked".to_string()];
+        args.extend(ips);
+        self.as_mut().start_job(
+            args,
+            &format!("rechecking cracked status for {count} server(s)..."),
         )
     }
 

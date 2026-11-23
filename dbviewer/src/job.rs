@@ -1,4 +1,4 @@
-//! Background `mcscan.py` job runner (sync and whitelist rechecks).
+//! Background `mcscan.py` job runner (sync, rescan, and rechecks).
 //!
 //! The viewer runs the same commands the CLI uses, in the directory that
 //! holds `netdb.json` and `servers.db`. Output is captured on a background

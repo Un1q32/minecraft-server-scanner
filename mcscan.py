@@ -13,6 +13,9 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
   mcscan.py --init-db URL TOKEN     save shared-DB creds to netdb.json
   mcscan.py --recheck-whitelist IP:PORT ...
                                     probe whitelist status for those servers
+  mcscan.py --recheck-cracked IP:PORT ...
+                                    probe cracked/online mode with a minimal
+                                    login handshake
   mcscan.py --set-whitelist IP:PORT LABEL
                                     store a whitelist verdict observed directly
   mcscan.py --rescan IP:PORT ...    re-ping those servers, update local DB
@@ -26,9 +29,10 @@ separated -- e.g. "1.0.0.0/8, AS13335, mc.example.com".
                                     every round with 5/30-minute due spacing
 
 Discovery only (status ping + player sample) unless --recheck-whitelist
-is used, which runs the same login probes as the GUI's Check Whitelist
-button. Needs no display; masscan still needs raw-socket privileges (run as
-root, or passwordless sudo for the automatic retry).
+or --recheck-cracked is used, which run the same login probes as the GUI's
+Check Whitelist / Check Cracked buttons. Needs no display; masscan still
+needs raw-socket privileges (run as root, or passwordless sudo for the
+automatic retry).
 """
 
 import argparse
@@ -343,6 +347,41 @@ def cmd_set_cracked(ip, label):
         return 2
     scanner.update_server_cracked(ip, label, "real client join")
     print(f"cracked set: {ip}: {label}", flush=True)
+    return 0
+
+
+def cmd_recheck_cracked(ips):
+    """Probe cracked/online mode with the minimal login handshake."""
+    entries = []
+    seen = set()
+    for raw in ips or []:
+        ip = scanner.strict_ip_port(raw)
+        if not ip:
+            print(f"skip {raw!r}: not a valid ip:port", flush=True)
+            continue
+        if ip in seen:
+            continue
+        seen.add(ip)
+        entries.append(ip)
+    if not entries:
+        print("error: no valid servers to check", flush=True)
+        return 2
+
+    def progress(done, total, ip, result, message):
+        label = "online-mode" if result is False else (
+            "cracked" if result is True else "unknown")
+        print(f"[{done}/{total}] {ip}: {label}"
+              + (f" ({message})" if message else ""), flush=True)
+
+    print(f"checking cracked status for {len(entries)} server(s)...",
+          flush=True)
+    results = scanner.recheck_cracked_ips(
+        entries, progress_cb=progress, stop_event=_CLI_STOP)
+    cracked = sum(1 for _ip, result, _message in results if result is True)
+    online = sum(1 for _ip, result, _message in results if result is False)
+    unknown = len(results) - cracked - online
+    print(f"cracked recheck complete: {cracked} cracked, {online} online-mode, "
+          f"{unknown} unknown", flush=True)
     return 0
 
 
@@ -893,6 +932,13 @@ def cmd_continuous(args):
     rescan_every = getattr(args, "rescan_every", None)
     if high_res and rescan_every is None:
         rescan_every = 1
+    cracked_batch = getattr(args, "cracked_recheck", None)
+    if cracked_batch is None:
+        cracked_batch = continuous.DEFAULT_CRACKED_RECHECK_BATCH
+    else:
+        cracked_batch = max(0, int(cracked_batch))
+    cracked_recheck = (not getattr(args, "no_cracked_recheck", False)
+                       and cracked_batch > 0)
     return continuous.run_continuous(
         rate=args.rate,
         wait=args.wait,
@@ -904,6 +950,8 @@ def cmd_continuous(args):
         do_rescan=not getattr(args, "no_rescan", False),
         rescan_every=rescan_every,
         high_res=high_res,
+        cracked_recheck=cracked_recheck,
+        cracked_recheck_batch=cracked_batch,
         stop_event=_CLI_STOP,
         max_rounds=getattr(args, "rounds", None),
         shard=shard,
@@ -959,6 +1007,10 @@ def main(argv=None):
         "--set-whitelist", nargs=2, metavar=("IP:PORT", "LABEL"), default=None,
         help="store a whitelist verdict observed from a real client join")
     parser.add_argument(
+        "--recheck-cracked", nargs="+", metavar="IP:PORT", default=None,
+        help="probe cracked/online mode using the minimal login handshake "
+             "and update the local DB")
+    parser.add_argument(
         "--set-cracked", nargs=2, metavar=("IP:PORT", "LABEL"), default=None,
         help="store a cracked verdict observed from a real client join "
              "(yes/no/unknown)")
@@ -997,6 +1049,14 @@ def main(argv=None):
     parser.add_argument(
         "--no-rescan", action="store_true",
         help="--continuous: skip rescan rounds entirely")
+    parser.add_argument(
+        "--no-cracked-recheck", action="store_true",
+        help="--continuous: do not probe servers whose cracked/online state "
+             "is still unknown")
+    parser.add_argument(
+        "--cracked-recheck", type=int, default=None, metavar="N",
+        help="--continuous: max unknown cracked probes per round "
+             "(default: %d; 0 disables)" % 100)
     parser.add_argument(
         "--rescan-every", type=int, default=None, metavar="N",
         help="--continuous: run one rescan round every N rounds "
@@ -1047,7 +1107,8 @@ def main(argv=None):
             and args.init_db is None and not args.continuous \
             and not args.high_res \
             and args.recheck_whitelist is None and args.set_whitelist is None \
-            and args.set_cracked is None and args.rescan is None \
+            and args.recheck_cracked is None and args.set_cracked is None \
+            and args.rescan is None \
             and not args.download_db and not args.vacuum_db \
             and not args.dedupe and not args.prune_activity:
         parser.print_help()
@@ -1079,6 +1140,8 @@ def main(argv=None):
             rc = cmd_recheck_whitelist(args.recheck_whitelist) or rc
         if args.set_whitelist is not None:
             rc = cmd_set_whitelist(*args.set_whitelist) or rc
+        if args.recheck_cracked is not None:
+            rc = cmd_recheck_cracked(args.recheck_cracked) or rc
         if args.set_cracked is not None:
             rc = cmd_set_cracked(*args.set_cracked) or rc
         if args.rescan is not None:

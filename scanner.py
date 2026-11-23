@@ -484,6 +484,12 @@ def get_cached_cracked_entry(ip_port):
         entry = _CRACKED_CACHE.get(ip_port)
         return dict(entry) if entry else None
 
+def remove_cached_cracked_entry(ip_port):
+    """Drop a stale cracked verdict after a definitive online-mode probe."""
+    with _CRACKED_CACHE_LOCK:
+        if _CRACKED_CACHE.pop(ip_port, None) is not None:
+            _save_cracked_cache_locked()
+
 def record_cracked_server(ip_port, message="", extra=None):
     message = sanitize_motd(message or "")[:500]
     data = {
@@ -5147,10 +5153,20 @@ def pick_username(sample_names):
         return random.choice(valid)
     return "Notch"
 
-def login_probe(host, port=25565):
-    protocol, sample_names, sample_offline_hint = get_server_status_info(host, port)
+def login_probe(host, port=25565, protocol=None, username=None):
+    """Minimal mode probe: handshake + Login Start, then first server packet.
+
+    With a known protocol this avoids the status ping entirely.  The first
+    Encryption Request proves online mode; Login Success without encryption
+    proves offline/cracked.  A kick before encryption is inconclusive.
+    """
+    sample_names = []
+    sample_offline_hint = None
+    if protocol is None:
+        protocol, sample_names, sample_offline_hint = get_server_status_info(host, port)
     protocol = sanitize_protocol(protocol, DEFAULT_STATUS_PROTOCOL)
-    username = pick_username(sample_names)
+    if username is None:
+        username = pick_username(sample_names)
     sock = None
     saw_encryption_request = False
     compression_threshold = -1
@@ -5269,6 +5285,101 @@ def is_cracked_server(host, port=25565):
     Returns (result, message) where result is True/False/None (cracked/online/unknown).
     """
     return login_probe(host, port)
+
+def query_unknown_cracked(limit=None, randomize=False):
+    """Online servers whose cracked state is still unknown."""
+    _ensure_server_db()
+    import sqlite3
+    with _SERVER_DB_LOCK:
+        con = _server_db_connect()
+        try:
+            con.row_factory = sqlite3.Row
+            order = "RANDOM()" if randomize else "last_seen DESC"
+            sql = ("SELECT ip_port, protocol FROM servers"
+                   " WHERE cracked IS NULL AND online != 0"
+                   f" ORDER BY {order}")
+            if limit:
+                sql += " LIMIT ?"
+                cur = con.execute(sql, (max(1, int(limit)),))
+            else:
+                cur = con.execute(sql)
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            con.close()
+
+
+def recheck_cracked_ips(entries, progress_cb=None, stop_event=None,
+                        workers=None):
+    """Probe entries with the minimal login handshake and persist verdicts.
+
+    ``entries`` may be ip:port strings or dicts with ``ip_port``/``protocol``.
+    Returns a list of ``(ip_port, result, message)``; result is True for
+    cracked, False for online-mode, and None when the probe was inconclusive.
+    """
+    parsed = []
+    seen = set()
+    for item in entries or []:
+        if isinstance(item, dict):
+            ip = strict_ip_port(item.get("ip_port"))
+            protocol = sanitize_protocol(item.get("protocol"))
+        else:
+            ip = strict_ip_port(item)
+            protocol = _stored_protocol(ip) if ip else None
+        if not ip or ip in seen:
+            continue
+        seen.add(ip)
+        parsed.append((ip, protocol))
+    if not parsed:
+        return []
+    try:
+        workers = int(workers or CRACKED_VERIFY_WORKERS)
+    except Exception:
+        workers = CRACKED_VERIFY_WORKERS
+    workers = max(1, min(workers, len(parsed)))
+    results = []
+
+    def probe(item):
+        ip, protocol = item
+        try:
+            host, port = split_host_port(ip)
+            result, message = login_probe(host, port, protocol=protocol,
+                                          username=OFFLINE_PROBE_NAME)
+            return ip, result, message
+        except Exception as exc:
+            return ip, None, str(exc)[:200]
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = []
+        for item in parsed:
+            if stop_event is not None and stop_event.is_set():
+                break
+            futures.append(executor.submit(probe, item))
+        for done, future in enumerate(as_completed(futures), 1):
+            ip, result, message = future.result()
+            try:
+                if result is True:
+                    # Definitive offline-mode login. Refresh the DB verdict;
+                    # only add a new cache entry/log line when this server was
+                    # not already known as cracked.
+                    if get_cached_cracked_entry(ip):
+                        update_server_cracked(ip, "Yes", message or "")
+                    else:
+                        record_cracked_server(
+                            ip, message or "CRACKED (login success)")
+                elif result is False:
+                    # A previously cached cracked verdict is now disproven.
+                    remove_cached_cracked_entry(ip)
+                    update_server_cracked(ip, "No", message or "")
+            except Exception:
+                pass
+            results.append((ip, result, message))
+            if progress_cb:
+                try:
+                    progress_cb(done, len(futures), ip, result, message)
+                except Exception:
+                    pass
+    return results
+
 
 def build_authenticated_login_start(account, protocol):
     body = varint_encode(0)
