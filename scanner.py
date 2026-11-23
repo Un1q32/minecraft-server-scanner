@@ -5219,7 +5219,9 @@ def login_probe(host, port=25565):
 
             if packet_id == 0x04:  # Login Plugin Request
                 if not saw_encryption_request:
-                    return True, "CRACKED (offline-mode behind proxy/login plugin)"
+                    # A proxy/modded server can send a plugin request before
+                    # auth; this does not prove offline mode.
+                    return None, "UNKNOWN MODE (login plugin before auth)"
                 return False, "ONLINE-MODE + login plugin (secure/proxied)"
 
             if packet_id == 0x00:  # Disconnect
@@ -5238,7 +5240,9 @@ def login_probe(host, port=25565):
                     # kick does not make the server offline-mode.
                     return False, f"ONLINE-MODE (disconnect: {shown})"
                 if "whitelist" in clean or "white list" in clean:
-                    return True, f"CRACKED (whitelist message: {display_text(reason, 500)})"
+                    # Whitelist checks can run before encryption even on an
+                    # online-mode server/proxy.  This is not proof of mode.
+                    return None, f"UNKNOWN MODE (whitelist message: {display_text(reason, 500)})"
                 if ("throttl" in low or "too fast" in low
                         or "try again" in low):
                     return None, f"THROTTLED, retry later: {shown}"
@@ -5506,9 +5510,6 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                                 f"proxy kick: {shown_reason}", mod_warning), "done"
                         if "whitelist" in low or "white list" in low or "not whitelisted" in low:
                             msg = f"WHITELISTED ({shown_reason})"
-                            if (not mojang_used and not saw_encryption
-                                    and not whitelist_login_transient(reason)):
-                                msg += " [offline-mode]"
                             return True, append_mod_warning(msg, mod_warning), "done"
                         if "throttl" in low:
                             return None, append_mod_warning(f"Connection throttled, retry later ({shown_reason})", mod_warning), "done"
@@ -5529,9 +5530,6 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                                 extra_warning = append_mod_warning("", mod_warning_text("NeoForge" if marker == "neoforge" else "Forge", reason)) or extra_warning
                                 break
                         msg = f"Not Whitelisted ({shown_reason})"
-                        if (not mojang_used and not saw_encryption
-                                and not whitelist_login_transient(reason)):
-                            msg += " [offline-mode]"
                         return False, append_mod_warning(msg, extra_warning), "done"
 
                     if packet_id == 0x02:
@@ -5551,14 +5549,10 @@ def whitelist_login_probe(host, port=25565, account=None, protocol=None, proxy=N
                                    "direct joins are blocked by the proxy")
                             return False, append_mod_warning(msg, warn), "done"
                         msg = f"Not Whitelisted (login plugin request{': ' + channel if channel else ''}; no immediate whitelist kick)"
-                        if not mojang_used and not saw_encryption:
-                            msg += " [offline-mode]"
                         return False, append_mod_warning(msg, warn), "done"
 
                     if packet_id == 0x05:
                         msg = "Not Whitelisted (entered configuration; no immediate whitelist kick)"
-                        if not mojang_used and not saw_encryption:
-                            msg += " [offline-mode]"
                         return False, append_mod_warning(msg, mod_warning), "done"
 
             except socket.timeout:
