@@ -86,6 +86,35 @@ final class ScannerRunner {
 		}, WORKER);
 	}
 
+	/** Read the full scanner-local row after a rescan. */
+	static CompletableFuture<@Nullable ServerRecord> storedServer(String address) {
+		return CompletableFuture.supplyAsync(() -> {
+			Path database = BundledScanner.directory().resolve("servers.db");
+			if (!Files.isRegularFile(database)) {
+				return null;
+			}
+			SQLiteConfig config = new SQLiteConfig();
+			config.setReadOnly(true);
+			config.setOpenMode(SQLiteOpenMode.OPEN_URI);
+			SQLiteDataSource source = new SQLiteDataSource(config);
+			source.setUrl("jdbc:sqlite:" + database.toAbsolutePath().toUri() + "?mode=ro");
+			String sql = "SELECT ip_port, motd, players_online, max_players, version,"
+				+ " protocol, cracked, whitelist, first_seen, last_seen, times_seen,"
+				+ " players_now, players_ever, online FROM servers"
+				+ " WHERE ip_port = ? LIMIT 1";
+			try (Connection connection = source.getConnection();
+				 PreparedStatement statement = connection.prepareStatement(sql)) {
+				statement.setString(1, address);
+				try (ResultSet rs = statement.executeQuery()) {
+					return rs.next() ? ServerRecord.fromRow(rs) : null;
+				}
+			} catch (Exception e) {
+				McdbBrowserClient.LOGGER.warn("Could not read the rescanned server {}", address, e);
+				return null;
+			}
+		}, WORKER);
+	}
+
 	/** Read the label the scanner stored locally after a recheck. */
 	static CompletableFuture<@Nullable String> storedWhitelist(String address) {
 		return CompletableFuture.supplyAsync(() -> {

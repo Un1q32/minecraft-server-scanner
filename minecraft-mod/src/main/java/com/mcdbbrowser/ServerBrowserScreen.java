@@ -622,9 +622,49 @@ public class ServerBrowserScreen extends DropdownScreen {
 	private void rescanSelected() {
 		ServerRecord server = this.selectedServer();
 		if (server != null) {
-			this.runScannerAction("Rescanning " + server.address() + "…",
-				() -> ScannerRunner.rescan(server.address(), this::setScannerStatus),
-				() -> {});
+			String address = server.address();
+			this.runScannerAction("Rescanning " + address + "…",
+				() -> ScannerRunner.rescan(address, this::setScannerStatus),
+				() -> this.refreshRescanned(address));
+		}
+	}
+
+	/** Update one visible row from the scanner's local DB without syncing. */
+	private void refreshRescanned(String address) {
+		ScannerRunner.storedServer(address).whenComplete((fresh, throwable) -> this.minecraft.execute(() -> {
+			if (throwable != null) {
+				McdbBrowserClient.LOGGER.warn("Could not refresh rescanned server {}", address, throwable);
+				return;
+			}
+			if (fresh == null) {
+				return;
+			}
+			this.applyServerRecord(fresh);
+			this.updateButtonStates();
+		}));
+	}
+
+	private void applyServerRecord(ServerRecord fresh) {
+		if (this.result == null) {
+			return;
+		}
+		List<ServerRecord> rows = this.result.rows();
+		for (int i = 0; i < rows.size(); i++) {
+			ServerRecord row = rows.get(i);
+			if (row.address().equalsIgnoreCase(fresh.address())) {
+				boolean visible = switch (this.query.online()) {
+					case ONLINE -> fresh.online();
+					case OFFLINE -> !fresh.online();
+					case ALL -> true;
+				};
+				if (visible) {
+					rows.set(i, fresh.withPortGroup(row.portCount(), row.portSummary()));
+				} else {
+					rows.remove(i);
+				}
+				this.list.setRowsPreservingScroll(rows);
+				break;
+			}
 		}
 	}
 
