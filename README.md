@@ -438,7 +438,7 @@ same command on every machine:
     mcscan.py --continuous
 
 Each node registers with the DB server on startup and heartbeats every 10
-seconds. The server keeps the active-node list, expires a node after 30
+seconds. The server keeps the active-node list, expires a node after 90
 seconds without a heartbeat, and returns a 1-based shard index plus the
 current node count. Nodes apply the latest index at the start of each round,
 so:
@@ -446,7 +446,15 @@ so:
 - adding a machine needs no changes to the other machines;
 - stopping one machine lets the others renumber and take over its slice;
 - a clean Ctrl-C sends a leave request immediately, so the remaining nodes
-  rebalance on their next heartbeat instead of waiting for the 30 s timeout.
+  rebalance on their next heartbeat instead of waiting for the 90 s timeout.
+
+A slow or busy network (the Pi especially) can delay a heartbeat for many
+seconds. Heartbeats use a 20-second timeout, retry with a short backoff
+instead of sleeping a full interval, and rate-limit repeated timeout
+messages to once per five minutes. A node that has not completed a
+heartbeat for most of the server's TTL pauses at the next round boundary
+and waits for re-registration instead of scanning without a shard; on
+startup it refuses to begin a round until the first shard is assigned.
 
 A machine that dies mid-round can leave its slice uncovered until that round
 ends, but the next round uses the updated shard map. The node id is stored

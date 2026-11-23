@@ -38,8 +38,11 @@ When shared-DB credentials exist, continuous nodes also auto-shard: each
 heartbeats ``/api/continuous`` every 10 seconds, and the DB server returns
 its 1-based index plus the current node count. Nodes are ordered by
 registration time, so adding one appends a shard without disturbing the
-others. A node expires after 30 seconds without a heartbeat, and a clean
-stop sends an explicit leave. The latest index is applied at the next
+others. A node expires after 90 seconds without a heartbeat, and a clean
+stop sends an explicit leave. Failed heartbeats retry with a short backoff
+(not after a full interval), repeated identical errors are rate-limited,
+and a node that loses its registration pauses at the next round boundary
+instead of scanning unsharded. The latest index is applied at the next
 round boundary. ``--shard I/N`` opts out and uses a fixed manual slice.
 
 Discovery only: status pings, no logins. masscan is strongly recommended
@@ -79,7 +82,12 @@ RANDOM_EXPLORE = 0.10
 STATUS_INTERVAL = 0.3           # live status redraw (seconds)
 STATUS_LOG_INTERVAL = 15.0      # redraw cadence when output is piped
 SHARD_HEARTBEAT = 10.0          # auto-shard heartbeat interval (seconds)
-SHARD_TIMEOUT = 8.0             # per-heartbeat HTTP timeout (seconds)
+SHARD_TIMEOUT = 20.0            # per-heartbeat HTTP timeout (seconds)
+SHARD_FAIL_BACKOFF = 2.0        # first retry delay after a failed heartbeat
+SHARD_FAIL_BACKOFF_MAX = 20.0   # cap for the retry backoff
+SHARD_FAIL_LOG_EVERY = 300.0    # repeat the same failure at most this often
+SHARD_START_TIMEOUT = 300.0     # wait this long for the first shard assignment
+SHARD_RECOVER_TIMEOUT = 90.0    # wait this long for a stale heartbeat to recover
 NODE_ID_FILE = "continuous_node_id"
 DEFAULT_CRACKED_RECHECK_BATCH = 100  # unknown-mode probes per round
 CRACKED_RECHECK_TTL = 6 * 3600       # do not retry the same unknown host sooner
@@ -1023,7 +1031,12 @@ class ShardManager:
         self.stop_event = stop_event
         self._shard = None
         self._reported_total = None
+        self._reported_waiting = False
         self._last_error = None
+        self._last_ok = None
+        self._ttl = 30.0
+        self._fail_streak = 0
+        self._last_fail_log = 0.0
         self._messages = []
         self._lock = threading.Lock()
         self._local_stop = threading.Event()
@@ -1039,60 +1052,112 @@ class ShardManager:
         self._ready.wait(timeout=5.0)
 
     def refresh(self, leave=False):
-        # One retry for a transient timeout. The status bar log is deferred to
-        # the end of the round, so a slow DB server does not spam the console.
-        attempts = 1 if leave else 2
-        data = None
-        for attempt in range(attempts):
-            try:
-                data = scanner.netdb_continuous_heartbeat(
-                    self.url, self.token, self.node_id,
-                    timeout=2 if leave else SHARD_TIMEOUT, leave=leave)
-                break
-            except Exception as exc:
-                text = str(exc)
-                transient = ("timed out" in text.lower()
-                             or "timeout" in text.lower())
-                if attempt + 1 < attempts and transient:
-                    time.sleep(0.5)
-                    continue
-                if not leave and text != self._last_error:
-                    if transient:
-                        text = "timed out; will retry next heartbeat"
-                    with self._lock:
-                        self._messages.append(
-                            f"auto-shard heartbeat failed: {text}")
-                    self._last_error = text
-                return
-        if leave or data is None:
-            return
+        """Send one heartbeat. Returns True when the DB server answered.
+
+        There is no internal retry: ``_run`` schedules the next attempt with
+        a backoff, which keeps trying during a network burst instead of
+        sleeping a full heartbeat interval after a timeout.
+        """
+        try:
+            data = scanner.netdb_continuous_heartbeat(
+                self.url, self.token, self.node_id,
+                timeout=2 if leave else SHARD_TIMEOUT, leave=leave)
+        except Exception as exc:
+            if not leave:
+                self._record_failure(str(exc))
+            return False
+        if leave:
+            return True
         try:
             index = int(data.get("index") or 0)
             total = int(data.get("total") or 0)
         except Exception:
             index = total = 0
         if not (1 <= index <= total):
-            text = "invalid shard response from DB server"
-            if text != self._last_error:
-                with self._lock:
-                    self._messages.append(f"auto-shard heartbeat failed: {text}")
-            self._last_error = text
-            return
-        self._last_error = None
+            self._record_failure("invalid shard response from DB server")
+            return False
+        try:
+            ttl = float(data.get("ttl") or 0)
+            if ttl > 0:
+                # The server's TTL decides when this node's slice is freed.
+                self._ttl = max(30.0, ttl)
+            heartbeat = float(data.get("heartbeat") or 0)
+            if heartbeat > 0:
+                self.interval = max(2.0, heartbeat)
+        except Exception:
+            pass
         with self._lock:
+            recovered = self._fail_streak > 0
+            self._fail_streak = 0
+            self._last_error = None
+            self._last_fail_log = 0.0
+            self._last_ok = time.monotonic()
             self._shard = (index, total)
+            if recovered:
+                self._messages.append(
+                    f"auto-shard heartbeat recovered ({index}/{total})")
+        return True
+
+    def _record_failure(self, text):
+        """Queue a failure message, suppressing repeated identical errors."""
+        text = str(text)
+        if ("timed out" in text.lower() or "timeout" in text.lower()):
+            text = "timed out; retrying with backoff"
+        now = time.monotonic()
+        with self._lock:
+            self._fail_streak += 1
+            changed = text != self._last_error
+            due = now - self._last_fail_log >= SHARD_FAIL_LOG_EVERY
+            if changed or due:
+                self._messages.append(f"auto-shard heartbeat failed: {text}")
+                self._last_fail_log = now
+            self._last_error = text
 
     def _run(self):
-        self.refresh()
-        self._ready.set()
-        while not self._local_stop.wait(self.interval):
+        delay = 0.0
+        fail_delay = SHARD_FAIL_BACKOFF
+        first = True
+        while not self._local_stop.is_set():
+            if self._local_stop.wait(delay):
+                break
             if self.stop_event.is_set():
                 break
-            self.refresh()
+            ok = self.refresh()
+            if first:
+                self._ready.set()
+                first = False
+            if ok:
+                delay = self.interval
+                fail_delay = SHARD_FAIL_BACKOFF
+            else:
+                delay = fail_delay
+                fail_delay = min(fail_delay * 2, SHARD_FAIL_BACKOFF_MAX)
 
     def shard(self):
         with self._lock:
             return self._shard
+
+    def healthy(self):
+        """True while the last successful heartbeat is safely inside TTL."""
+        now = time.monotonic()
+        with self._lock:
+            if self._shard is None or self._last_ok is None:
+                return False
+            ttl = max(30.0, self._ttl)
+            return (now - self._last_ok) <= ttl * 0.75
+
+    def wait_healthy(self, timeout, stop_event=None):
+        """Wait up to ``timeout`` seconds for a fresh shard assignment."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return False
+            if self.healthy():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.25, remaining))
 
     def drain_messages(self):
         """Round-start output: errors plus one line if the peer count changed.
@@ -1107,7 +1172,13 @@ class ShardManager:
         with self._lock:
             messages = list(self._messages)
             self._messages = []
-            if self._shard is not None:
+            if self._shard is None:
+                if not self._reported_waiting:
+                    self._reported_waiting = True
+                    messages.append(
+                        "auto-shard: waiting for a shard assignment")
+            else:
+                self._reported_waiting = False
                 index, total = self._shard
                 if self._reported_total != total:
                     self._reported_total = total
@@ -1257,6 +1328,23 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
           f"({'enabled' if url and token else 'skipped: no netdb.json'})")
     if shard_manager:
         shard_manager.start()
+        if not shard_manager.healthy():
+            deadline = time.monotonic() + SHARD_START_TIMEOUT
+            while not shard_manager.healthy():
+                if stop_event.is_set():
+                    shard_manager.stop()
+                    return 130
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print("error: auto-shard is enabled but the shared DB did "
+                          "not assign a shard; refusing to scan unsharded. "
+                          "Check the URL/token/network, or use --no-auto-shard "
+                          "or --shard I/N for a fixed slice.", flush=True)
+                    shard_manager.stop()
+                    return 2
+                print("  waiting for the shared DB to assign a shard...",
+                      flush=True)
+                shard_manager.wait_healthy(min(30.0, remaining), stop_event)
         shard_state["value"] = shard_manager.shard()
 
     rounds = 0
@@ -1309,6 +1397,23 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
 
     try:
         while not stop_event.is_set():
+            if shard_manager and not shard_manager.healthy():
+                for message in shard_manager.drain_messages():
+                    print(f"  {message}", flush=True)
+                print("  auto-shard heartbeat is stale; waiting for the DB "
+                      "server...", flush=True)
+                if not shard_manager.wait_healthy(SHARD_RECOVER_TIMEOUT,
+                                                  stop_event):
+                    if stop_event.is_set():
+                        break
+                    print("  no current shard assignment; skipping this round",
+                          flush=True)
+                    # Back off so a long outage does not spin the loop.
+                    for _ in range(int(SHARD_HEARTBEAT * 10)):
+                        if stop_event.is_set():
+                            break
+                        time.sleep(0.1)
+                    continue
             if shard_manager:
                 shard_state["value"] = shard_manager.shard()
             rounds += 1
