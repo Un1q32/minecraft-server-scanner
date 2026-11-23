@@ -59,6 +59,14 @@ public record ServerRecord(
 			this.online);
 	}
 
+	ServerRecord withCracked(boolean newCracked) {
+		return new ServerRecord(this.address, this.motd, this.playersOnline, this.maxPlayers,
+			this.version, this.protocol, newCracked, this.whitelist,
+			this.firstSeenEpochSeconds, this.lastSeenEpochSeconds, this.timesSeen,
+			this.playersNowJson, this.playersEverJson, this.portSummary, this.portCount,
+			this.online);
+	}
+
 	ServerRecord withPortGroup(int count, String summary) {
 		return new ServerRecord(this.address, this.motd, this.playersOnline, this.maxPlayers,
 			this.version, this.protocol, this.cracked, this.whitelist,

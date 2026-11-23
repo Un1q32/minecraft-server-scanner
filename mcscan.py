@@ -331,6 +331,21 @@ def cmd_set_whitelist(ip, label):
     return 0
 
 
+def cmd_set_cracked(ip, label):
+    """Store a cracked verdict produced by a real client join."""
+    ip = scanner.strict_ip_port(ip)
+    if not ip:
+        print(f"error: {ip!r} is not a valid ip:port", flush=True)
+        return 2
+    label = (label or "").strip().lower()
+    if label not in ("yes", "no", "unknown"):
+        print("error: cracked label must be yes, no, or unknown", flush=True)
+        return 2
+    scanner.update_server_cracked(ip, label, "real client join")
+    print(f"cracked set: {ip}: {label}", flush=True)
+    return 0
+
+
 def cmd_recheck_whitelist(ips):
     """Probe whitelist status for the given servers and update servers.db.
 
@@ -944,6 +959,10 @@ def main(argv=None):
         "--set-whitelist", nargs=2, metavar=("IP:PORT", "LABEL"), default=None,
         help="store a whitelist verdict observed from a real client join")
     parser.add_argument(
+        "--set-cracked", nargs=2, metavar=("IP:PORT", "LABEL"), default=None,
+        help="store a cracked verdict observed from a real client join "
+             "(yes/no/unknown)")
+    parser.add_argument(
         "--rescan", nargs="+", metavar="IP:PORT", default=None,
         help="re-ping these servers and update the local DB (status ping "
              "only; no masscan and no shared-DB sync)")
@@ -1028,7 +1047,7 @@ def main(argv=None):
             and args.init_db is None and not args.continuous \
             and not args.high_res \
             and args.recheck_whitelist is None and args.set_whitelist is None \
-            and args.rescan is None \
+            and args.set_cracked is None and args.rescan is None \
             and not args.download_db and not args.vacuum_db \
             and not args.dedupe and not args.prune_activity:
         parser.print_help()
@@ -1060,6 +1079,8 @@ def main(argv=None):
             rc = cmd_recheck_whitelist(args.recheck_whitelist) or rc
         if args.set_whitelist is not None:
             rc = cmd_set_whitelist(*args.set_whitelist) or rc
+        if args.set_cracked is not None:
+            rc = cmd_set_cracked(*args.set_cracked) or rc
         if args.rescan is not None:
             rc = cmd_rescan(args.rescan) or rc
         if args.continuous or args.high_res:

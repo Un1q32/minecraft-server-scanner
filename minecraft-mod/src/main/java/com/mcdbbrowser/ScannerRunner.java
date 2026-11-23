@@ -115,7 +115,22 @@ final class ScannerRunner {
 		}, WORKER);
 	}
 
-	/** Read the label the scanner stored locally after a recheck. */
+	/** Store a cracked verdict observed from the real client join, then publish it. */
+	static CompletableFuture<Result> setCracked(String address, String label, Consumer<String> progress) {
+		return CompletableFuture.supplyAsync(() -> {
+			Result update = runStep(List.of("--set-cracked", address, label),
+				SCAN_TIMEOUT_SECONDS, progress);
+			if (!update.ok()) {
+				return update;
+			}
+			Result sync = runStep(List.of("--sync"), SYNC_TIMEOUT_SECONDS, progress);
+			return sync.ok()
+				? new Result(true, "Cracked verdict saved for " + address)
+				: new Result(false, "Cracked verdict saved locally, but sync failed: " + sync.message());
+		}, WORKER);
+	}
+
+	/** Read the full scanner-local row after a rescan. */
 	static CompletableFuture<@Nullable String> storedWhitelist(String address) {
 		return CompletableFuture.supplyAsync(() -> {
 			Path directory = BundledScanner.directory();

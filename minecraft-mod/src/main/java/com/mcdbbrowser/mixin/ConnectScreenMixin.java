@@ -1,6 +1,7 @@
 package com.mcdbbrowser.mixin;
 
 import com.mcdbbrowser.ConnectionHistory;
+import com.mcdbbrowser.CrackedAutoUpdate;
 import com.mcdbbrowser.WhitelistAutoUpdate;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
@@ -22,6 +23,7 @@ abstract class ConnectScreenMixin {
 		if (server != null && !server.isRealm()) {
 			ConnectionHistory.add(server.name, server.ip);
 			WhitelistAutoUpdate.track(server.ip);
+			CrackedAutoUpdate.track(server.ip);
 		}
 	}
 }

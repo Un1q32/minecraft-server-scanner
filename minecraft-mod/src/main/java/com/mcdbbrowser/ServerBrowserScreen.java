@@ -112,6 +112,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 	@Override
 	protected void init() {
 		WhitelistAutoUpdate.attach(this);
+		CrackedAutoUpdate.attach(this);
 		boolean sameQuery = this.query.equals(rememberedPositionQuery);
 		this.pendingScrollOffset = !sameQuery ? 0.0
 			: (this.list == null ? rememberedScrollOffset : this.list.scrollAmount());
@@ -742,6 +743,24 @@ public class ServerBrowserScreen extends DropdownScreen {
 			}
 			this.updateButtonStates();
 		}));
+	}
+
+	/** Replace one loaded row's cracked verdict and cache it for the next visit. */
+	void applyCracked(String address, boolean cracked) {
+		ServerDatabase.setCracked(address, cracked);
+		if (this.result == null) {
+			return;
+		}
+		List<ServerRecord> rows = this.result.rows();
+		for (int i = 0; i < rows.size(); i++) {
+			ServerRecord row = rows.get(i);
+			if (row.address().equalsIgnoreCase(address)) {
+				rows.set(i, row.withCracked(cracked));
+				this.list.setRowsPreservingScroll(rows);
+				break;
+			}
+		}
+		this.updateButtonStates();
 	}
 
 	/** Replace one loaded row's whitelist verdict and cache it for the next visit. */

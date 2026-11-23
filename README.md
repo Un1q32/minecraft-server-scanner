@@ -843,7 +843,9 @@ required on the machine.
 - Sync DB: `mcscan.py --sync`
 
 The filter row includes **Notes** with `Any`, `No notes`, and `Has notes`.
-Choose **No notes** to hide servers already joined/annotated. Whitelist and
+Choose **No notes** to hide servers already joined/annotated. Joining a server
+also records its cracked verdict: if the server sends an encryption request it
+is **No**, while a successful join without one is **Yes**. Whitelist and
 sync commands reload the shared database; Rescan refreshes only the selected
 row. Settings contains the Python command and a **Shared DB Credentials** menu for the URL
 and token; those are written to the extracted scanner's `netdb.json`, so no

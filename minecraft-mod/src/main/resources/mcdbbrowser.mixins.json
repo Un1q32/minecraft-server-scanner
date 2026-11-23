@@ -3,6 +3,7 @@
 	"package": "com.mcdbbrowser.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
+		"ClientHandshakePacketListenerImplMixin",
 		"ConnectScreenMixin",
 		"DisconnectedScreenMixin"
 	],

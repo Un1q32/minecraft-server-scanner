@@ -414,6 +414,47 @@ public final class ServerDatabase {
 		}, WORKER);
 	}
 
+	/** Patch the downloaded browser cache with a cracked verdict from a join. */
+	public static CompletableFuture<Void> setCracked(String address, boolean cracked) {
+		return CompletableFuture.runAsync(() -> {
+			if (!Files.isRegularFile(DB_FILE)) {
+				return;
+			}
+			boolean wasOpen = connection != null;
+			if (wasOpen) {
+				close();
+			}
+			try {
+				SQLiteConfig config = new SQLiteConfig();
+				config.setReadOnly(false);
+				config.setOpenMode(SQLiteOpenMode.OPEN_URI);
+				SQLiteDataSource source = new SQLiteDataSource(config);
+				source.setUrl("jdbc:sqlite:" + DB_FILE.toAbsolutePath().toUri());
+				try (Connection database = source.getConnection()) {
+					try (Statement pragma = database.createStatement()) {
+						pragma.execute("PRAGMA journal_mode=DELETE");
+					}
+					try (PreparedStatement statement = database.prepareStatement(
+							"UPDATE server_state SET cracked=?, last_source='cracked' WHERE ip_port = ?")) {
+						statement.setInt(1, cracked ? 1 : 0);
+						statement.setString(2, address);
+						statement.executeUpdate();
+					}
+				}
+			} catch (SQLException e) {
+				McdbBrowserClient.LOGGER.warn("Could not cache the cracked verdict for {}", address, e);
+			} finally {
+				if (wasOpen) {
+					try {
+						open();
+					} catch (SQLException e) {
+						McdbBrowserClient.LOGGER.warn("Could not reopen the server list after a cracked update", e);
+					}
+				}
+			}
+		}, WORKER);
+	}
+
 	public record HistoryPoint(double seenAt, @Nullable Integer playersOnline,
 	                           @Nullable Integer maxPlayers) {
 	}
