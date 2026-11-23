@@ -51,13 +51,9 @@ final class ScannerRunner {
 	static CompletableFuture<Result> rescan(String address, Consumer<String> progress) {
 		return CompletableFuture.supplyAsync(() -> {
 			Result scan = runStep(List.of("--rescan", address), SCAN_TIMEOUT_SECONDS, progress);
-			if (!scan.ok()) {
-				return scan;
-			}
-			Result sync = runStep(List.of("--sync"), SYNC_TIMEOUT_SECONDS, progress);
-			return sync.ok()
-				? new Result(true, "Rescanned " + address + " and synced")
-				: new Result(false, "Rescan finished, but sync failed: " + sync.message());
+			return scan.ok()
+				? new Result(true, "Rescanned " + address)
+				: scan;
 		}, WORKER);
 	}
 

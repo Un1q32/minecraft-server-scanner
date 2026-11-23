@@ -834,7 +834,7 @@ are bundled inside the mod jar and extracted to
 `<game>/mcdbbrowser/scanner/` on first use; only a Python 3 interpreter is
 required on the machine.
 
-- Rescan: `mcscan.py --rescan <ip:port>` then `mcscan.py --sync`
+- Rescan: `mcscan.py --rescan <ip:port>` (local only; use **Sync DB** separately)
 - Recheck Whitelist: `mcscan.py --recheck-whitelist <ip:port>` then
   `mcscan.py --sync`
 - Sync DB: `mcscan.py --sync`

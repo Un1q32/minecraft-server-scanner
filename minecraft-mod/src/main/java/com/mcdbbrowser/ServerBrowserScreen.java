@@ -177,7 +177,7 @@ public class ServerBrowserScreen extends DropdownScreen {
 		int actionRowY = this.height - 44;
 		int actionRowX = this.footerRowX(3, ACTION_BUTTON_WIDTH);
 		this.rescanButton = this.addRenderableWidget(this.actionButton("Rescan",
-			"Run mcscan.py --rescan for the selected server, then sync", actionRowX, actionRowY, this::rescanSelected));
+			"Run mcscan.py --rescan for the selected server", actionRowX, actionRowY, this::rescanSelected));
 		this.whitelistButton = this.addRenderableWidget(this.actionButton("Recheck Whitelist",
 			"Run mcscan.py --recheck-whitelist for the selected server, then sync",
 			actionRowX + ACTION_BUTTON_WIDTH + GAP, actionRowY, this::recheckWhitelistSelected));
