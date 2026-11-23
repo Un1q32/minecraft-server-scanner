@@ -4714,14 +4714,15 @@ def parse_description(desc):
             return sanitize_motd(''.join([x.get('text', '') for x in desc['extra']]))
     return ''
 
-def ping_server(entry, proxy=None, persist=True):
+def ping_server(entry, proxy=None, persist=True, timeout=None):
     if _SHUTDOWN.is_set():
         return None
+    timeout = STATUS_TIMEOUT if timeout is None else max(0.2, float(timeout))
     try:
         host, port = split_host_port(entry)
         with open_connection(host, port, proxy=proxy,
-                             timeout=STATUS_TIMEOUT) as sock:
-            sock.settimeout(STATUS_TIMEOUT)
+                             timeout=timeout) as sock:
+            sock.settimeout(timeout)
 
             handshake = (
                 varint_encode(0x00) +
@@ -8385,10 +8386,12 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
 
 # GUI-friendly scan with streaming callbacks
 def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, login_probe=False,
-                     stop_event=None, record_failures=False):
+                     stop_event=None, record_failures=False, confirm_failures=False):
     filtered = [s for s in servers if not is_ignored(s)]
     results, online_lines = [], []
     total, done = len(filtered), 0
+
+    confirm = bool(confirm_failures and total <= 2000)
 
     def task(ip):
         if _SHUTDOWN.is_set():
@@ -8397,7 +8400,18 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, l
             try: on_start(ip)
             except Exception: pass
         # The batch loop below persists results with one transaction.
-        return ping_server(ip, persist=False)
+        result = ping_server(ip, persist=False)
+        if (result is None and record_failures and confirm
+                and not _SHUTDOWN.is_set()):
+            # A single timeout under load is not proof that a known server is
+            # offline.  Retry once with a longer socket timeout before the
+            # caller records a failure.
+            time.sleep(0.5)
+            if _SHUTDOWN.is_set():
+                return None
+            result = ping_server(ip, persist=False,
+                                 timeout=STATUS_TIMEOUT * 2)
+        return result
 
     # More in-flight handshakes, but DB/user-log writes are batched so the
     # workers spend their time on the network instead of fsync per server.
@@ -11766,7 +11780,8 @@ class ServersTab(QWidget, QtBaseMixin):
         def work():
             try:
                 results, _ = scan_servers_gui(
-                    sel, on_progress=on_progress, record_failures=True)
+                    sel, on_progress=on_progress, record_failures=True,
+                    confirm_failures=True)
                 msg = f"Rescan complete. Responded: {len(results)}."
                 self.after(0, lambda msg=msg: self._op_done(msg))
             except Exception as exc:
@@ -12205,7 +12220,8 @@ class ServerMonitorTab(QtBaseMixin, QWidget):
             return
         self.after(0, lambda: self._set_status(f"Pinging {len(ips)} server(s)..."))
         cycle_ts = time.time()
-        results, _ = scan_servers_gui(ips, record_failures=True)
+        results, _ = scan_servers_gui(
+            ips, record_failures=True, confirm_failures=True)
         processed = set()
 
         if results:
@@ -13051,6 +13067,7 @@ class ShodanTab(QWidget, QtBaseMixin):
                     on_result=on_result,
                     on_progress=on_progress,
                     record_failures=True,
+                    confirm_failures=True,
                 )
                 self.after(
                     0,
@@ -13724,6 +13741,7 @@ class JSONTab(QWidget, QtBaseMixin):
                     on_result=on_result,
                     on_progress=on_progress,
                     record_failures=True,
+                    confirm_failures=True,
                 )
                 self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
                 if only_cracked:

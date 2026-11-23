@@ -436,7 +436,7 @@ def cmd_rescan(ips):
     try:
         results, _ = scanner.scan_servers_gui(
             targets, on_result=on_result, on_progress=on_progress,
-            record_failures=True)
+            record_failures=True, confirm_failures=True)
     except scanner.ScanStopped:
         print("rescan stopped.", flush=True)
         return 130

@@ -659,6 +659,17 @@ def run_round(ranges, ports, *, rate, wait, scan_duration, stop_event,
                 result = scanner.ping_server(ip_port)
             except Exception:
                 result = None
+            if result is None and not scanner.shutdown_requested():
+                # Confirm a failed open-port handshake before marking the
+                # server offline; transient load causes false negatives.
+                time.sleep(0.5)
+                if scanner.shutdown_requested():
+                    return
+                try:
+                    result = scanner.ping_server(
+                        ip_port, timeout=scanner.STATUS_TIMEOUT * 2)
+                except Exception:
+                    result = None
             if result:
                 emit(result)
                 return
@@ -1419,7 +1430,8 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                                         on_result=(lambda r, _line:
                                                    on_hit(r) if r else None),
                                         stop_event=_RescanDeadline(),
-                                        record_failures=True)
+                                        record_failures=True,
+                                        confirm_failures=True)
                                     results.extend(batch)
                                     processed_ports += direct_groups
                                 except Exception as exc:
