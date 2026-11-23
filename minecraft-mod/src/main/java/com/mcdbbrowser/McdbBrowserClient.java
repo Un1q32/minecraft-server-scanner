@@ -28,7 +28,7 @@ public class McdbBrowserClient implements ClientModInitializer {
 		ConnectionHistory.load();
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
 			WhitelistAutoUpdate.onJoined();
-			CrackedAutoUpdate.onJoined();
+			CrackedAutoUpdate.onJoined(handler);
 		});
 
 		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
