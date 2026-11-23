@@ -1398,9 +1398,6 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                                     direct_targets.append(f"{spec}:{port}")
                                 direct_groups += 1
                                 continue
-                            status.note(
-                                f"  port {port}: {len(specs)} target(s) "
-                                f"(masscan)...")
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note,
