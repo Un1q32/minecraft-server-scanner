@@ -623,7 +623,8 @@ public class ServerBrowserScreen extends DropdownScreen {
 		ServerRecord server = this.selectedServer();
 		if (server != null) {
 			this.runScannerAction("Rescanning " + server.address() + "…",
-				() -> ScannerRunner.rescan(server.address(), this::setScannerStatus));
+				() -> ScannerRunner.rescan(server.address(), this::setScannerStatus),
+				() -> {});
 		}
 	}
 
