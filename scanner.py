@@ -5219,6 +5219,9 @@ def login_probe(host, port=25565):
 
             if packet_id == 0x04:  # Login Plugin Request
                 if not saw_encryption_request:
+                    if sample_offline_hint is False:
+                        return False, ("ONLINE-MODE (sample UUIDs look online; "
+                                       "login plugin before auth)")
                     # A proxy/modded server can send a plugin request before
                     # auth; this does not prove offline mode.
                     return None, "UNKNOWN MODE (login plugin before auth)"
@@ -5241,7 +5244,12 @@ def login_probe(host, port=25565):
                     return False, f"ONLINE-MODE (disconnect: {shown})"
                 if "whitelist" in clean or "white list" in clean:
                     # Whitelist checks can run before encryption even on an
-                    # online-mode server/proxy.  This is not proof of mode.
+                    # online-mode server/proxy.  A non-offline sample is
+                    # strong enough to report online; otherwise leave the
+                    # existing verdict alone rather than inventing cracked.
+                    if sample_offline_hint is False:
+                        return False, ("ONLINE-MODE (sample UUIDs look online; "
+                                       f"whitelist message: {display_text(reason, 500)})")
                     return None, f"UNKNOWN MODE (whitelist message: {display_text(reason, 500)})"
                 if ("throttl" in low or "too fast" in low
                         or "try again" in low):
