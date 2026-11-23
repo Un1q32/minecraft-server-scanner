@@ -357,8 +357,10 @@ Older-with-25565 hosts are diluted
 into their `/20` so a rescan doesn't burst at known addresses; the
 Minecraft handshake, not the SYN sweep, dominates rescan time, so the
 extra hosts are nearly free. Ports with only a handful of servers are
-pinged directly instead of starting a separate masscan process, and the
-largest port group runs first.
+collected into one Python handshake batch instead of starting a pool per
+port. masscan's port list is global, so per-IP ports cannot be combined
+into one masscan run without scanning a cartesian product of extra ports.
+The largest port group runs first.
 
 Offline servers are a last resort. They are collected as rescan
 candidates but never displace an online server: an offline host is only

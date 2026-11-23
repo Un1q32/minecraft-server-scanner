@@ -68,7 +68,6 @@ DEFAULT_RESCAN_EVERY = 2        # normal rounds between rescan rounds
 HIGH_RES_RESCAN_SPACING = 1800  # --high-res: 30 minutes between rescans
 HIGH_RES_PLAYER_SPACING = 300   # --high-res: 5 minutes for servers with players
 RESCAN_PY_MAX = 100             # tiny port groups: ping directly, no masscan
-RESCAN_LOG_MIN_TARGETS = 20     # suppress per-port noise for tiny groups
 DEEP_PORT_LO = 1024
 DEEP_PORT_HI = 65535
 REVIVED_AFTER = 7 * 86400       # unseen this long -> a find is a "revival"
@@ -1366,10 +1365,20 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                     rescan_deadline = (time.monotonic()
                                        + max(30, scan_duration))
                     processed_ports = 0
+                    direct_targets = []
+                    direct_groups = 0
+
+                    class _RescanDeadline:
+                        def is_set(self):
+                            return (stop_event.is_set()
+                                    or time.monotonic() >= rescan_deadline)
+
                     try:
                         # Largest groups first: port 25565 usually holds most
                         # of the servers, so it should get the shared budget
-                        # before the long tail of tiny ports.
+                        # before the long tail of tiny ports.  Tiny exact
+                        # groups are collected and checked in one Python pool
+                        # at the end instead of starting a pool per port.
                         for port, specs in sorted(
                                 by_port.items(), key=lambda kv: -len(kv[1])):
                             if stop_event.is_set():
@@ -1381,26 +1390,44 @@ def run_continuous(*, rate, wait, scan_duration=DEFAULT_SCAN_DURATION,
                             # port, but never go past the shared deadline.
                             duration = min(
                                 max(30, scan_duration // 2), remaining)
-                            # Tiny exact groups are cheaper to ping directly
-                            # than to start another masscan process.  Padded
-                            # /20 groups can still contain thousands of hosts,
-                            # so they always go through masscan.
                             direct = (len(specs) <= RESCAN_PY_MAX
                                       and _estimate_probes(specs, [port])
                                       <= RESCAN_PY_MAX)
-                            if not direct or len(specs) >= RESCAN_LOG_MIN_TARGETS:
-                                status.note(
-                                    f"  port {port}: {len(specs)} target(s) "
-                                    f"({'python' if direct else 'masscan'})...")
+                            if direct:
+                                for spec in specs:
+                                    direct_targets.append(f"{spec}:{port}")
+                                direct_groups += 1
+                                continue
+                            status.note(
+                                f"  port {port}: {len(specs)} target(s) "
+                                f"(masscan)...")
                             batch, fatal = do_round(
                                 specs, [port], duration=duration,
                                 on_hit=on_hit, log=status.note,
-                                backend="python" if direct else None)
+                                backend=None)
                             results.extend(batch)
                             processed_ports += 1
                             if fatal:
                                 _sync_now(url, token)
                                 return 1
+                        if direct_targets and not stop_event.is_set():
+                            remaining = rescan_deadline - time.monotonic()
+                            if remaining > 1:
+                                status.note(
+                                    f"  checking {len(direct_targets)} exact "
+                                    f"target(s) in one Python batch...")
+                                try:
+                                    batch, _ = scanner.scan_servers_gui(
+                                        direct_targets,
+                                        on_result=(lambda r, _line:
+                                                   on_hit(r) if r else None),
+                                        stop_event=_RescanDeadline(),
+                                        record_failures=True)
+                                    results.extend(batch)
+                                    processed_ports += direct_groups
+                                except Exception as exc:
+                                    status.note(
+                                        f"  exact-target batch failed: {exc}")
                         skipped_ports = len(by_port) - processed_ports
                         if skipped_ports > 0 and not stop_event.is_set():
                             status.note(
